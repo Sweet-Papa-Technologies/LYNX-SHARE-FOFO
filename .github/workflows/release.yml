@@ -108,7 +108,6 @@ jobs:
           restore-keys: |
             release-objcache-
             round-objcache-
-          save-always: true
 
       - name: Fetch ONNX Runtime (Windows x64)
         shell: bash

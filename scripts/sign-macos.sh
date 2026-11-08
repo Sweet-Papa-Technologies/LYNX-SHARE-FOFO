@@ -190,7 +190,16 @@ esac
 case "$SIGN_TARGET" in
     *.app|*.dmg|*.pkg)
         info "stapling   $(basename "$SIGN_TARGET")"
-        xcrun stapler staple "$SIGN_TARGET" 2>&1 | sed 's/^/           /'
+        stapled=0
+        for attempt in 1 2 3 4 5; do
+            if xcrun stapler staple "$SIGN_TARGET" 2>&1 | sed 's/^/           /'; then
+                stapled=1
+                break
+            fi
+            info "stapler attempt $attempt/5 failed (CloudKit ticket propagation); retrying in 5s..."
+            sleep 5
+        done
+        [ "$stapled" = 1 ] || die "xcrun stapler staple failed after 5 attempts"
         xcrun stapler validate "$SIGN_TARGET" 2>&1 | sed 's/^/           /'
         ;;
 esac

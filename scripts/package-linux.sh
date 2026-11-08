@@ -52,14 +52,20 @@ EOF
 chmod 755 "$APPDIR/AppRun"
 
 TOOL="${APPIMAGETOOL:-$HOME/opt/appimagetool-$APPIMAGETOOL_VERSION-x86_64.AppImage}"
+RUNTIME="${APPIMAGERUNTIME:-$HOME/opt/runtime-x86_64}"
+AUTH_ARGS=()
+TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+[[ -n "$TOKEN" ]] && AUTH_ARGS=(-H "Authorization: Bearer $TOKEN")
 if [[ ! -x "$TOOL" ]]; then
     mkdir -p "$(dirname "$TOOL")"
-    AUTH_ARGS=()
-    TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    [[ -n "$TOKEN" ]] && AUTH_ARGS=(-H "Authorization: Bearer $TOKEN")
     curl -fsSL -H "Accept: application/octet-stream" "${AUTH_ARGS[@]}" --retry 5 --retry-delay 5 --retry-all-errors -o "$TOOL" "https://api.github.com/repos/AppImage/appimagetool/releases/assets/184558942" \
         || curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
     chmod +x "$TOOL"
+fi
+if [[ ! -f "$RUNTIME" ]]; then
+    mkdir -p "$(dirname "$RUNTIME")"
+    curl -fsSL -H "Accept: application/octet-stream" "${AUTH_ARGS[@]}" --retry 5 --retry-delay 5 --retry-all-errors -o "$RUNTIME" "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/326011592" \
+        || curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$RUNTIME" "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
 fi
 # no FUSE needed to run the tool itself (containers, CI)
 # update information (Gear Lever, AppImageUpdate): a fixed address on lynx-share.com, no GitHub API (issue #48: its
@@ -67,7 +73,7 @@ fi
 # at a published release's .zsync. Its URL line is absolute, because readers resolve a relative one against the fixed address.
 UPDATE_INFO="${UPDATE_INFO:-}"
 APPIMAGE_URL="${APPIMAGE_URL-https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/download/v$LABEL/$APPIMAGE}"
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$TOOL" ${UPDATE_INFO:+-u "$UPDATE_INFO"} "$APPDIR" "$OUTDIR/$APPIMAGE" \
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$TOOL" --runtime-file "$RUNTIME" ${UPDATE_INFO:+-u "$UPDATE_INFO"} "$APPDIR" "$OUTDIR/$APPIMAGE" \
     > "$WORK/appimagetool.log" 2>&1 || { cat "$WORK/appimagetool.log"; exit 1; }
 if [[ -n "$UPDATE_INFO" && ! -f "$OUTDIR/$APPIMAGE.zsync" ]]; then
     [[ -f "$APPIMAGE.zsync" ]] && mv "$APPIMAGE.zsync" "$OUTDIR/"
