@@ -564,15 +564,9 @@ jobs:
           else
             tag="v$LABEL"
           fi
+          notes="Signed release build of **LYNX SHARE ${tag#v}** from commit \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
           if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --title "LYNX SHARE ${tag#v}" \
-              --notes "Signed release build of **LYNX SHARE ${tag#v}** from commit \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)).
-
-- **Windows (x64 Installer, signed via Azure Trusted Signing):** \`LYNX-$LABEL-setup-x64.exe\`
-- **Windows (x64 Portable ZIP, signed binaries):** \`LYNX-$LABEL-windows-x64.zip\`
-- **macOS (Universal Apple Silicon & Intel DMG, Developer ID signed & notarized):** \`LYNX-$LABEL-macos-universal.dmg\`
-- **Linux (x86_64 AppImage & tarball):** \`LYNX-$LABEL-x86_64.AppImage\`, \`LYNX-$LABEL-linux-x86_64.tar.gz\`
-- **Checksums:** \`SHA256SUMS.txt\`"
+            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes "$notes"
           fi
           gh release upload "$tag" dist/* --clobber
 
