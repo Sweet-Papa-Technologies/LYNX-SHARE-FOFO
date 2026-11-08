@@ -474,11 +474,14 @@ jobs:
           test -s Demo.lynx
 
       - name: Import Apple signing certificate
-        if: ${{ secrets.APPLE_CERT_P12 != '' }}
         env:
           CERT_B64: ${{ secrets.APPLE_CERT_P12 }}
           CERT_PASS: ${{ secrets.APPLE_CERT_PASSWORD }}
         run: |
+          if [[ -z "${CERT_B64:-}" ]]; then
+            echo "No APPLE_CERT_P12 secret configured; package-macos.sh will use ad-hoc signing."
+            exit 0
+          fi
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
           KCPASS=$(openssl rand -hex 16)
           echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
