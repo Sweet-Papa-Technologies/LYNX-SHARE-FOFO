@@ -92,12 +92,21 @@ jobs:
         shell: bash
         run: |
           mkdir -p ~/opt && cd ~/opt
-          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
           echo "$ZIG_SHA256  zig.tar.xz" | sha256sum -c -
           tar xf zig.tar.xz && rm zig.tar.xz
-          curl -fsSL -o juce.tar.gz "https://github.com/juce-framework/JUCE/archive/refs/tags/$JUCE_VERSION.tar.gz"
+          curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors -o juce.tar.gz "https://github.com/juce-framework/JUCE/archive/refs/tags/$JUCE_VERSION.tar.gz"
           echo "$JUCE_SHA256  juce.tar.gz" | sha256sum -c -
           tar xzf juce.tar.gz && mv "JUCE-$JUCE_VERSION" "juce-$JUCE_VERSION" && rm juce.tar.gz
+
+      - name: Cache compiled object files
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/lynx-objcache
+          key: release-objcache-${{ github.run_id }}
+          restore-keys: |
+            release-objcache-
+            round-objcache-
 
       - name: Build (Zig cross compile)
         shell: bash
@@ -180,7 +189,7 @@ jobs:
     runs-on: windows-latest
     environment: release
     permissions:
-      contents: read
+      contents: write
       id-token: write
     env:
       LABEL: ${{ needs.version.outputs.label }}
@@ -364,6 +373,24 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Publish signed Windows installer to GitHub Releases
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$LABEL"
+          fi
+          notes="Signed release build of **LYNX SHARE ${tag#v}** from commit \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes "$notes"
+          fi
+          gh release upload "$tag" dist/* --clobber
+
   # Built inside an Ubuntu 22.04 container (glibc 2.35, the oldest Ubuntu LTS in standard support, which the
   # AppImage catalog tests on): a binary only runs on systems whose glibc is at least as new as the one it was
   # built against. GCC 13 comes from the toolchain PPA; libstdc++/libgcc are linked statically (CMakeLists.txt),
@@ -397,7 +424,7 @@ jobs:
       - name: JUCE (checksum verified)
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          curl -fsSL -o juce.tar.gz "https://github.com/juce-framework/JUCE/archive/refs/tags/$JUCE_VERSION.tar.gz"
+          curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors -o juce.tar.gz "https://github.com/juce-framework/JUCE/archive/refs/tags/$JUCE_VERSION.tar.gz"
           echo "$JUCE_SHA256  juce.tar.gz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/juce" && tar xzf juce.tar.gz -C "$RUNNER_TEMP/juce" --strip-components 1 && rm juce.tar.gz
 
@@ -453,7 +480,7 @@ jobs:
 
       - name: JUCE (checksum verified)
         run: |
-          curl -fsSL -o juce.tar.gz "https://github.com/juce-framework/JUCE/archive/refs/tags/$JUCE_VERSION.tar.gz"
+          curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors -o juce.tar.gz "https://github.com/juce-framework/JUCE/archive/refs/tags/$JUCE_VERSION.tar.gz"
           echo "$JUCE_SHA256  juce.tar.gz" | shasum -a 256 -c -
           mkdir -p "$RUNNER_TEMP/juce" && tar xzf juce.tar.gz -C "$RUNNER_TEMP/juce" --strip-components 1 && rm juce.tar.gz
 

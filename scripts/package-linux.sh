@@ -54,7 +54,7 @@ chmod 755 "$APPDIR/AppRun"
 TOOL="${APPIMAGETOOL:-$HOME/opt/appimagetool-$APPIMAGETOOL_VERSION-x86_64.AppImage}"
 if [[ ! -x "$TOOL" ]]; then
     mkdir -p "$(dirname "$TOOL")"
-    curl -fsSL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+    curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
     chmod +x "$TOOL"
 fi
 # no FUSE needed to run the tool itself (containers, CI)

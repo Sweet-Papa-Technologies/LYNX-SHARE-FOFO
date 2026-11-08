@@ -14,7 +14,7 @@ case "$PLATFORM" in
 esac
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-curl -fsSL -o "$WORK/$ASSET" "https://github.com/microsoft/onnxruntime/releases/download/v$VERSION/$ASSET"
+curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$WORK/$ASSET" "https://github.com/microsoft/onnxruntime/releases/download/v$VERSION/$ASSET"
 if command -v sha256sum > /dev/null; then echo "$SHA  $WORK/$ASSET" | sha256sum -c -
 else echo "$SHA  $WORK/$ASSET" | shasum -a 256 -c -; fi
 case "$ASSET" in
