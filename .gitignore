@@ -16,3 +16,5 @@ __pycache__/
 *.obj
 build-ctl/
 build-plug/
+.DS_Store
+.env

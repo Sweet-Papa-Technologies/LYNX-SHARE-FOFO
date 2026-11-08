@@ -178,6 +178,10 @@ jobs:
     needs: [version, build, sign]
     if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
     runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
     env:
       LABEL: ${{ needs.version.outputs.label }}
       VERSION: ${{ needs.version.outputs.version }}
@@ -190,6 +194,26 @@ jobs:
           name: ${{ needs.sign.result == 'success' && 'LYNX-signed' || 'LYNX-unsigned' }}
           path: bin
 
+      - name: Azure login (OIDC)
+        if: vars.AZURE_CLIENT_ID != '' && needs.sign.result != 'success'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign binaries with Azure Trusted Signing
+        if: vars.AZURE_CLIENT_ID != '' && needs.sign.result != 'success'
+        shell: bash
+        run: |
+          dotnet tool install --global sign --prerelease || true
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          targets=(bin/LYNX.exe)
+          for f in bin/LYNX-bridge32.exe bin/lynx-asio.dll bin/lynx-asio32.dll; do
+            [[ -f "$f" ]] && targets+=("$f")
+          done
+          ./scripts/sign-windows.sh "${targets[@]}" --description "LYNX SHARE"
+
       - name: Check version resource and signature
         shell: pwsh
         run: |
@@ -199,7 +223,9 @@ jobs:
           if ($v.ProductName -ne 'LYNX SHARE' -or $v.ProductVersion -ne $env:VERSION) { throw "version resource mismatch" }
           $sig = Get-AuthenticodeSignature $exe.FullName
           "Authenticode: $($sig.Status) $($sig.SignerCertificate.Subject)"
-          if ('${{ needs.sign.result }}' -eq 'success') {
+          if ('${{ vars.AZURE_CLIENT_ID }}' -ne '') {
+            if ($sig.Status -ne 'Valid') { throw "Azure Trusted Signing build is not validly signed: $($sig.Status)" }
+          } elseif ('${{ needs.sign.result }}' -eq 'success') {
             # the test-signing policy signs with SignPath's self-signed test certificate: Windows does not trust it
             # (status UnknownError/NotTrusted), so only check that a signature from that certificate is present
             if ('${{ vars.SIGNPATH_POLICY_SLUG }}' -eq 'test-signing') {
@@ -223,7 +249,7 @@ jobs:
           Get-Content opentest.txt -Tail 5
           if ($p.ExitCode -ne 0 -or -not (Select-String -Path opentest.txt -Pattern '^result=OK' -Quiet)) { Get-Content opentest.txt | Select-String -Pattern 'FAIL|HANG'; throw "editor windows test failed (exit $($p.ExitCode))" }
 
-      - name: Portable package and installer
+      - name: Build portable package and NSIS installer
         shell: pwsh
         run: |
           $name = "LYNX-$env:LABEL-windows-x64"
@@ -245,9 +271,26 @@ jobs:
           & $nsis -V2 -INPUTCHARSET UTF8 "-DVERSION=$env:VERSION" "-DSTAGE=$PWD\pkg\$name" "-DOUTFILE=$PWD\dist\LYNX-$env:LABEL-setup-x64.exe" `
             "-DICON=$PWD\resources\LYNX.ico" resources\installer\LYNX.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
+
+      - name: Sign installer with Azure Trusted Signing
+        if: vars.AZURE_CLIENT_ID != '' && needs.sign.result != 'success'
+        shell: bash
+        run: |
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          ./scripts/sign-windows.sh "dist/LYNX-$LABEL-setup-x64.exe" --description "LYNX SHARE Installer"
+
+      - name: Verify installer signature and test install/uninstall
+        shell: pwsh
+        run: |
+          $setup = Get-Item "dist\LYNX-$env:LABEL-setup-x64.exe"
+          $sig = Get-AuthenticodeSignature $setup.FullName
+          "Installer Authenticode: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ('${{ vars.AZURE_CLIENT_ID }}' -ne '' -and $sig.Status -ne 'Valid') {
+            throw "signed installer is not validly signed: $($sig.Status)"
+          }
           # the installer installs and uninstalls cleanly (per user, into a scratch folder)
           $inst = "$env:RUNNER_TEMP\lynx-inst"
-          Start-Process "dist\LYNX-$env:LABEL-setup-x64.exe" -ArgumentList '/S', "/D=$inst" -Wait
+          Start-Process $setup.FullName -ArgumentList '/S', "/D=$inst" -Wait
           if (-not (Test-Path "$inst\LYNX.exe")) { throw "installer did not install LYNX.exe" }
           Start-Process "$inst\Uninstall.exe" -ArgumentList '/S', "_?=$inst" -Wait
           if (Test-Path "$inst\LYNX.exe") { throw "uninstaller left LYNX.exe" }
@@ -430,8 +473,35 @@ jobs:
           "$bin" --showcase "$PWD/Demo.lynx" || true
           test -s Demo.lynx
 
-      - name: Package
+      - name: Import Apple signing certificate
+        if: ${{ secrets.APPLE_CERT_P12 != '' }}
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERT_P12 }}
+          CERT_PASS: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KCPASS=$(openssl rand -hex 16)
+          echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KCPASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KCPASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASS" \
+              -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Package (sign, notarize, and staple if credentials present)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_B64: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: ./scripts/package-macos.sh build/LYNX_artefacts/Release/LYNX.app "$LABEL" dist Demo.lynx
+
+      - name: Clean up signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
 
       - name: Upload package
         uses: actions/upload-artifact@v7
@@ -446,7 +516,7 @@ jobs:
     if: ${{ !cancelled() && needs.package.result == 'success' && needs.linux.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
-      contents: write   # attach the files to the release on a tag push
+      contents: write   # attach the files to the release on a tag push or manual dispatch
     env:
       LABEL: ${{ needs.version.outputs.label }}
     steps:
@@ -480,16 +550,26 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      - name: Attach to the GitHub release
-        if: github.ref_type == 'tag'
+      - name: Publish to GitHub Releases
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          tag="$GITHUB_REF_NAME"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$LABEL"
+          fi
           if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --draft --prerelease --title "LYNX SHARE ${tag#v}" \
-              --notes "Built from \`$GITHUB_SHA\` by [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+            gh release create "$tag" --title "LYNX SHARE ${tag#v}" \
+              --notes "Signed release build of **LYNX SHARE ${tag#v}** from commit \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)).
+
+- **Windows (x64 Installer, signed via Azure Trusted Signing):** \`LYNX-$LABEL-setup-x64.exe\`
+- **Windows (x64 Portable ZIP, signed binaries):** \`LYNX-$LABEL-windows-x64.zip\`
+- **macOS (Universal Apple Silicon & Intel DMG, Developer ID signed & notarized):** \`LYNX-$LABEL-macos-universal.dmg\`
+- **Linux (x86_64 AppImage & tarball):** \`LYNX-$LABEL-x86_64.AppImage\`, \`LYNX-$LABEL-linux-x86_64.tar.gz\`
+- **Checksums:** \`SHA256SUMS.txt\`"
           fi
           gh release upload "$tag" dist/* --clobber
 

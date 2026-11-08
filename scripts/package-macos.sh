@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# macOS package of a built LYNX.app (shown as LYNX SHARE: CFBundleName): ad-hoc signature (LYNX has no Apple Developer ID, so it is NOT notarized) and a
-# compressed .dmg with the app, a link to /Applications and a "read me first" note on how to open it the first time.
+# macOS package of a built LYNX.app (shown as LYNX SHARE: CFBundleName).
+# When a Developer ID Application certificate is present in the keychain (CI or local), signs LYNX.app with Hardened
+# Runtime + resources/LYNX.entitlements, builds the compressed .dmg, signs the .dmg, and (when notarisation credentials
+# are present) notarizes and staples it. Otherwise falls back to an ad-hoc signature so local builds still run cleanly.
 #
 # usage: scripts/package-macos.sh <LYNX.app> <label> <output folder> [Demo.lynx]
 set -euo pipefail
@@ -13,14 +15,34 @@ mkdir -p "$STAGE" "$OUTDIR"
 
 ditto "$APP" "$STAGE/LYNX.app"
 ./scripts/fetch-onnxruntime.sh macos "$STAGE/LYNX.app/Contents/Frameworks"
-# ad-hoc signature over the whole bundle: Apple Silicon refuses to run unsigned code, and a consistent bundle
-# signature turns "LYNX is damaged" into the normal "unidentified developer" prompt
-codesign --force --deep --sign - "$STAGE/LYNX.app"
-codesign --verify --deep --strict "$STAGE/LYNX.app"
+
+CERT_LINE="$(security find-identity -v -p codesigning 2>/dev/null | grep -F "Developer ID Application" | head -1 || true)"
+if [[ -n "$CERT_LINE" ]]; then
+    echo "==> Signing LYNX.app with Developer ID Application"
+    ./scripts/sign-macos.sh "$STAGE/LYNX.app" --dry-run
+else
+    # ad-hoc signature over the whole bundle: Apple Silicon refuses to run unsigned code, and a consistent bundle
+    # signature turns "LYNX is damaged" into the normal "unidentified developer" prompt
+    codesign --force --deep --sign - "$STAGE/LYNX.app"
+    codesign --verify --deep --strict "$STAGE/LYNX.app"
+fi
+
 ln -s /Applications "$STAGE/Applications"
 [[ -n "$DEMO" && -f "$DEMO" ]] && cp "$DEMO" "$STAGE/Demo.lynx"
 cp LICENSE "$STAGE/LICENSE.txt"
-cat > "$STAGE/Read me first.txt" <<'EOF'
+
+if [[ -n "$CERT_LINE" ]]; then
+    cat > "$STAGE/Read me first.txt" <<'EOF'
+LYNX SHARE for macOS (Apple Silicon and Intel, macOS 11 or newer)
+
+1. Drag LYNX SHARE into the Applications folder.
+2. Open LYNX SHARE from Applications.
+3. macOS asks for microphone access the first time you record.
+
+Source code, checksums and help: https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO
+EOF
+else
+    cat > "$STAGE/Read me first.txt" <<'EOF'
 LYNX SHARE for macOS (Apple Silicon and Intel, macOS 11 or newer)
 
 1. Drag LYNX SHARE into the Applications folder.
@@ -34,21 +56,8 @@ LYNX SHARE for macOS (Apple Silicon and Intel, macOS 11 or newer)
 3. macOS asks for microphone access the first time you record.
 
 Source code, checksums and help: https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO
-
----
-
-LYNX SHARE para macOS (Apple Silicon e Intel, macOS 11 ou mais novo)
-
-1. Arraste o LYNX SHARE para a pasta Aplicativos.
-2. O LYNX SHARE é software livre de um desenvolvedor independente sem Apple Developer ID, por isso não é notarizado pela
-   Apple. Na primeira vez, abra assim:
-     - Clique com o botão direito (ou Control-clique) no LYNX SHARE em Aplicativos, escolha Abrir e depois Abrir de novo.
-     - No macOS 15 Sequoia ou mais novo: tente abrir o LYNX SHARE uma vez, depois vá em Ajustes do Sistema > Privacidade e
-       Segurança e clique em "Abrir Mesmo Assim" ao lado da mensagem sobre o LYNX.
-   Ou, no Terminal:   xattr -dr com.apple.quarantine /Applications/LYNX.app
-   Depois disso ele abre normalmente.
-3. O macOS pede acesso ao microfone na primeira vez que você gravar.
 EOF
+fi
 
 rm -f "$OUTDIR/$NAME.dmg"
 # hdiutil sometimes fails with "Resource busy" on CI runners (a transient lock on the image); retry a few times
@@ -59,4 +68,15 @@ for attempt in 1 2 3 4 5; do
     echo "hdiutil create failed (attempt $attempt), retrying"; sleep $((attempt * 10))
 done
 hdiutil verify "$OUTDIR/$NAME.dmg"
+
+if [[ -n "$CERT_LINE" ]]; then
+    if [[ -n "${ASC_KEY_B64:-}" || -n "${ASC_KEY_PATH:-}" ]]; then
+        echo "==> Signing, notarizing, and stapling $OUTDIR/$NAME.dmg"
+        ./scripts/sign-macos.sh "$OUTDIR/$NAME.dmg"
+    else
+        echo "==> Signing $OUTDIR/$NAME.dmg (no notarisation key in environment)"
+        ./scripts/sign-macos.sh "$OUTDIR/$NAME.dmg" --dry-run
+    fi
+fi
+
 ls -la "$OUTDIR/$NAME.dmg"
