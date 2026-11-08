@@ -222,7 +222,7 @@ inline bool isNoSound (EffectKind k)
     {
         case EffectKind::peakController: case EffectKind::formulaController: case EffectKind::waveCandy: case EffectKind::visualizer:
         case EffectKind::xyController: case EffectKind::xyzController: case EffectKind::controlSurface: case EffectKind::bigClock:
-        case EffectKind::tuner: case EffectKind::htmlNotebook:
+        case EffectKind::tuner: case EffectKind::htmlNotebook: case EffectKind::edison:
             return true;
         default:
             return false;
@@ -239,7 +239,7 @@ inline const char* skipReason (EffectKind k)
         case EffectKind::patcher: return "a container (its nodes are audited on their own)";
         case EffectKind::hardwareInsert: return "needs an audio device (round trip through hardware)";
         case EffectKind::waveCandy: case EffectKind::visualizer: case EffectKind::bigClock: case EffectKind::htmlNotebook:
-        case EffectKind::tuner:
+        case EffectKind::tuner: case EffectKind::edison:
             return "visual only: no sound, no control output";
         default: return nullptr;
     }

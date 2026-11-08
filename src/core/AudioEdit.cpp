@@ -622,6 +622,64 @@ void addRegion (Document& doc, Range r, std::string name)
     sortMarkers (doc);
 }
 
+int addLoopTakeMarkers (Document& doc, std::int64_t recordAt, std::int64_t recordedFrames, const std::vector<std::int64_t>& wrapOffsets)
+{
+    if (recordedFrames <= 0)
+        return 0;
+    recordAt = clampFrame (recordAt, doc.audio.frames());
+    std::vector<std::int64_t> interior;
+    interior.reserve (wrapOffsets.size());
+    for (const auto w : wrapOffsets)
+        if (w > 0 && w < recordedFrames)
+            interior.push_back (w);
+    std::sort (interior.begin(), interior.end());
+    interior.erase (std::unique (interior.begin(), interior.end()), interior.end());
+    if (interior.empty())
+        return 0;
+
+    addMarker (doc, recordAt, "Take 1");
+    for (std::size_t i = 0; i < interior.size(); ++i)
+        addMarker (doc, recordAt + interior[i], "Take " + std::to_string (i + 2));
+    return (int) interior.size() + 1;
+}
+
+Range markerSpan (const Document& doc, int index) noexcept
+{
+    if (index < 0 || index >= (int) doc.markers.size())
+        return {};
+    const auto& m = doc.markers[(std::size_t) index];
+    if (m.isRegion())
+        return clamp (doc, { m.start, m.end });
+    std::int64_t to = doc.audio.frames();
+    for (int i = index + 1; i < (int) doc.markers.size(); ++i)
+        if (doc.markers[(std::size_t) i].start > m.start)
+        {
+            to = doc.markers[(std::size_t) i].start;
+            break;
+        }
+    return clamp (doc, { m.start, to });
+}
+
+Range spanAroundFrame (const Document& doc, std::int64_t frame) noexcept
+{
+    const auto n = doc.audio.frames();
+    if (n <= 0)
+        return {};
+    frame = clampFrame (frame, n);
+    for (const auto& m : doc.markers)
+        if (m.isRegion() && frame >= m.start && frame < m.end)
+            return clamp (doc, { m.start, m.end });
+    std::int64_t from = 0, to = n;
+    for (const auto& m : doc.markers)
+    {
+        if (m.start <= frame)
+            from = std::max (from, m.start);
+        if (m.start > frame)
+            to = std::min (to, m.start);
+    }
+    return clamp (doc, { from, to });
+}
+
 int removeMarkers (Document& doc, Range r)
 {
     const auto before = doc.markers.size();

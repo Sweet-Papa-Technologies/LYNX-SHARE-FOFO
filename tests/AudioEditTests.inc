@@ -483,3 +483,72 @@ TEST (fl_auto_slicer_matches_fl)
     CHECK (lynx::flslice::autoSlice (x.data(), nullptr, n, 48000.0) == fl);
     CHECK (lynx::flslice::autoSlice (nullptr, nullptr, 0, 44100.0).empty());
 }
+
+#include "core/AudioCapture.h"
+TEST (audioedit_loop_take_markers_and_selection)
+{
+    namespace ae = lynx::audioedit;
+    lynx::AudioCapture cap;
+    cap.setSource (lynx::AudioCapture::input);
+
+    constexpr int passes = 4;
+    constexpr int loopSamples = 1000;
+    for (int pass = 0; pass < passes; ++pass)
+    {
+        if (pass > 0)
+            cap.markLoopWrap();
+        std::vector<float> blockL ((std::size_t) loopSamples, 0.1f * (float) (pass + 1));
+        std::vector<float> blockR ((std::size_t) loopSamples, -0.1f * (float) (pass + 1));
+        cap.push (lynx::AudioCapture::input, blockL.data(), blockR.data(), loopSamples);
+    }
+
+    std::vector<float> recL, recR;
+    std::vector<std::int64_t> wraps;
+    cap.pull (recL, recR, &wraps);
+    cap.setSource (lynx::AudioCapture::off);
+
+    CHECK ((int) recL.size() == passes * loopSamples);
+    CHECK (wraps == (std::vector<std::int64_t> { 1000, 2000, 3000 }));
+
+    ae::Document emptyDoc;
+    ae::History history;
+    history.reset (emptyDoc, "Empty");
+
+    ae::Document doc;
+    doc.title = "Audio input";
+    doc.audio.sampleRate = 48000.0;
+    doc.audio.channels = { recL, recR };
+    ae::addLoopTakeMarkers (doc, 0, (std::int64_t) recL.size(), wraps);
+    history.commit (doc, "Record");
+
+    CHECK ((int) doc.markers.size() == passes);
+    for (int k = 0; k < passes; ++k)
+    {
+        CHECK (doc.markers[(std::size_t) k].start == (std::int64_t) (k * loopSamples));
+        CHECK (! doc.markers[(std::size_t) k].isRegion());
+        CHECK (doc.markers[(std::size_t) k].name == "Take " + std::to_string (k + 1));
+        const ae::Range expected { (std::int64_t) (k * loopSamples), (std::int64_t) ((k + 1) * loopSamples) };
+        CHECK (ae::markerSpan (doc, k) == expected);
+        CHECK (ae::spanAroundFrame (doc, (std::int64_t) (k * loopSamples + loopSamples / 2)) == expected);
+    }
+
+    // Undo / redo preserves the loop-take markers
+    CHECK (history.canUndo());
+    const auto undone = history.undo();
+    CHECK (undone.markers.empty() && undone.audio.empty());
+    CHECK (history.canRedo());
+    const auto redone = history.redo();
+    CHECK ((int) redone.markers.size() == passes);
+    for (int k = 0; k < passes; ++k)
+        CHECK (redone.markers[(std::size_t) k].start == (std::int64_t) (k * loopSamples)
+               && redone.markers[(std::size_t) k].name == "Take " + std::to_string (k + 1));
+
+    // WAV round-trip preserves the loop-take markers
+    const auto wavBytes = ae::encodeWav (doc, ae::WavFormat::float32);
+    ae::Document decoded;
+    CHECK (ae::decodeWav (wavBytes.data(), wavBytes.size(), decoded));
+    CHECK ((int) decoded.markers.size() == passes);
+    for (int k = 0; k < passes; ++k)
+        CHECK (decoded.markers[(std::size_t) k].start == (std::int64_t) (k * loopSamples)
+               && decoded.markers[(std::size_t) k].name == "Take " + std::to_string (k + 1));
+}

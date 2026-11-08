@@ -90,7 +90,7 @@ int paramIndexOf (EffectKind kind, const std::string& name);
 Table parseTable()
 {
     Table table;
-    std::istringstream in (std::string (builtInTable) + effectBanks168r);
+    std::istringstream in (std::string (builtInTable) + effectBanks168rA + effectBanks168rB);
     std::string line, folder;
     auto kind = EffectKind::plugin;
     while (std::getline (in, line))

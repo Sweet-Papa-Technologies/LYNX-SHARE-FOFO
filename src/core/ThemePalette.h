@@ -10,8 +10,19 @@
 // text stays readable. With LYNX's default accent and background it gives exactly the built-in palette.
 namespace lynx::themes
 {
-constexpr std::uint32_t defaultAccent = 0xffe5383b;     // LYNX red
-constexpr std::uint32_t defaultBackground = 0xff15161a; // the app background (token bg1)
+constexpr std::uint32_t classicAccent = 0xffe5383b;     // LYNX Classic red
+constexpr std::uint32_t classicBackground = 0xff15161a; // LYNX Classic background (token bg1)
+constexpr std::uint32_t defaultAccent = 0xffe02844;     // LYNX Vivid crimson (WCAG AA >= 4.5:1 with white text)
+constexpr std::uint32_t defaultBackground = 0xff111520; // Deep midnight-slate app background (token bg1)
+
+// Vivid per-window accent colours (Playlist, Channel Rack, Piano Roll, Mixer, Browser)
+constexpr std::uint32_t playlistAccent    = 0xff00c8ff; // Electric Cyan
+constexpr std::uint32_t channelRackAccent = 0xffff6b35; // Vivid Coral Orange
+constexpr std::uint32_t pianoRollAccent   = 0xff10d98c; // Vivid Emerald Mint
+constexpr std::uint32_t mixerAccent       = 0xffa855f7; // Vivid Violet Amethyst
+constexpr std::uint32_t browserAccent     = 0xfff59e0b; // Vivid Amber Gold
+
+std::uint32_t windowAccent (int panelIndex) noexcept;
 
 // Every themeable token of ui/Theme.h (ARGB).
 struct Palette

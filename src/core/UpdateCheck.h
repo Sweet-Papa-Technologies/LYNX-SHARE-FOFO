@@ -151,6 +151,6 @@ bool cacheFresh (std::int64_t lastCheckMs, std::int64_t nowMs);
 
 // The GitHub API address of the release list (prereleases included; drafts are only listed for the repository's
 // own token, and dropped anyway).
-constexpr const char* releasesUrl = "https://api.github.com/repos/Ka1-S/LYNX-SHARE/releases?per_page=10";
-constexpr const char* releasesPage = "https://github.com/Ka1-S/LYNX-SHARE/releases";
+constexpr const char* releasesUrl = "https://api.github.com/repos/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases?per_page=10";
+constexpr const char* releasesPage = "https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases";
 } // namespace lynx::update

@@ -148,13 +148,14 @@ if [[ "$split" -ge 2 ]] && command -v python3 > /dev/null && python3 scripts/spl
         *zig*) # zig compiles every source of one command in parallel (and caches each object)
             $CXX $FLAGS $CORE $WAVPACK $CHUNKS -o build-local/lynx_tests 2> build-local/split/errors.log || rc=$? ;;
         *)
+            rm -f build-local/split/*.log
             pids=""
             for f in $CHUNKS; do
                 $CXX $FLAGS -c "$f" -o "${f%.cpp}.o" 2> "${f%.cpp}.log" &
                 pids="$pids $!"
             done
             for p in $pids; do wait "$p" || rc=$?; done
-            cat build-local/split/*.log > build-local/split/errors.log
+            cat build-local/split/lynx_split_main.log build-local/split/chunk*.log > build-local/split/errors.log
             [[ $rc == 0 ]] && { $CXX $FLAGS $CORE $WAVPACK $(echo "$CHUNKS" | sed 's/\.cpp/.o/g') -o build-local/lynx_tests 2>> build-local/split/errors.log || rc=$?; } ;;
     esac
     grep -v 'glibc version' build-local/split/errors.log >&2 || true

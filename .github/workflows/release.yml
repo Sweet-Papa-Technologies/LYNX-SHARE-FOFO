@@ -142,7 +142,7 @@ jobs:
   sign:
     name: Sign (SignPath)
     needs: build
-    if: vars.SIGNPATH_ENABLED == 'true'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 200
     permissions:
@@ -499,7 +499,7 @@ jobs:
   store:
     name: Microsoft Store submission
     needs: [version, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    if: false
     runs-on: windows-2025
     env:
       LABEL: ${{ needs.version.outputs.label }}

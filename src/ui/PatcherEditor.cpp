@@ -4,6 +4,7 @@
 #include "ui/PatcherEditor.h"
 #include "ui/VisualEditors.h"
 #include "ui/FlExtraEditors.h"
+#include "ui/AudioEditor.h"
 #include "core/ControlSurface.h"
 #include "core/VideoPlayer.h"
 #include "core/VoltageController.h"
@@ -1479,8 +1480,13 @@ public:
         juce::PopupMenu pluginEffects, pluginInstruments;
         addPluginItems (pluginEffects, engine, false, [this, at] (PluginRef ref) {
             PatchNode n;
-            n.effect.kind = EffectKind::plugin;
-            n.effect.plugin = ref;
+            if (ref.id == "lynx:fx:edison")
+                n.effect = makeEffectSlot (EffectKind::edison);
+            else
+            {
+                n.effect.kind = EffectKind::plugin;
+                n.effect.plugin = ref;
+            }
             addNode (n, at);
         }, this);
         addPluginItems (pluginInstruments, engine, true, [this, at] (PluginRef ref) {
@@ -1586,6 +1592,8 @@ private:
                 n.channel.name = ref.name;
                 n.channel.plugin = ref;
             }
+            else if (ref.id == "lynx:fx:edison")
+                n.effect = makeEffectSlot (EffectKind::edison);
             else
             {
                 n.effect.kind = EffectKind::plugin;
@@ -2211,6 +2219,11 @@ private:
                                 },
                                 title + " (" + tr ("Patcher") + ")"),
                             title + " - " + tr ("Patcher"), target.key() + "-node-" + juce::String (n));
+            return;
+        }
+        if (! node.generator && node.effect.kind == EffectKind::edison)
+        {
+            openAudioEditorForInsert (engine, target.channel ? 0 : target.index);
             return;
         }
         if (! node.generator && node.effect.kind != EffectKind::plugin && node.effect.kind != EffectKind::patcher)

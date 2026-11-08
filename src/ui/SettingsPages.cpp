@@ -423,7 +423,7 @@ private:
         languageNote.setColour (juce::Label::textColourId, noFont ? theme::colour::accent : theme::colour::textDisabled);
         translationLink.setButtonText (tr ("New translation — suggestions welcome"));
         translationLink.setTooltip (tr ("Opens a GitHub issue to suggest a better translation"));
-        translationLink.setURL (juce::URL ("https://github.com/Ka1-S/LYNX-SHARE/issues/new")
+        translationLink.setURL (juce::URL ("https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new")
                                     .withParameter ("title", "Translation (" + id + "): ")
                                     .withParameter ("labels", "translation"));
     }

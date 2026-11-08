@@ -520,8 +520,10 @@ const std::regex& regexFor (const std::string& pattern, int flags)
         auto f = std::regex::ECMAScript;
         if ((flags & 2) != 0)
             f |= std::regex::icase;
+       #if ! defined (_MSC_VER)
         if ((flags & 8) != 0)
             f |= std::regex::multiline;
+       #endif
         slot = std::make_unique<std::regex> (toEcma (pattern, (flags & 16) != 0), f);
         if (cache.size() > 256)
         {

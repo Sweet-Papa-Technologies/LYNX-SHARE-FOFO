@@ -6,6 +6,7 @@
 #include "ui/NewtoneEditor.h"
 #include "ui/VisualEditors.h"
 #include "ui/FlExtraEditors.h"
+#include "ui/AudioEditor.h"
 #include "ui/PluginEditors.h"
 #include "core/LuxeVerb.h"
 #include "core/PresetCycle.h"
@@ -5779,6 +5780,11 @@ void open (AudioEngine& engine, int track, int slot)
     if (kind == EffectKind::patcher) // its node graph editor (REA_rodada141)
     {
         PatcherWindows::openSlot (engine, track, slot);
+        return;
+    }
+    if (kind == EffectKind::edison)
+    {
+        openAudioEditorForInsert (engine, track, slot);
         return;
     }
     if (VisualWindows::handles (kind)) // Wave Candy / Visualizer: displays fed by the slot's tap (round 164c)

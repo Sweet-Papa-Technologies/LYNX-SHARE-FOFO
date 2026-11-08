@@ -201,7 +201,9 @@ public:
 
         for (auto kind : addableEffects())
             if (addableEffectAvailable (kind)) // (FL engines without the user's FL installation are left out)
-                effects.all.push_back ({ addableEffectName (kind), natives::effectEngine (kind) != nullptr ? tr ("built-in FL engine") : tr ("built-in"),
+                effects.all.push_back ({ addableEffectName (kind),
+                                         kind == EffectKind::edison ? tr ("built-in") + " · " + tr ("Audio editor")
+                                                                    : natives::effectEngine (kind) != nullptr ? tr ("built-in FL engine") : tr ("built-in"),
                                          [this, kind, bpm = engine.getSong().bpm] {
                                              if (const auto fx = newAddableEffect (kind, bpm))
                                                  targets.addEffect (*fx);

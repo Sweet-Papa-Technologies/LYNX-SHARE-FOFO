@@ -20,8 +20,8 @@ TEST (report159_consent)
     CHECK (parseConsent ("always") == Consent::always);
     CHECK (parseConsent ("never\n") == Consent::never);
     CHECK (parseConsent ("ask") == Consent::ask);
-    CHECK (parseConsent ("") == Consent::ask);       // no file yet: ask
-    CHECK (parseConsent ("yes") == Consent::ask);    // anything unknown: ask, never "send"
+    CHECK (parseConsent ("") == Consent::never);     // no file yet: never send by default
+    CHECK (parseConsent ("yes") == Consent::never);  // anything unknown: never
     CHECK (std::string (consentName (Consent::always)) == "always" && std::string (consentName (Consent::never)) == "never");
     for (auto c : { Consent::ask, Consent::always, Consent::never })
         CHECK (parseConsent (consentName (c)) == c);
@@ -220,7 +220,7 @@ TEST (report159_github_url)
     f.kind = githubKindOption ("crash");
     f.steps = "1. Open the editor\n2. LYNX closes";
     const auto url = githubIssueUrl (f);
-    CHECK (url.rfind ("https://github.com/Ka1-S/LYNX-SHARE/issues/new?template=bug_report.yml&", 0) == 0);
+    CHECK (url.rfind ("https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new?template=bug_report.yml&", 0) == 0);
     CHECK (has (url, "&os=Windows%2011") && has (url, "&kind=LYNX%20SHARE%20closed%20%28crash%29") && has (url, "&version=0.1.16"));
     CHECK (has (url, "&steps=1.%20Open%20the%20editor%0A2.%20LYNX%20closes"));
     CHECK (! has (url, "&logs=")); // empty fields are left out

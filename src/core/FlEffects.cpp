@@ -1672,6 +1672,7 @@ std::vector<std::string> flPluginsForEffect (EffectKind kind)
         case EffectKind::bigClock: return { "Fruity Big Clock" };
         case EffectKind::tuner: return { "Tuner" };
         case EffectKind::htmlNotebook: return { "Fruity HTML NoteBook" };
+        case EffectKind::edison: return { "Edison" };
         case EffectKind::scratcher: return { "Fruity Scratcher" };
         case EffectKind::transmitter: return { "Transmitter" };
         case EffectKind::flTransporter: return { "Transporter" };

@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "core/Adr.h"
+#include "core/AudioEdit.h"
 #include "core/VideoTrack.h"
 
 namespace lynx
@@ -864,10 +865,11 @@ enum class EffectKind : std::uint8_t
     flTransporter,   // FL's Transporter, exact (REA_rodada167f-transporter, core/TransporterFl.h): FL's 22 controls (raw − min) / range + source, stereo, send
     kilnChannel,     // LYNX's console channel (round tp172c7, core/MixSuite.h kiln): six measured console models, drive, noise, group bypass
     fretChannel,     // LYNX's guitar / bass channel strip (round tp172c8, core/MixSuite.h fret): phase correction, EQ, compressor, amp
-    shellChannel     // LYNX's drum channel strip (round tp172c8, core/MixSuite.h shell): gate, transient shaper, enhancers, listen-mic compressor
+    shellChannel,    // LYNX's drum channel strip (round tp172c8, core/MixSuite.h shell): gate, transient shaper, enhancers, listen-mic compressor
+    edison           // Edison audio recorder / editor slot (passes audio through; opens AudioEditor for the insert)
 };
 // the last EffectKind (loops over every kind; update when one is appended)
-constexpr EffectKind lastEffectKind = EffectKind::shellChannel;
+constexpr EffectKind lastEffectKind = EffectKind::edison;
 
 // round 165x: 160 → 192 (Ember had reached 160; a slot's parameters are 768 bytes, project files store only an engine's
 // own count, so older projects load unchanged). Round 150: 128 → 160 (Prism Multiband 155, Ember 133).
@@ -1803,6 +1805,9 @@ struct Song
     std::vector<VideoTrack> videoTracks;
     VideoSettings video;
     AdrSession adr; // the ADR cue list, its takes and its settings (round 174d, core/Adr.h)
+    // The audio editor's document (audio, take/cue markers, regions, loop; round 86 / phase 2.2): saved with the project
+    // and kept across Song undo/redo. Shared so copying Song is O(1).
+    std::shared_ptr<const audioedit::Document> recorderDocument;
     std::vector<MidiLink> midiLinks;
     // FL's "initialized controls" (.flp 0xD8; the parameter menu's "Init song with this position", REA round 146):
     // values the targets are reset to whenever the song starts playing in song mode (from any position), before

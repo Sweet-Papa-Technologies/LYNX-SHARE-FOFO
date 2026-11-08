@@ -380,6 +380,8 @@ void LiveSessionManager::start (const Options& o)
     keys = livecrypto::derive (invite); // (the relay token depends on the secret only)
     setState (State::starting, tr ("Opening the session..."));
     const auto relay = options.relay.trimCharactersAtEnd ("/");
+    if (relay.isEmpty())
+        return setState (State::ended, tr ("Could not reach the LYNX SHARE relay ({0}).", { tr ("no connection") }));
     const auto token = str (keys.relayToken);
     if (httpThread.joinable())
         httpThread.join();
@@ -453,6 +455,8 @@ void LiveSessionManager::join (const juce::String& code, const Options& o)
     std::string why;
     if (! livelink::Connection::available (&why))
         return setState (State::ended, tr ("Live sessions need a newer libcurl on this computer ({0})", { str (why) }));
+    if (options.relay.trim().isEmpty())
+        return setState (State::ended, tr ("Could not reach the LYNX SHARE relay ({0}).", { tr ("no connection") }));
     const auto parsed = livecrypto::parseCode (utf8 (code));
     if (! parsed)
         return setState (State::ended, tr ("That is not a LYNX SHARE invite code."));
@@ -506,7 +510,7 @@ void LiveSessionManager::end (const juce::String& text, bool keepPart)
     const bool wasLive = state == State::live;
     stopTimer();
     link.close();
-    if (host && roomId.isNotEmpty() && hostToken.isNotEmpty())
+    if (host && roomId.isNotEmpty() && hostToken.isNotEmpty() && options.relay.trim().isNotEmpty())
     {
         // the room goes at once (else when the relay's timer finds it empty)
         const auto url = options.relay.trimCharactersAtEnd ("/") + "/v1/rooms/" + roomId, token = hostToken;
@@ -2200,6 +2204,8 @@ bool LiveSessionManager::resumeHost (const juce::File& file, const Options& o)
     options = o;
     if (options.relay.isEmpty() || j["relay"].toString().isNotEmpty())
         options.relay = j["relay"].toString().isNotEmpty() ? j["relay"].toString() : options.relay;
+    if (options.relay.trim().isEmpty())
+        return false;
     if (options.name.isEmpty())
         options.name = j["name"].toString();
     if (options.projectFile == juce::File())

@@ -123,7 +123,9 @@ std::vector<EffectEntry> effectEntries (AudioEngine& engine, bool withUnavailabl
         {
             const auto flEngine = natives::effectEngine (kind) != nullptr;
             out.push_back ({ std::string ("lynx:fx:") + effectInfo (kind).name, addableEffectName (kind),
-                             flEngine ? tr ("built-in FL engine") : tr ("built-in"), flEngine ? 1 : 0,
+                             kind == EffectKind::edison ? tr ("built-in") + " · " + tr ("Audio editor")
+                                                        : flEngine ? tr ("built-in FL engine") : tr ("built-in"),
+                             flEngine ? 1 : 0,
                              [kind, bpm] { return std::optional<EffectSlot> (newAddableEffect (kind, bpm)); } });
             out.back().available = available;
             out.back().flPlugin = isFlEffect (kind);

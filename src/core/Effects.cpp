@@ -3101,6 +3101,11 @@ const EffectInfo& effectInfo (EffectKind kind)
             static const EffectInfo info { "Fruity HTML NoteBook", {} };
             return info;
         }
+        case EffectKind::edison:
+        {
+            static const EffectInfo info { "Edison", {} };
+            return info;
+        }
         case EffectKind::scratcher:
         {
             // FL's defaults (its editor's DFM): platter at 690 / 30000, 1x, stopped, Hold off, Volume 199 / 255
@@ -3779,6 +3784,7 @@ std::string formatEffectParam (EffectKind kind, int param, float v, double bpm)
         case EffectKind::tuner:
             return flextra::tuner::paramText (param, v);
         case EffectKind::htmlNotebook:
+        case EffectKind::edison:
             return {};
         case EffectKind::scratcher:
             return scratcher::paramText (param, v);
@@ -4110,7 +4116,8 @@ std::unique_ptr<Effect> makeEffect (EffectKind kind)
         case EffectKind::fruityMute2: return flextra::mute2::make(); // round 165g
         case EffectKind::bigClock:
         case EffectKind::tuner:
-        case EffectKind::htmlNotebook: return visualfx::make(); // round 165g: pass the sound, feed the editor's tap
+        case EffectKind::htmlNotebook:
+        case EffectKind::edison: return visualfx::make(); // round 165g: pass the sound, feed the editor's tap
         case EffectKind::scratcher: return scratcher::make (nullptr); // (with its sample: RackRenderer's buildEffect)
         case EffectKind::transmitter: return transmitter::make();
         case EffectKind::flTransporter: return transporter::make(); // round 167f

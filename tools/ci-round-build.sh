@@ -4,7 +4,7 @@
 # the source folders; nothing else in the tree is sent. Exits with the run's result.
 # The pushed tree is public: don't use this for anything that must stay private.
 set -euo pipefail
-repo="${LYNX_CI_REPO:-Ka1-S/LYNX-SHARE}"
+repo="${LYNX_CI_REPO:-Sweet-Papa-Technologies/LYNX-SHARE-FOFO}"
 out="${OUT:-build-win}"
 limit="${LYNX_CI_LIMIT:-10}"
 workflow="${LYNX_CI_WORKFLOW:-$(dirname "$(readlink -f "$0")")/../.github/workflows/round-build.yml}"

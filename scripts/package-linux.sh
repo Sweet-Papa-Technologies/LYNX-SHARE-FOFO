@@ -61,8 +61,8 @@ fi
 # update information (Gear Lever, AppImageUpdate): a fixed address on lynx-share.com, no GitHub API (issue #48: its
 # anonymous limit of 60 requests an hour shows up as "no updates"). scripts/publish-appimage-update.sh points that address
 # at a published release's .zsync. Its URL line is absolute, because readers resolve a relative one against the fixed address.
-UPDATE_INFO="${UPDATE_INFO-zsync|https://lynx-share.com/update/LYNX-$ARCH.AppImage.zsync}"
-APPIMAGE_URL="${APPIMAGE_URL-https://github.com/Ka1-S/LYNX-SHARE/releases/download/v$LABEL/$APPIMAGE}"
+UPDATE_INFO="${UPDATE_INFO:-}"
+APPIMAGE_URL="${APPIMAGE_URL-https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/download/v$LABEL/$APPIMAGE}"
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$TOOL" ${UPDATE_INFO:+-u "$UPDATE_INFO"} "$APPDIR" "$OUTDIR/$APPIMAGE" \
     > "$WORK/appimagetool.log" 2>&1 || { cat "$WORK/appimagetool.log"; exit 1; }
 if [[ -n "$UPDATE_INFO" && ! -f "$OUTDIR/$APPIMAGE.zsync" ]]; then

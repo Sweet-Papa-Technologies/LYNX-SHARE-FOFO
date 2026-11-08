@@ -3,7 +3,7 @@
 Thanks for wanting to help! LYNX SHARE is an alpha, so bug reports, ideas and pull requests are all very welcome.
 
 ## Reporting bugs and asking for features
-- Use the [issue templates](https://github.com/Ka1-S/LYNX-SHARE/issues/new/choose): *Bug report*, *Feature request* or *Sound / plugin difference*.
+- Use the [issue templates](https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new/choose): *Bug report*, *Feature request* or *Sound / plugin difference*.
 - Say which LYNX SHARE version and OS you use (Help › About). For crashes, attach the crash file LYNX SHARE offers to send, or `%APPDATA%\LYNX\autosave\crash*.txt` (Windows) / `~/.config/LYNX/autosave/` (Linux).
 - Screenshots and short videos help a lot, especially side by side with FL Studio.
 

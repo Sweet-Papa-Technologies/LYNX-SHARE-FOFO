@@ -326,8 +326,8 @@ juce::String githubUrl (const cr::ReportInput& in)
 // ================================================================================================================
 juce::String endpoint()
 {
-    const auto custom = juce::SystemStats::getEnvironmentVariable ("LYNX_CRASH_ENDPOINT", {});
-    return custom.isNotEmpty() ? custom : juce::String ("https://lynx-share.com/api/crash.php");
+    // Crash report upload to upstream (lynx-share.com) is disabled in this fork unless explicitly overridden.
+    return juce::SystemStats::getEnvironmentVariable ("LYNX_CRASH_ENDPOINT", {}).trim();
 }
 
 namespace
@@ -347,11 +347,17 @@ enum class Outcome
 {
     sent,
     retry,  // offline, timeout, server busy: try again later
-    reject  // the server refused it (4xx): never again
+    reject  // the server refused it (4xx) or upload is disabled: never again
 };
 
 Outcome post (const juce::MemoryBlock& body, juce::String& message)
 {
+    if (endpoint().isEmpty())
+    {
+        juce::ignoreUnused (body);
+        message = "upload disabled";
+        return Outcome::reject;
+    }
    #if JUCE_LINUX || JUCE_BSD
     // (LYNX is built without libcurl, JUCE_USE_CURL=0: the curl program sends it)
     const auto file = juce::File::createTempFile (".json.gz");
@@ -494,6 +500,13 @@ Uploader& uploader()
 
 void send (const juce::String& json, const juce::String& id, std::function<void (bool, const juce::String&)> done)
 {
+    if (endpoint().isEmpty())
+    {
+        juce::ignoreUnused (json, id);
+        if (done)
+            juce::MessageManager::callAsync ([done = std::move (done)] { done (false, "upload disabled"); });
+        return;
+    }
     pendingFolder().createDirectory();
     const auto body = gzip (json);
     pendingFolder().getChildFile (id + ".json.gz").replaceWithData (body.getData(), body.getSize());
@@ -502,6 +515,8 @@ void send (const juce::String& json, const juce::String& id, std::function<void 
 
 void retryPending()
 {
+    if (endpoint().isEmpty())
+        return;
     if (pendingFolder().findChildFiles (juce::File::findFiles, false, "*.json.gz").isEmpty())
         return;
     if (consent() == cr::Consent::never)

@@ -293,7 +293,7 @@ int run (const juce::StringArray& args)
 {
     const auto i = args.indexOf ("--livetest");
     const juce::File report (args[i + 1].unquoted());
-    juce::String relay = "https://relay.lynx-share.com";
+    juce::String relay = juce::SystemStats::getEnvironmentVariable ("LYNX_RELAY_URL", {}).trim();
     if (const auto r = args.indexOf ("--relay"); r >= 0)
         relay = args[r + 1].unquoted();
     // round 169j: --plugin <a .vst3>: Ana plays that instrument, Rui does not have it (live stand-ins)

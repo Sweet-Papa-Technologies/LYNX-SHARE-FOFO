@@ -27,7 +27,7 @@ void openAudioEditorForChannel (AudioEngine& engine, int channel);
 // song plays (it starts with the playback and stops with it, like FL's Edison record target).
 void openAudioEditorRecording (AudioEngine& engine);
 // A mixer insert (0 = Master): opens with the recording source set to it, like an editor sitting in a mixer slot.
-void openAudioEditorForInsert (AudioEngine& engine, int insert);
+void openAudioEditorForInsert (AudioEngine& engine, int insert, int slot = -1);
 
 // --snapshot: the editor showing `doc` (selection = the second quarter), in the waveform or spectrogram view.
 std::unique_ptr<juce::Component> makeAudioEditorForSnapshot (AudioEngine& engine, audioedit::Document doc, bool spectrum);
@@ -38,4 +38,14 @@ juce::StringArray audioEditorMenuForSnapshot (juce::Component& editor);
 std::unique_ptr<juce::Component> makeAudioToolPanelForSnapshot (juce::Component& editor, int tool, int envelopeMode = 0);
 const char* audioToolNameForSnapshot (int tool); // nullptr past the last tool
 void setAudioEditorEnvelopeModeForSnapshot (juce::Component& editor, int mode);
+
+// Headless test helpers for loop-take recording and take selection in the audio editor (phase 2.2):
+std::unique_ptr<juce::Component> makeAudioEditorForTest (AudioEngine& engine);
+void startAudioEditorLoopRecordForTest (juce::Component& editor, int source);
+void drainAudioEditorRecordForTest (juce::Component& editor);
+void stopAudioEditorRecordForTest (juce::Component& editor);
+audioedit::Document getAudioEditorDocumentForTest (const juce::Component& editor);
+audioedit::Range getAudioEditorSelectionForTest (const juce::Component& editor);
+// Simulates clicking marker `markerIndex` (>= 0) or a frame position (`markerIndex < 0`) in the ruler to select a take.
+audioedit::Range clickAudioEditorTakeForTest (juce::Component& editor, int markerIndex, std::int64_t frame = 0);
 } // namespace lynx

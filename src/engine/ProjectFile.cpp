@@ -274,6 +274,7 @@ const char* effectId (EffectKind k)
         case EffectKind::xyController: return "xyController";
         case EffectKind::xyzController: return "xyzController";
         case EffectKind::controlSurface: return "controlSurface";
+        case EffectKind::edison: return "edison";
     }
     return "eq";
 }
@@ -961,7 +962,7 @@ std::optional<EffectKind> effectFromId (const juce::String& id)
                     EffectKind::xyController, EffectKind::xyzController, EffectKind::controlSurface, EffectKind::hardwareInsert,
                     EffectKind::fruityMute2, EffectKind::bigClock, EffectKind::tuner, EffectKind::htmlNotebook,
                     EffectKind::scratcher, EffectKind::transmitter, EffectKind::flEmphasis, EffectKind::flTransporter,
-                    EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel })
+                    EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel, EffectKind::edison })
         if (id == effectId (k))
             return k;
 
@@ -2532,6 +2533,41 @@ juce::String toJson (const Song& song)
     if (song.hasLoop())
         root->setProperty ("loop", juce::Array<juce::var> { (juce::int64) song.loopStart, (juce::int64) song.loopEnd });
 
+    if (song.recorderDocument != nullptr && (! song.recorderDocument->audio.empty() || ! song.recorderDocument->markers.empty() || song.recorderDocument->hasLoop()))
+    {
+        const auto& doc = *song.recorderDocument;
+        auto rec = std::make_unique<juce::DynamicObject>();
+        if (! doc.title.empty())
+            rec->setProperty ("title", str (doc.title));
+        if (doc.hasLoop())
+            rec->setProperty ("loop", juce::Array<juce::var> { (juce::int64) doc.loopStart, (juce::int64) doc.loopEnd });
+        if (! doc.markers.empty())
+        {
+            juce::Array<juce::var> markers;
+            for (const auto& m : doc.markers)
+            {
+                auto mo = std::make_unique<juce::DynamicObject>();
+                mo->setProperty ("start", (juce::int64) m.start);
+                mo->setProperty ("end", (juce::int64) m.end);
+                mo->setProperty ("name", str (m.name));
+                if (! m.info.empty())
+                    mo->setProperty ("info", str (m.info));
+                if (m.time != 0.0)
+                    mo->setProperty ("time", m.time);
+                if (m.keyNum >= 0)
+                    mo->setProperty ("keyNum", m.keyNum);
+                markers.add (juce::var (mo.release()));
+            }
+            rec->setProperty ("markers", markers);
+        }
+        if (! doc.audio.empty())
+        {
+            const auto wav = audioedit::encodeWav (doc, audioedit::WavFormat::float32);
+            rec->setProperty ("wav", juce::Base64::toBase64 (wav.data(), wav.size()));
+        }
+        root->setProperty ("recorder", juce::var (rec.release()));
+    }
+
     // Online Sessions (round 168a): the lineage, the uid counter, the arrangements' uids (the arrangements list itself
     // is only written when there is more than one) and who works on the project
     if (! song.projectId.empty())
@@ -3033,6 +3069,42 @@ std::optional<Song> fromJson (const juce::String& json, juce::String& error)
     {
         song.loopStart = juce::jmax<juce::int64> (0, (juce::int64) loop[0]);
         song.loopEnd = juce::jmax<juce::int64> (song.loopStart, (juce::int64) loop[1]);
+    }
+
+    if (const auto& rec = root["recorder"]; rec.isObject())
+    {
+        auto doc = std::make_shared<audioedit::Document>();
+        doc->title = rec.getProperty ("title", {}).toString().toStdString();
+        if (const auto wav64 = rec.getProperty ("wav", {}).toString(); wav64.isNotEmpty())
+        {
+            juce::MemoryOutputStream bytes;
+            if (juce::Base64::convertFromBase64 (bytes, wav64))
+                audioedit::decodeWav (static_cast<const std::uint8_t*> (bytes.getData()), bytes.getDataSize(), *doc);
+        }
+        if (const auto& loop = rec["loop"]; loop.isArray() && loop.size() == 2)
+        {
+            doc->loopStart = juce::jmax<juce::int64> (0, (juce::int64) loop[0]);
+            doc->loopEnd = juce::jmax<juce::int64> (doc->loopStart, (juce::int64) loop[1]);
+        }
+        if (auto* markers = rec["markers"].getArray())
+        {
+            doc->markers.clear();
+            for (const auto& m : *markers)
+                if (m.isObject())
+                {
+                    audioedit::Marker mk;
+                    mk.start = juce::jmax<juce::int64> (0, (juce::int64) m.getProperty ("start", 0));
+                    mk.end = juce::jmax<juce::int64> (mk.start, (juce::int64) m.getProperty ("end", (juce::int64) mk.start));
+                    mk.name = m.getProperty ("name", {}).toString().toStdString();
+                    mk.info = m.getProperty ("info", {}).toString().toStdString();
+                    mk.time = (double) m.getProperty ("time", 0.0);
+                    mk.keyNum = (int) m.getProperty ("keyNum", -1);
+                    doc->markers.push_back (std::move (mk));
+                }
+            audioedit::sortMarkers (*doc);
+        }
+        if (! doc->audio.empty() || ! doc->markers.empty() || doc->hasLoop())
+            song.recorderDocument = std::move (doc);
     }
 
     if (auto* mixer = root["mixer"].getArray())

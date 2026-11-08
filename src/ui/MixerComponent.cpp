@@ -3673,7 +3673,7 @@ const EffectKind allEffects[] = { EffectKind::eq,     EffectKind::parametricEq, 
                                       EffectKind::multibandDelay, EffectKind::emphasizer, EffectKind::flEmphasis, EffectKind::flFrequencyShifter, EffectKind::flLowLifter,
                                       EffectKind::flPhaseInverter, EffectKind::flCenter, EffectKind::flBassBoost, EffectKind::fl7BandEq, EffectKind::flDelay1, // round 165k
                                       EffectKind::waveCandy, EffectKind::visualizer, // visual plugins (round 164c)
-                                      EffectKind::fruityMute2, EffectKind::bigClock, EffectKind::tuner, EffectKind::htmlNotebook, // round 165g
+                                      EffectKind::fruityMute2, EffectKind::bigClock, EffectKind::tuner, EffectKind::htmlNotebook, EffectKind::edison, // round 165g
                                       EffectKind::scratcher, // round 165g (flscratch165): FL's turntable
                                       EffectKind::transmitter, // round 165g (fltrans165): FL's transient / sustain splitter
                                       EffectKind::flTransporter, // round 167f: FL's transient looper, exact
@@ -5844,6 +5844,8 @@ bool EffectsPanel::dropEffect (EffectSlot fx, juce::Point<int> position)
             effects.push_back (fx);
     });
     selectedSlot = target >= 0 ? target : added >= 0 ? added : (int) slots()->size() - 1;
+    if (selectedSlot >= 0 && selectedSlot < (int) slots()->size() && (*slots())[(std::size_t) selectedSlot].kind == EffectKind::edison)
+        openEditor (selectedSlot);
     repaint();
     return true;
 }
@@ -6062,6 +6064,11 @@ void EffectsPanel::showAddMenu (int row)
 
     juce::PopupMenu plugins;
     addPluginItems (plugins, engine, false, [this, place] (PluginRef ref) {
+        if (ref.id == "lynx:fx:edison")
+        {
+            place (makeEffectSlot (EffectKind::edison));
+            return;
+        }
         EffectSlot slot;
         slot.kind = EffectKind::plugin;
         slot.plugin = ref;
@@ -6088,6 +6095,8 @@ void EffectsPanel::showSlotMenu (int slot)
         });
         if (slot < (int) slots()->size() && (*slots())[(std::size_t) slot].kind == EffectKind::plugin)
             openPluginWindow (slot);
+        else if (slot < (int) slots()->size() && (*slots())[(std::size_t) slot].kind == EffectKind::edison)
+            openEditor (slot);
     }));
     quickpick::addFolderViewItems (replace, engine);
 
@@ -6714,7 +6723,10 @@ bool MixerComponent::addEffectToSelected (EffectSlot slot)
     if (added)
     {
         effects.setTrack (t);
-        effects.selectSlot ((int) engine.getSong().mixer[(std::size_t) t].effects.size() - 1);
+        const auto newSlot = (int) engine.getSong().mixer[(std::size_t) t].effects.size() - 1;
+        effects.selectSlot (newSlot);
+        if (newSlot >= 0 && engine.getSong().mixer[(std::size_t) t].effects[(std::size_t) newSlot].kind == EffectKind::edison)
+            openAudioEditorForInsert (engine, t, newSlot);
     }
 
     return added;

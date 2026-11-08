@@ -123,7 +123,7 @@ Section "!$(SecApp)" SecMain
     WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "LYNX SHARE"
     WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
     WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "LYNX SHARE"
-    WriteRegStr HKCU "${UNINST_KEY}" "URLInfoAbout" "https://github.com/Ka1-S/LYNX-SHARE"
+    WriteRegStr HKCU "${UNINST_KEY}" "URLInfoAbout" "https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO"
     WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" '"$INSTDIR\LYNX.exe",0'
     WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
     WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'

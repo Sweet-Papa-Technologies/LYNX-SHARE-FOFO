@@ -2397,7 +2397,17 @@ void MainComponent::showWindowsTip()
 void MainComponent::refreshPanelButtons()
 {
     for (int i = 0; i < workspace::panelCount; ++i)
-        panelButtons[(std::size_t) i].setToggleState (workspace.isPanelVisible ((Panel) i), juce::dontSendNotification);
+    {
+        auto& b = panelButtons[(std::size_t) i];
+        const auto visible = workspace.isPanelVisible ((Panel) i);
+        const auto focused = visible && workspace.getFocused() == (Panel) i;
+        const auto winAccent = theme::panelAccent (i);
+        b.setToggleState (visible, juce::dontSendNotification);
+        b.setIconColour (winAccent.withAlpha (0.80f));
+        b.setOnColour (focused ? winAccent.withAlpha (0.34f) : winAccent.withAlpha (0.18f));
+        b.setIconColourWhenOn (focused ? theme::colour::textPrimary : winAccent.brighter (0.30f));
+        b.repaint();
+    }
 }
 
 void MainComponent::openPianoRoll()
@@ -6471,7 +6481,7 @@ juce::PopupMenu MainComponent::getMenuForIndex (int barIndex, const juce::String
                 showImportReport();
         });
         menu.addItem (tr ("Built-in plugins (online list)..."), [] {
-            juce::URL ("https://github.com/Ka1-S/LYNX-SHARE/blob/main/docs/PLUGINS.md").launchInDefaultBrowser();
+            juce::URL ("https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/blob/main/docs/PLUGINS.md").launchInDefaultBrowser();
         });
         menu.addItem (tr ("Report a problem..."), [this] { crashreporter::showManualReport (&engine.getDeviceManager()); });
         if (updater::offered()) // (not in the Store build: the Store updates it)

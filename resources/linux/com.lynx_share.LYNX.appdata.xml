@@ -23,9 +23,9 @@
   </description>
   <launchable type="desktop-id">com.lynx_share.LYNX.desktop</launchable>
   <icon type="stock">lynx</icon>
-  <url type="homepage">https://lynx-share.com</url>
-  <url type="bugtracker">https://github.com/Ka1-S/LYNX-SHARE/issues</url>
-  <url type="vcs-browser">https://github.com/Ka1-S/LYNX-SHARE</url>
+  <url type="homepage">https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO</url>
+  <url type="bugtracker">https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues</url>
+  <url type="vcs-browser">https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO</url>
   <developer id="com.lynx_share">
     <name>LYNX SHARE contributors</name>
   </developer>
@@ -43,15 +43,15 @@
   <screenshots>
     <screenshot type="default">
       <caption>The LYNX SHARE workspace: channel rack, playlist and mixer</caption>
-      <image>https://raw.githubusercontent.com/Ka1-S/LYNX-SHARE/main/docs/img/workspace.png</image>
+      <image>https://raw.githubusercontent.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/main/docs/img/workspace.png</image>
     </screenshot>
     <screenshot>
       <caption>Piano roll</caption>
-      <image>https://raw.githubusercontent.com/Ka1-S/LYNX-SHARE/main/docs/img/piano-roll.png</image>
+      <image>https://raw.githubusercontent.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/main/docs/img/piano-roll.png</image>
     </screenshot>
     <screenshot>
       <caption>Mixer</caption>
-      <image>https://raw.githubusercontent.com/Ka1-S/LYNX-SHARE/main/docs/img/mixer.png</image>
+      <image>https://raw.githubusercontent.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/main/docs/img/mixer.png</image>
     </screenshot>
   </screenshots>
   <provides>

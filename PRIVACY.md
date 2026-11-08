@@ -5,17 +5,16 @@ user or the person installing or operating it.
 
 ## What LYNX SHARE does and does not do
 
-- **Four network connections, all disclosed and under your control.** LYNX SHARE contains no telemetry, analytics,
-  advertising, online account or licence check. It connects to the network for exactly four things:
-  1. **The update check** (below): a version query to GitHub, on by default, off in *Settings › General › Updates*.
-  2. **Crash reports**: sending a crash / freeze report to `https://lynx-share.com/api/crash.php`, only with your
-     consent (below).
+- **Network connections, all disclosed and under your control.** LYNX SHARE contains no telemetry, analytics,
+  advertising, online account or licence check. In this fork (`Sweet-Papa-Technologies/LYNX-SHARE-FOFO`), automatic
+  uploads to upstream's `lynx-share.com` servers are disabled by default:
+  1. **The update check** (below): a version query to GitHub (`Sweet-Papa-Technologies/LYNX-SHARE-FOFO`), on by default, off in *Settings › General › Updates*.
+  2. **Crash reports**: crash report uploads to `lynx-share.com` are disabled, and crash reporting defaults to *Never send* (local crash files only, with an option to open a prefilled GitHub issue on `Sweet-Papa-Technologies/LYNX-SHARE-FOFO`).
   3. **The stem model download**: only after you choose *Extract stems from sample* on an audio clip and agree to the
      download, once, from `https://huggingface.co` (a plain file request; Hugging Face sees your IP address). Your audio
      is never uploaded: separation runs on your computer.
-  4. **Live sessions**: only while you are in one you started (*File › Online session › Start live session...*) or
-     joined with an invite code. Everything goes through the LYNX SHARE relay `relay.lynx-share.com` (a server of the
-     project), **end-to-end encrypted** with a key that comes from the invite code: the relay passes the frames on
+  4. **Live sessions**: disabled against upstream's relay by default unless a relay URL (`LYNX_RELAY_URL`) is explicitly configured. When a relay is configured and you start (*File › Online session › Start live session...*) or
+     join a session with an invite code, everything goes through that relay, **end-to-end encrypted** with a key that comes from the invite code: the relay passes the frames on
      without being able to read them (the project, your edits, your samples, your name), and it never receives the
      code's secret part. It sees what any server sees: your IP address, when you were connected and how many bytes
      went through; it keeps no log of the frames and forgets a room when the session ends. The other people in the
@@ -45,15 +44,15 @@ user or the person installing or operating it.
 
 ## Update check (on by default, switchable)
 
-A few seconds after it starts, LYNX SHARE asks GitHub's public API for the list of LYNX SHARE releases
-(`https://api.github.com/repos/Ka1-S/LYNX-SHARE/releases`) and compares the newest version number with its own. If a
+A few seconds after it starts, LYNX SHARE asks GitHub's public API for the list of releases
+(`https://api.github.com/repos/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases`) and compares the newest version number with its own. If a
 newer version exists, a bar under the toolbar says so (*What's new*, *Update*, and ✕ to skip that version). The list
 is kept for three hours (`update-cache.json` in the settings folder), so LYNX SHARE asks at most once every few hours;
 *Help › Check for updates…* asks at any time.
 
 - **What is sent:** an ordinary HTTPS request for that public list, with the user agent `LYNX-SHARE/<version>`. No
   identifier, no settings, no project, plugin or system information. GitHub sees your IP address, as for any visit to
-  a web page; GitHub's privacy statement applies to it. LYNX SHARE's own server is not involved.
+  a web page; GitHub's privacy statement applies to it.
 - **Turning it off:** *Settings › General › Updates › Check for updates automatically*. Off, LYNX SHARE never connects
   for updates unless you choose *Help › Check for updates…*. The choice is kept in `updates.txt` in the settings folder
   (with the version you skipped, if any).
@@ -65,29 +64,22 @@ is kept for three hours (`update-cache.json` in the settings folder), so LYNX SH
 - **The Microsoft Store version never checks:** the Store updates it, so it has no update check and no *Update*
   button.
 
-## Crash reports (opt-in)
+## Crash reports (local only by default)
 
-After LYNX SHARE closed unexpectedly (a crash or a freeze), the next start asks **"Send the report to help fix it?"**:
-*Send*, *Show what will be sent* (the exact text), *Don't send*, and *Report on GitHub instead* (opens GitHub's issue
-form prefilled; you attach the files yourself). **Help › Report a problem…** sends one by hand, with an optional
-description and an optional e-mail address (only if you want an answer). **Settings › General › Crash reports**:
-*Ask* (default), *Always send*, *Never send*.
+In this fork, **Settings › General › Crash reports** defaults to *Never send*, and automatic/server uploads to upstream's `lynx-share.com` endpoint are disabled.
+Crash and freeze logs are written locally (`autosave\crash *.txt`, `hang *.txt`, `crash-history.log`).
+If you choose **Help › Report a problem…** or **Report on GitHub instead**, LYNX SHARE can open GitHub's issue form prefilled at
+<https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new> (nothing is submitted until you submit the GitHub issue yourself in your browser).
 
-A report contains: a random report id, the LYNX SHARE version / build / commit, the operating system and its version, the
+A prefilled report / local JSON preview contains: a random report id, the LYNX SHARE version / build / commit, the operating system and its version, the
 CPU, the graphics cards and their driver versions, the screen size and scaling, the audio driver / device / sample
 rate / buffer size, the crash or freeze file (where in the program it stopped), the session's last 60 steps, the
 names, vendors, formats and versions of the third-party plugins loaded in that session, and the "GPU rendering" and
 plugin sandbox settings.
 
 It does **not** contain: audio, projects or samples, your computer's name, your user name (every path shows `<user>`
-instead), file and folder names of projects and samples (only their extension, e.g. `<file>.flp`, unless you tick
-"include file names"), or your IP address. The server keeps no IP address: to limit abuse it counts reports per day
-under a salted hash of the address that is deleted the next day. Reports are stored on lynx-share.com's server
-outside the website (not reachable from the web), read only by the LYNX SHARE maintainer, and used only to fix bugs.
-
-A report that could not be sent (offline) is tried once more at the next start, then deleted. The ids of sent reports
-are listed in `crash-reports\sent.log` in LYNX SHARE's settings folder. To have a report deleted, open an issue with its id
-at <https://github.com/Ka1-S/LYNX-SHARE/issues>.
+instead), or file and folder names of projects and samples (only their extension, e.g. `<file>.flp`, unless you tick
+"include file names").
 
 ## Third-party plugins
 
@@ -95,12 +87,6 @@ VST3 and CLAP plugins that **you** load are separate programs from other vendors
 sandbox process) with your permissions and may do things LYNX SHARE does not, including network access. Their behaviour is
 governed by their own privacy policies.
 
-## Website
-
-The website [lynx-share.com](https://lynx-share.com) is a static page (plus the crash-report endpoint above). It asks the GitHub API for the latest release
-so that its download buttons point to it, and remembers your language choice in your browser's local storage. It sets
-no cookies and runs no analytics.
-
 ## Contact
 
-Questions: open an issue at <https://github.com/Ka1-S/LYNX-SHARE/issues>.
+Questions: open an issue at <https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues>.

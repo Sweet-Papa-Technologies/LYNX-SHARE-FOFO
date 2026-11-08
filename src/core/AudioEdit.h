@@ -83,6 +83,7 @@ struct Range
     std::int64_t start = 0, end = 0;
     std::int64_t length() const noexcept { return end > start ? end - start : 0; }
     bool empty() const noexcept { return end <= start; }
+    bool operator== (const Range&) const noexcept = default;
 };
 
 // The range clamped to the audio (start <= end).
@@ -162,6 +163,15 @@ void changeSpeed (Document& doc, Range r, double ratio);
 // --- markers, regions, loop ------------------------------------------------------------------------------------
 void addMarker (Document& doc, std::int64_t at, std::string name = {});
 void addRegion (Document& doc, Range r, std::string name = {});
+// Places "Take 1", "Take 2", ... point markers for a loop recording of `recordedFrames` frames starting at `recordAt`,
+// with loop wraps at frame offsets `wrapOffsets` relative to `recordAt` (strictly interior wraps 0 < w < recordedFrames).
+// Does nothing when there are no interior wraps. Returns how many markers were added.
+int addLoopTakeMarkers (Document& doc, std::int64_t recordAt, std::int64_t recordedFrames, const std::vector<std::int64_t>& wrapOffsets);
+// The frame range [start, end) of marker `index`: its own [start, end) when it is a region, or from its `start`
+// to the next marker's `start` (or the end of the audio) when it is a point marker (such as "Take 1", "Take 2"...).
+Range markerSpan (const Document& doc, int index) noexcept;
+// The frame range of the region containing `frame`, or between the markers surrounding `frame` (or the whole audio).
+Range spanAroundFrame (const Document& doc, std::int64_t frame) noexcept;
 // Removes the markers at positions within the range and the regions that overlap it (an empty range: those at
 // exactly r.start). Returns how many were removed.
 int removeMarkers (Document& doc, Range r);

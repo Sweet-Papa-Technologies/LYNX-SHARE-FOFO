@@ -72,10 +72,17 @@ inline juce::String run()
 
     // the wheel: over a fader it moves that fader one FL step; over the rest of a strip it scrolls the mixer
     engine.editSong ([] (Song& s) { s.mixer[3].volume = unityFader; });
-    const juce::MouseWheelDetails notch { 0.0f, 120.0f * 0.5f / 256.0f, false, false, false };
+   #if JUCE_WINDOWS
+    constexpr float wheelNotchDelta = 120.0f * 0.5f / 256.0f;
+   #elif JUCE_LINUX || JUCE_BSD
+    constexpr float wheelNotchDelta = 50.0f / 256.0f;
+   #else
+    constexpr float wheelNotchDelta = 0.12f;
+   #endif
+    const juce::MouseWheelDetails notch { 0.0f, wheelNotchDelta, false, false, false };
     strips.mouseWheelMove (at (strips, cap, cap, {}), notch);
     check (near (volume (3), unityFader + 0.02f, 1.0e-3f), "the wheel over a fader isn't one step");
-    const juce::MouseWheelDetails down { 0.0f, -120.0f * 0.5f / 256.0f, false, false, false };
+    const juce::MouseWheelDetails down { 0.0f, -wheelNotchDelta, false, false, false };
     view.setViewPosition (0, 0);
     const auto others = volume (3);
     const juce::Point<int> body (rail.getCentreX(), strips.getHeight() - 4);

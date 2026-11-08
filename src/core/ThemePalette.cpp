@@ -18,8 +18,8 @@ std::uint32_t rgb (int r, int g, int b)
     return 0xff000000u | (clamp (r) << 16) | (clamp (g) << 8) | clamp (b);
 }
 
-// The built-in palette (the values ui/Theme.h shipped with before themes existed).
-constexpr Palette builtIn {
+// The classic palette (kept available as the "LYNX Classic" preset and as the surface-step reference).
+constexpr Palette classicBuiltIn {
     0xff0e0f12, 0xff15161a, 0xff1b1d22, 0xff23262c, 0xff2c2f37, 0xff363a43, 0xff434852, // bg0..bg6
     0xff2a2d34, 0xff3b3f48,                                                             // border, borderStrong
     0xffeceef2, 0xffa1a6b0, 0xff60656f,                                                 // text
@@ -29,16 +29,40 @@ constexpr Palette builtIn {
     0xffb3545a, 0xffff6b6e, 0xff4a4e57, 0xff3a3e47                                      // notes, LED
 };
 
-// A surface token for another background: the built-in step from bg1 to that token, applied to the new background
+// The default palette: deep midnight-slate surfaces, WCAG AA/AAA text contrast across all label tiers, and vivid accents.
+constexpr Palette builtIn {
+    0xff0a0d14, 0xff111520, 0xff171c28, 0xff1f2636, 0xff283044, 0xff333d54, 0xff404c68, // bg0..bg6
+    0xff2c354a, 0xff424f6b,                                                             // border, borderStrong
+    0xfff4f6fb, 0xffc6cddb, 0xff8a94a8,                                                 // text (WCAG AAA primary/secondary, AA disabled)
+    0xffe02844, 0xfff5425d, 0xffba1e36, 0xff5e1c2b, 0xffffffff, 0x38e02844,             // accent family (contrast >= 4.6:1 with white)
+    0xffdce2ee, 0xff48536b, 0xff282e3d, 0xff4c3e48, 0xfff29aa7,                         // knobs, steps
+    0xff3f485e, 0xff293040, 0xff1d2330, 0xff131722, 0xff191f2c, 0xff131823,             // grids, keys, rows
+    0xffbf4b5c, 0xffff5c72, 0xff4c5569, 0xff3b4357                                      // notes, LED
+};
+
+// A surface token for another background: the classic step from bg1 to that token, applied to the new background
 // (mirrored for a light background, whose raised surfaces get darker instead of lighter).
 std::uint32_t surface (std::uint32_t token, std::uint32_t background, bool light)
 {
-    const auto base = builtIn.bg1;
+    const auto base = classicBuiltIn.bg1;
     const auto sign = light ? -1 : 1;
     return rgb (red (background) + sign * (red (token) - red (base)), green (background) + sign * (green (token) - green (base)),
                 blue (background) + sign * (blue (token) - blue (base)));
 }
 } // namespace
+
+std::uint32_t windowAccent (int panelIndex) noexcept
+{
+    switch (panelIndex)
+    {
+        case 0: return playlistAccent;
+        case 1: return channelRackAccent;
+        case 2: return pianoRollAccent;
+        case 3: return mixerAccent;
+        case 4: return browserAccent;
+        default: return defaultAccent;
+    }
+}
 
 std::uint32_t mix (std::uint32_t a, std::uint32_t b, double amount)
 {
@@ -75,11 +99,13 @@ Palette derivePalette (std::uint32_t accentIn, std::uint32_t backgroundIn)
     const auto background = backgroundIn | 0xff000000u;
     if (accent == builtIn.accent && background == builtIn.bg1)
         return builtIn;
+    if (accent == classicBuiltIn.accent && background == classicBuiltIn.bg1)
+        return classicBuiltIn;
 
-    Palette p = builtIn;
+    Palette p = classicBuiltIn;
     const auto light = relativeLuminance (background) > 0.4;
 
-    // surfaces, hairlines, grids: the built-in steps from the background
+    // surfaces, hairlines, grids: the classic steps from the background
     for (auto* token : { &p.bg0, &p.bg1, &p.bg2, &p.bg3, &p.bg4, &p.bg5, &p.bg6, &p.border, &p.borderStrong, &p.knobTrack, &p.stepOff,
                          &p.gridBar, &p.gridBeat, &p.gridStep, &p.keyBlack, &p.rowWhite, &p.rowBlack, &p.noteMuted, &p.ledOff })
         *token = surface (*token, background, light);
@@ -88,8 +114,15 @@ Palette derivePalette (std::uint32_t accentIn, std::uint32_t backgroundIn)
     {
         p.textPrimary = 0xff16181c;
         p.textSecondary = 0xff4c515b;
-        p.textDisabled = 0xff8d929b;
+        p.textDisabled = 0xff6b707a;
         p.knobArc = 0xff4c515b;
+    }
+    else
+    {
+        p.textPrimary = builtIn.textPrimary;
+        p.textSecondary = builtIn.textSecondary;
+        p.textDisabled = builtIn.textDisabled;
+        p.knobArc = builtIn.knobArc;
     }
     // a mid-grey background where the dark theme's text would not read: the readable one
     if (contrastRatio (p.textPrimary, p.bg2) < 4.5)
@@ -97,6 +130,18 @@ Palette derivePalette (std::uint32_t accentIn, std::uint32_t backgroundIn)
 
     // the accent family
     if (accent == builtIn.accent)
+    {
+        p.accent = builtIn.accent;
+        p.accentHover = builtIn.accentHover;
+        p.accentPressed = builtIn.accentPressed;
+        p.accentMuted = mix (background, accent, 0.34);
+        p.onAccent = builtIn.onAccent;
+        p.selectionFill = builtIn.selectionFill;
+        p.stepNote = builtIn.stepNote;
+        p.noteHard = builtIn.noteHard;
+        p.noteSoft = builtIn.noteSoft;
+    }
+    else if (accent == classicBuiltIn.accent)
     {
         p.accentMuted = mix (background, accent, 0.34);
     }
@@ -173,8 +218,13 @@ const std::vector<Spec>& builtInThemes()
             return s;
         };
         return std::vector<Spec> {
-            make ("LYNX", defaultAccent, defaultBackground), make ("Ocean", 0xff3d8bfd, 0xff12161d), make ("Emerald", 0xff2fbf71, 0xff131715),
-            make ("Amber", 0xfff0a020, 0xff17150f),          make ("Violet", 0xff9d6bff, 0xff16141c), make ("Graphite", 0xffd5d8de, 0xff141414),
+            make ("LYNX", defaultAccent, defaultBackground),
+            make ("LYNX Classic", classicAccent, classicBackground),
+            make ("Ocean", 0xff3d8bfd, 0xff12161d),
+            make ("Emerald", 0xff2fbf71, 0xff131715),
+            make ("Amber", 0xfff0a020, 0xff17150f),
+            make ("Violet", 0xff9d6bff, 0xff16141c),
+            make ("Graphite", 0xffd5d8de, 0xff141414),
         };
     }();
     return all;

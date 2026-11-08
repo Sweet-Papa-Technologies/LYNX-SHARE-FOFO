@@ -4449,9 +4449,6 @@ void AudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputCha
 
     // With the loop region on, the block is split at the loop end and the position jumps back to
     // its start (the nodes see a jump and release their notes, as in FL).
-    // the audio editor's input recording (nothing happens unless it chose the input)
-    meters.capture.push (AudioCapture::input, numInputChannels > 0 ? inputChannelData[0] : nullptr, numInputChannels > 1 ? inputChannelData[1] : nullptr,
-                         numSamples);
 
     std::array<const float*, 64> inputs {};
     std::array<float*, 64> outputs {};
@@ -4523,6 +4520,9 @@ void AudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputCha
 
         for (int ch = 0; ch < numInputChannels; ++ch)
             inputs[(std::size_t) ch] = inputChannelData[ch] != nullptr ? inputChannelData[ch] + done : nullptr;
+
+        // the audio editor's input recording (nothing happens unless it chose the input; pushed per sub-block so loop wraps are sample-accurate)
+        meters.capture.push (AudioCapture::input, numInputChannels > 0 ? inputs[0] : nullptr, numInputChannels > 1 ? inputs[1] : nullptr, n);
 
         // the block's input by device channel, for the inserts (monitoring, meters) and the takes
         liveInput.numChannels = 0;
@@ -4653,6 +4653,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputCha
             else if (looping && transportReached (position, loopEnd))
             {
                 position = songWrap;
+                meters.capture.markLoopWrap();
                 // loop recording: where this pass ends in the takes (round 163)
                 if (const auto frames = takeFrames.load (std::memory_order_relaxed); frames > 0 && takeStartTick.load (std::memory_order_relaxed) >= 0.0)
                     if (const auto k = takeWrapCount.load (std::memory_order_relaxed); k < (int) takeWraps.size())

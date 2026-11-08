@@ -383,6 +383,11 @@ void drawKnobDirect (juce::Graphics& g, juce::Rectangle<float> bounds, float val
 }
 } // namespace
 
+juce::Colour panelAccent (int panelIndex) noexcept
+{
+    return juce::Colour (themes::windowAccent (panelIndex));
+}
+
 void setPalette (const themes::Palette& p)
 {
     auto c = [] (std::uint32_t argb) { return juce::Colour (argb); };

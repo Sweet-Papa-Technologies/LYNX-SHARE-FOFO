@@ -25,6 +25,7 @@ public:
     {
         source.store (off, std::memory_order_release);
         readIndex.store (writeIndex.load (std::memory_order_acquire), std::memory_order_release);
+        wrapRead.store (wrapWrite.load (std::memory_order_acquire), std::memory_order_release);
         dropped.store (0, std::memory_order_relaxed);
         source.store (newSource, std::memory_order_release);
     }
@@ -59,17 +60,45 @@ public:
             push (from, zeros.data(), zeros.data(), std::min (n - done, (int) zeros.size()));
     }
 
+    // audio thread: marks a transport loop wrap at the current write position (lock-free, no allocation)
+    void markLoopWrap() noexcept
+    {
+        if (source.load (std::memory_order_relaxed) == off)
+            return;
+        const auto ww = wrapWrite.load (std::memory_order_relaxed);
+        const auto wr = wrapRead.load (std::memory_order_acquire);
+        if (ww - wr < maxWraps)
+        {
+            wraps[(std::size_t) (ww & wrapMask)].store (writeIndex.load (std::memory_order_relaxed), std::memory_order_relaxed);
+            wrapWrite.store (ww + 1, std::memory_order_release);
+        }
+    }
+
     // UI: appends what arrived since the last call. Returns the number of frames appended.
-    int pull (std::vector<float>& l, std::vector<float>& r)
+    // When `loopWraps` is given, appends the sample index in `l` (after this call) of every loop wrap that occurred
+    // within the pulled frames.
+    int pull (std::vector<float>& l, std::vector<float>& r, std::vector<std::int64_t>* loopWraps = nullptr)
     {
         const auto w = writeIndex.load (std::memory_order_acquire);
         const auto rd = readIndex.load (std::memory_order_relaxed);
+        const auto base = (std::int64_t) l.size();
         const auto n = (int) (w - rd);
         for (int i = 0; i < n; ++i)
         {
             l.push_back (left[(std::size_t) ((rd + (std::uint64_t) i) & mask)]);
             r.push_back (right[(std::size_t) ((rd + (std::uint64_t) i) & mask)]);
         }
+        const auto ww = wrapWrite.load (std::memory_order_acquire);
+        auto wr = wrapRead.load (std::memory_order_relaxed);
+        for (; wr != ww; ++wr)
+        {
+            const auto pos = wraps[(std::size_t) (wr & wrapMask)].load (std::memory_order_relaxed);
+            if (pos > w)
+                break;
+            if (loopWraps != nullptr && pos >= rd)
+                loopWraps->push_back (base + (std::int64_t) (pos - rd));
+        }
+        wrapRead.store (wr, std::memory_order_release);
         readIndex.store (w, std::memory_order_release);
         return n;
     }
@@ -78,11 +107,15 @@ public:
     int droppedFrames() const noexcept { return dropped.load (std::memory_order_relaxed); }
 
     static constexpr std::size_t capacity = std::size_t (1) << 18; // ~5.5 s at 48 kHz
+    static constexpr std::size_t maxWraps = 256;
 private:
     static constexpr std::uint64_t mask = capacity - 1;
+    static constexpr std::uint64_t wrapMask = maxWraps - 1;
     std::vector<float> left, right;
     std::atomic<int> source { off };
     std::atomic<std::uint64_t> writeIndex { 0 }, readIndex { 0 };
+    std::array<std::atomic<std::uint64_t>, maxWraps> wraps {};
+    std::atomic<std::uint64_t> wrapWrite { 0 }, wrapRead { 0 };
     std::atomic<int> dropped { 0 };
 };
 } // namespace lynx

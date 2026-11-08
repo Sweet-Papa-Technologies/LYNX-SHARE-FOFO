@@ -164,27 +164,38 @@ public:
     void paint (juce::Graphics& g) override
     {
         using namespace theme;
+        const auto winAccent = panelAccent ((int) panel);
         g.fillAll (colour::bg2);
         auto strip = getLocalBounds().removeFromTop (Workspace::titleHeight);
-        g.setColour (colour::bg3);
+        g.setColour (colour::bg3.interpolatedWith (winAccent, focused ? 0.22f : 0.12f));
         g.fillRect (strip);
-        g.setColour (colour::border);
+        g.setColour (colour::border.interpolatedWith (winAccent, focused ? 0.50f : 0.25f));
         g.fillRect (strip.removeFromBottom (1));
     }
 
     void paintOverChildren (juce::Graphics& g) override
     {
         using namespace theme;
+        const auto winAccent = panelAccent ((int) panel);
 
-        if (focused) // the focused panel gets the accent along its title
+        // Subtle window-accent wash across the title strip (including editors sharing the title bar)
+        g.setColour (winAccent.withAlpha (focused ? 0.10f : 0.05f));
+        g.fillRect (0, 0, getWidth(), Workspace::titleHeight - 1);
+        g.setColour (winAccent.withAlpha (focused ? 0.42f : 0.22f));
+        g.fillRect (0, Workspace::titleHeight - 1, getWidth(), 1);
+
+        // Vivid per-window top accent bar: bold 3px + glow when focused, 2px when unfocused
+        g.setColour (focused ? winAccent : winAccent.withAlpha (0.78f));
+        g.fillRect (0, 0, getWidth(), focused ? 3 : 2);
+        if (focused)
         {
-            g.setColour (colour::accent);
-            g.fillRect (0, 0, getWidth(), 2);
+            g.setColour (winAccent.withAlpha (0.32f));
+            g.fillRect (0, 3, getWidth(), 1);
         }
 
         if (! owner.isDetached (panel))
         {
-            g.setColour (focused ? colour::borderStrong.brighter (0.15f) : colour::borderStrong);
+            g.setColour (focused ? winAccent.withAlpha (0.85f) : colour::borderStrong.interpolatedWith (winAccent, 0.38f));
             g.drawRect (getLocalBounds(), 1);
         }
     }
@@ -193,7 +204,7 @@ public:
     int titleWidth() const
     {
         const auto text = juce::roundToInt (juce::GlyphArrangement::getStringWidth (juce::Font (theme::font (theme::type::body, true)), title));
-        return 4 + menuSize + 6 + text + 12 + (accessory != nullptr ? accessoryWidth + 8 : 0);
+        return 4 + menuSize + 10 + text + 12 + (accessory != nullptr ? accessoryWidth + 8 : 0);
     }
 
     void resized() override
@@ -386,6 +397,7 @@ public:
     juce::String getTitle() const { return title; }
     juce::String getTitleTooltip() const { return titleTooltip; }
     bool isFocusedPanel() const { return focused; }
+    Panel getPanel() const noexcept { return panel; }
 
 private:
     // the title text (a child, so it stays visible over an editor sharing the title row)
@@ -396,11 +408,20 @@ private:
         void paint (juce::Graphics& g) override
         {
             using namespace theme;
-            g.setColour (colour::bg3);
+            const auto winAccent = panelAccent ((int) frame.getPanel());
+            const auto isFocused = frame.isFocusedPanel();
+            g.setColour (colour::bg3.interpolatedWith (winAccent, isFocused ? 0.24f : 0.14f));
             g.fillRect (getLocalBounds().withTrimmedTop (2));
-            g.setColour (frame.isFocusedPanel() ? colour::textPrimary : colour::textSecondary);
+
+            // Vivid window-accent pill indicator beside the panel title
+            const auto pillH = (float) juce::jmax (10, getHeight() - 12);
+            const auto pillY = ((float) getHeight() - pillH) * 0.5f + 0.5f;
+            fillRoundRect (g, { (float) (4 + menuSize + 2), pillY, 3.5f, pillH }, 1.75f,
+                           isFocused ? winAccent : winAccent.withAlpha (0.85f));
+
+            g.setColour (isFocused ? colour::textPrimary : colour::textPrimary.interpolatedWith (winAccent, 0.20f));
             g.setFont (font (type::body, true));
-            g.drawFittedText (frame.getTitle(), getLocalBounds().withTrimmedLeft (4 + menuSize + 6).withTrimmedRight (8),
+            g.drawFittedText (frame.getTitle(), getLocalBounds().withTrimmedLeft (4 + menuSize + 10).withTrimmedRight (8),
                               juce::Justification::centredLeft, 1, 0.9f);
         }
 

@@ -16,6 +16,7 @@
 #include "ui/QuickPick.h"
 #include "ui/VideoPlayerView.h"
 #include "ui/VisualEditors.h"
+#include "ui/AudioEditor.h"
 #include "core/FlExtraFx.h"
 #include "core/Vfx.h"
 
@@ -248,6 +249,20 @@ std::unique_ptr<juce::Component> effectEditor (AudioEngine& engine, EffectSlot s
         return FormulaControllerWindows::makeEditor (engine, 1, 0);
     if (NewtoneWindows::handles (kind))
         return makeNewtoneEditor (engine, 1, 0);
+    if (kind == EffectKind::edison)
+    {
+        audioedit::Document doc;
+        doc.audio = audioedit::silence (2, 44100.0, 44100);
+        for (std::size_t i = 0; i < 44100; ++i)
+        {
+            const auto t = (double) i / 44100.0;
+            const auto env = std::sin (t * 3.14159265) * (0.6 + 0.4 * std::sin (t * 25.0));
+            doc.audio.channels[0][i] = (float) (0.7 * env * std::sin (2.0 * 3.14159265 * 220.0 * t));
+            doc.audio.channels[1][i] = (float) (0.7 * env * std::sin (2.0 * 3.14159265 * 221.5 * t));
+        }
+        doc.markers = { { 0, 22050, "Take 1" }, { 22050, 44100, "Take 2" } };
+        return makeAudioEditorForSnapshot (engine, std::move (doc), false);
+    }
     if (Controller164Windows::handles (kind))
     {
         auto locate = [] (Song& song) -> EffectSlot* { return song.mixer.size() > 1 && ! song.mixer[1].effects.empty() ? &song.mixer[1].effects[0] : nullptr; };

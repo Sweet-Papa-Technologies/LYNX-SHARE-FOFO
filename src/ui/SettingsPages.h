@@ -42,7 +42,7 @@ struct GeneralOptions
     bool crossfadesInNewProjects = true; // FL's "Enable automatic crossfades in new projects" (Settings › Project; round 166e)
     bool pluginSandbox = false;
     bool pluginSubstitutes = true; // missing plugins play a LYNX equivalent (core/PluginSubstitutes.h)
-    int crashReports = 0;          // crashreport::Consent: 0 ask, 1 always send, 2 never (round 159)
+    int crashReports = 2;          // crashreport::Consent: 0 ask, 1 always send, 2 never (default: never)
     bool checkUpdates = true;      // "Check for updates automatically" (ui/Updater.h, round 166b)
     bool reducedEffects = false;
     bool artMotion = true;         // round 170j: the Themed plugins' art moves (falling petals, glows...)

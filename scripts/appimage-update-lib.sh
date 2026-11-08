@@ -1,8 +1,8 @@
 # Shared by scripts/deploy-site.sh and scripts/publish-appimage-update.sh: the AppImage's fixed update address.
 # The live site holds the address's target (update/.htaccess, a 302 to a release's .zsync), not this repository, so a site
 # deploy from an old checkout cannot move or remove it.
-UPDATE_ADDRESS="${LYNX_UPDATE_ADDRESS:-https://lynx-share.com/update/LYNX-x86_64.AppImage.zsync}"
-UPDATE_REPO="${LYNX_UPDATE_REPO:-Ka1-S/LYNX-SHARE}"
+UPDATE_ADDRESS="${LYNX_UPDATE_ADDRESS:-}"
+UPDATE_REPO="${LYNX_UPDATE_REPO:-Sweet-Papa-Technologies/LYNX-SHARE-FOFO}"
 # the first release whose AppImage reads the address
 UPDATE_FIRST_VERSION="v0.1.25"
 

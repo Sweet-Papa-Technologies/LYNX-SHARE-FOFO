@@ -3059,11 +3059,153 @@ private:
         // round 177b: a plugin's sidechain bus gets the slot's sidechain (one-click sidechain)
         const auto sidechainResult = lynx::pluginSidechainSelfTest();
 
+        // phase 2.2: loop-take markers in the audio recorder (sample-accurate Take 1..N markers on loop wrap,
+        // click-to-select take by marker or region, project save/load and undo/redo persistence)
+        juce::String loopTakeResult = "OK";
+        {
+            struct LoopStandIn final : juce::AudioIODevice
+            {
+                LoopStandIn() : juce::AudioIODevice ("looptake", "test") {}
+                juce::StringArray getOutputChannelNames() override { return { "L", "R" }; }
+                juce::StringArray getInputChannelNames() override { return { "In L", "In R" }; }
+                juce::Array<double> getAvailableSampleRates() override { return { 48000.0 }; }
+                juce::Array<int> getAvailableBufferSizes() override { return { 500 }; }
+                int getDefaultBufferSize() override { return 500; }
+                juce::String open (const juce::BigInteger&, const juce::BigInteger&, double, int) override { return {}; }
+                void close() override {}
+                bool isOpen() override { return true; }
+                void start (juce::AudioIODeviceCallback*) override {}
+                void stop() override {}
+                bool isPlaying() override { return true; }
+                juce::String getLastError() override { return {}; }
+                int getCurrentBufferSizeSamples() override { return 500; }
+                double getCurrentSampleRate() override { return 48000.0; }
+                int getCurrentBitDepth() override { return 32; }
+                juce::BigInteger getActiveOutputChannels() const override
+                {
+                    juce::BigInteger b;
+                    b.setRange (0, 2, true);
+                    return b;
+                }
+                juce::BigInteger getActiveInputChannels() const override
+                {
+                    juce::BigInteger b;
+                    b.setRange (0, 2, true);
+                    return b;
+                }
+                int getOutputLatencyInSamples() override { return 0; }
+                int getInputLatencyInSamples() override { return 0; }
+            } standIn;
+
+            lynx::AudioEngine recEngine (false);
+            auto song = lynx::Song::makeDefault();
+            song.bpm = 120.0; // at 48 kHz and ppq=960, 1 tick = 25 samples
+            song.mode = lynx::PlayMode::song;
+            song.loopStart = 0;
+            song.loopEnd = 100; // 100 ticks = 2500 samples per loop pass
+            song.channels.clear();
+            song.playlist.clear();
+            recEngine.setSong (song);
+            recEngine.dispatchPendingMessages();
+
+            auto& cb = recEngine.deviceCallback();
+            cb.audioDeviceAboutToStart (&standIn);
+
+            std::vector<float> inL (500, 0.0f), inR (500, 0.0f), outL (500, 0.0f), outR (500, 0.0f);
+            const float* ins[] = { inL.data(), inR.data() };
+            float* outs[] = { outL.data(), outR.data() };
+            juce::AudioIODeviceCallbackContext context;
+
+            recEngine.stop();
+            recEngine.seek (0.0);
+            cb.audioDeviceIOCallbackWithContext (ins, 2, outs, 2, 500, context);
+
+            auto editor = lynx::makeAudioEditorForTest (recEngine);
+            lynx::startAudioEditorLoopRecordForTest (*editor, lynx::AudioCapture::input);
+            recEngine.play();
+
+            constexpr int passes = 4;
+            constexpr int loopSamples = 2500;
+            constexpr int blockSize = 500;
+            for (int pass = 0; pass < passes; ++pass)
+            {
+                const float valL = 0.2f * (float) (pass + 1);
+                const float valR = -0.2f * (float) (pass + 1);
+                std::fill (inL.begin(), inL.end(), valL);
+                std::fill (inR.begin(), inR.end(), valR);
+                for (int b = 0; b < loopSamples / blockSize; ++b)
+                {
+                    cb.audioDeviceIOCallbackWithContext (ins, 2, outs, 2, blockSize, context);
+                    lynx::drainAudioEditorRecordForTest (*editor);
+                }
+            }
+
+            recEngine.stop();
+            lynx::stopAudioEditorRecordForTest (*editor);
+            cb.audioDeviceStopped();
+
+            const auto doc = lynx::getAudioEditorDocumentForTest (*editor);
+            if (doc.audio.frames() != passes * loopSamples)
+                loopTakeResult = "ERROR frames=" + juce::String ((juce::int64) doc.audio.frames());
+            else if ((int) doc.markers.size() != passes)
+                loopTakeResult = "ERROR markers=" + juce::String ((int) doc.markers.size());
+            else
+            {
+                for (int k = 0; k < passes && loopTakeResult == "OK"; ++k)
+                {
+                    const auto expectedStart = (std::int64_t) (k * loopSamples);
+                    const auto expectedEnd = (std::int64_t) ((k + 1) * loopSamples);
+                    const lynx::audioedit::Range expectedRange { expectedStart, expectedEnd };
+                    if (doc.markers[(std::size_t) k].start != expectedStart
+                        || doc.markers[(std::size_t) k].name != "Take " + std::to_string (k + 1))
+                    {
+                        loopTakeResult = "ERROR marker " + juce::String (k) + " at " + juce::String ((juce::int64) doc.markers[(std::size_t) k].start);
+                        break;
+                    }
+                    const auto byMarker = lynx::clickAudioEditorTakeForTest (*editor, k);
+                    const auto byRegion = lynx::clickAudioEditorTakeForTest (*editor, -1, expectedStart + loopSamples / 2);
+                    if (byMarker != expectedRange || byRegion != expectedRange)
+                    {
+                        loopTakeResult = "ERROR select take " + juce::String (k + 1);
+                        break;
+                    }
+                    const float expectedSample = 0.2f * (float) (k + 1);
+                    if (std::abs (doc.audio.channels[0][(std::size_t) (expectedStart + 10)] - expectedSample) > 1.0e-5f)
+                    {
+                        loopTakeResult = "ERROR signal take " + juce::String (k + 1);
+                        break;
+                    }
+                }
+            }
+
+            // Verify undo/redo and ProjectFile save/load preserve the loop-take markers
+            if (loopTakeResult == "OK")
+            {
+                juce::String saveErr;
+                const auto savedSong = lynx::ProjectFile::fromJson (lynx::ProjectFile::toJson (recEngine.getSong()), saveErr);
+                if (! savedSong || savedSong->recorderDocument == nullptr
+                    || (int) savedSong->recorderDocument->markers.size() != passes
+                    || savedSong->recorderDocument->markers[1].start != loopSamples
+                    || savedSong->recorderDocument->markers[1].name != "Take 2")
+                    loopTakeResult = "ERROR project round-trip " + saveErr;
+                else
+                {
+                    recEngine.undo();
+                    const auto undoneDoc = lynx::getAudioEditorDocumentForTest (*editor);
+                    recEngine.redo();
+                    const auto redoneDoc = lynx::getAudioEditorDocumentForTest (*editor);
+                    if (! undoneDoc.markers.empty() || (int) redoneDoc.markers.size() != passes
+                        || redoneDoc.markers[2].start != 2 * loopSamples || redoneDoc.markers[2].name != "Take 3")
+                        loopTakeResult = "ERROR undo/redo";
+                }
+            }
+        }
+
         const auto mixerBasics = lynx::mixerbasics::run();
         const auto ok = mixerBasics == "OK" && audioOk && projectOk && richOk && hwOutOk && flp168jOk && blocksOk && polyOk && latencyOk && substituteOk && patcherOk && nativesOk && undoOk && projectSaveOk && recordOk && recordUndoOk && midiOk && packageOk
                         && sessionResult == "OK" && liveResult.startsWith ("OK")
                         && wavpack != "ERROR" && effectsOk && driverPanel == "OK" && metronomeOk && artResult == "OK" && effectParamsResult == "OK"
-                        && sidechainResult == "OK";
+                        && sidechainResult == "OK" && loopTakeResult == "OK";
 
         juce::String report;
         report << "connections=" << offline.getNumGraphConnections() << "\n"
@@ -3092,6 +3234,7 @@ private:
                << "driver_panel=" << driverPanel << "\n"
                << "plugin_art=" << artResult << "\n"
                << "plugin_sidechain=" << sidechainResult << "\n"
+               << "loop_take_markers=" << loopTakeResult << "\n"
                << "metronome=" << metronomeResult << " (FL sounds " << metronomeFlSounds << "/" << lynx::metronome::soundCount
                << ", downbeat peak " << juce::String (metronomeMaster, 4) << ")\n"
                << "result=" << (ok ? "OK" : "FAILED") << "\n";
@@ -3120,7 +3263,7 @@ private:
             for (int k = 0; k <= (int) lynx::lastEffectKind; ++k)
             {
                 const auto kind = (lynx::EffectKind) k;
-                if (! lynx::NativeEffectWindows::canOpen (kind) || kind == lynx::EffectKind::patcher) // (the Patcher's editor is a graph window)
+                if (! lynx::NativeEffectWindows::canOpen (kind) || kind == lynx::EffectKind::patcher || kind == lynx::EffectKind::edison) // (the Patcher's editor is a graph window)
                     continue;
                 const auto before = lynx::RackRenderer::nonFiniteEffectBlocks();
                 const auto& info = lynx::effectInfo (kind);
@@ -3401,7 +3544,7 @@ private:
         for (int k = 0; k <= (int) lynx::lastEffectKind; ++k)
         {
             const auto kind = (lynx::EffectKind) k;
-            if (! lynx::NativeEffectWindows::canOpen (kind) || kind == lynx::EffectKind::patcher)
+            if (! lynx::NativeEffectWindows::canOpen (kind) || kind == lynx::EffectKind::patcher || kind == lynx::EffectKind::edison)
                 continue;
             const auto& info = lynx::effectInfo (kind);
             const auto base = lynx::natives::newEffect (kind, lynx::flStudioAccess()).value_or (lynx::makeEffectSlot (kind));
@@ -10226,12 +10369,15 @@ private:
                 alert->setOpaque (true);
                 saveWindow (std::move (alert), name);
             };
-            saveAlert (ui.makeConfirmDiscardWindow(), "-confirm.png");
-            saveAlert (lynx::MainComponent::makeAboutWindow(), "-about.png");
-            saveAlert (lynx::makeNameAndColourDialog (lynx::tr ("Rename pattern"), "Pattern 2", lynx::lynxPalette()[6]), "-rename.png");
-            saveAlert (lynx::makeRecordChoiceDialog(), "-record-dialog.png");
-            saveAlert (lynx::makeSamplePitchDialog (7.25f, true, true), "-sample-pitch.png"); // round 163c
-            saveAlert (lynx::makeMidiImportDialog(), "-midi-import-dialog.png"); // File › Import › MIDI file (REA round 143)
+            if (! lynx::platform::testMode())
+            {
+                saveAlert (ui.makeConfirmDiscardWindow(), "-confirm.png");
+                saveAlert (lynx::MainComponent::makeAboutWindow(), "-about.png");
+                saveAlert (lynx::makeNameAndColourDialog (lynx::tr ("Rename pattern"), "Pattern 2", lynx::lynxPalette()[6]), "-rename.png");
+                saveAlert (lynx::makeRecordChoiceDialog(), "-record-dialog.png");
+                saveAlert (lynx::makeSamplePitchDialog (7.25f, true, true), "-sample-pitch.png"); // round 163c
+                saveAlert (lynx::makeMidiImportDialog(), "-midi-import-dialog.png"); // File › Import › MIDI file (REA round 143)
+            }
             saveWindow (lynx::makeSetupWizardContent (offline, {}, {}), "-setup.png");
             saveWindow (lynx::crashreporter::makeDialogForSnapshot (false), "-crash-report.png"); // round 159
             saveWindow (lynx::crashreporter::makeDialogForSnapshot (true), "-report-problem.png");
@@ -10512,6 +10658,17 @@ private:
                 juce::File (prefix + "-audioeditor-menu.txt").replaceWithText (lynx::audioEditorMenuForSnapshot (*wave).joinIntoString ("\n") + "\n");
                 saveWindow (std::move (wave), "-audioeditor.png");
                 saveWindow (lynx::makeAudioEditorForSnapshot (offline, d, true), "-audioeditor-spectrum.png");
+
+                // phase 2.2: loop-recorded takes in the audio editor (Take 1..4 vertical markers, Take 2 selected)
+                ae::Document loopDoc = d;
+                loopDoc.title = "Loop recording";
+                loopDoc.markers.clear();
+                loopDoc.loopStart = loopDoc.loopEnd = 0;
+                ae::addLoopTakeMarkers (loopDoc, 0, (std::int64_t) frames,
+                                        { (std::int64_t) (frames / 4), (std::int64_t) (frames / 2), (std::int64_t) (frames * 3 / 4) });
+                auto loopWave = lynx::makeAudioEditorForSnapshot (offline, loopDoc, false);
+                lynx::clickAudioEditorTakeForTest (*loopWave, 1); // select Take 2
+                saveWindow (std::move (loopWave), "-audioeditor-loop-takes.png");
             }
 
             // the tempo tapper after five steady taps (round 132)

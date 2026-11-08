@@ -33,7 +33,7 @@ LYNX SHARE for macOS (Apple Silicon and Intel, macOS 11 or newer)
    After that it opens normally.
 3. macOS asks for microphone access the first time you record.
 
-Source code, checksums and help: https://github.com/Ka1-S/LYNX-SHARE
+Source code, checksums and help: https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO
 
 ---
 

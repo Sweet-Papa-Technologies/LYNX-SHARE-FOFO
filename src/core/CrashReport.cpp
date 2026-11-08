@@ -16,9 +16,9 @@ Consent parseConsent (std::string_view text)
         text.remove_prefix (1);
     if (text == "always")
         return Consent::always;
-    if (text == "never")
-        return Consent::never;
-    return Consent::ask;
+    if (text == "ask")
+        return Consent::ask;
+    return Consent::never;
 }
 
 const char* consentName (Consent c)

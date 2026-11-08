@@ -27,6 +27,7 @@
 #include "ui/ValueControl.h"
 #include "ui/I18n.h"
 #include "ui/Icons.h"
+#include "ui/SlotWatch.h"
 #include "ui/Theme.h"
 #include "ui/ToolWindow.h"
 
@@ -437,6 +438,7 @@ struct Source
     Kind kind = Kind::none;
     int index = -1; // channel or insert
     juce::String path;
+    int slot = -1;
 };
 
 class AudioEditor final : public juce::Component,
@@ -534,7 +536,12 @@ public:
         envButton.onClick = [this] { envModeMenu().showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&envButton)); };
         setupText (sendButton, tr ("Send"), tr ("Send to the Playlist as an audio clip, to a new Sampler channel or back to the channel"));
         sendButton.setColour (juce::TextButton::buttonColourId, theme::colour::accentMuted);
-        sendButton.onClick = [this] { sendMenu().showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&sendButton)); };
+        sendButton.onClick = [this] {
+            if (! sendDragged)
+                sendMenu().showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&sendButton));
+            sendDragged = false;
+        };
+        sendButton.addMouseListener (this, false);
 
         // quick tools (the second row)
         struct Quick
@@ -574,8 +581,19 @@ public:
 
         setWantsKeyboardFocus (true);
         setSize (1120, 600);
-        history.reset (doc, tr ("Empty").toStdString());
-        updateButtons();
+        if ((source.kind == Source::Kind::none || source.kind == Source::Kind::insert) && engine.getSong().recorderDocument != nullptr)
+        {
+            lastSyncedDoc = engine.getSong().recorderDocument;
+            doc = *lastSyncedDoc;
+            history.reset (doc, tr ("Open").toStdString());
+            documentChanged();
+            zoomToFit();
+        }
+        else
+        {
+            history.reset (doc, tr ("Empty").toStdString());
+            updateButtons();
+        }
         startTimerHz (30);
     }
 
@@ -634,6 +652,7 @@ public:
         selection = {};
         cursor = 0;
         modified = false;
+        syncToSong (false);
         documentChanged();
         zoomToFit();
         updateTitle();
@@ -774,8 +793,15 @@ public:
     // --- mouse ----------------------------------------------------------------------------------------------
     void mouseDown (const juce::MouseEvent& e) override
     {
+        if (e.eventComponent == &sendButton)
+        {
+            sendDragged = false;
+            return;
+        }
         grabKeyboardFocus();
         drag = Drag::none;
+        clickedMarkerInWave = -1;
+        rulerSpanSelect = false;
         if (doc.audio.empty())
         {
             if (e.mods.isPopupMenu())
@@ -784,6 +810,7 @@ public:
         }
 
         const auto pos = e.getPosition();
+        dragStartX = e.x;
 
         if (overviewArea.contains (pos))
         {
@@ -808,15 +835,34 @@ public:
                     return;
                 }
             }
-            if (const auto m = markerAt (e.x); m >= 0)
+            if (const auto m = markerAt (e.x, e.y); m >= 0)
             {
                 if (e.mods.isPopupMenu())
                     markerMenu (m).showMenuAsync (juce::PopupMenu::Options().withMousePosition());
                 else
                 {
+                    selection = ae::markerSpan (doc, m);
+                    cursor = selection.start;
                     dragMarkerIndex = m;
+                    markerDragged = false;
                     beginPointDrag (Drag::marker);
+                    if (playing)
+                        startPlayback();
+                    repaint();
                 }
+                return;
+            }
+            if (! e.mods.isPopupMenu() && ! e.mods.isShiftDown() && ! doc.markers.empty())
+            {
+                const auto f = xToFrame (e.x);
+                selection = ae::spanAroundFrame (doc, f);
+                cursor = selection.start;
+                anchor = snapFrame (f);
+                rulerSpanSelect = true;
+                drag = Drag::select;
+                if (playing)
+                    startPlayback();
+                repaint();
                 return;
             }
         }
@@ -832,6 +878,8 @@ public:
 
         if (waveArea.contains (pos) || rulerArea.contains (pos))
         {
+            if (waveArea.contains (pos) && ! e.mods.isShiftDown())
+                clickedMarkerInWave = markerAt (e.x, -1);
             const auto f = snapFrame (xToFrame (e.x));
             if (e.mods.isShiftDown() && ! selection.empty())
                 anchor = std::abs (f - selection.start) < std::abs (f - selection.end) ? selection.end : selection.start;
@@ -850,6 +898,17 @@ public:
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
+        if (e.eventComponent == &sendButton)
+        {
+            if (! sendDragged && ! doc.audio.empty() && e.getDistanceFromDragStart() >= 4)
+            {
+                sendDragged = true;
+                const auto file = writeEditFile (selection);
+                if (file.existsAsFile())
+                    juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, &sendButton);
+            }
+            return;
+        }
         if (drag == Drag::overview)
         {
             centreViewOnOverview (e.x);
@@ -862,6 +921,17 @@ public:
         }
         if (drag == Drag::none)
             return;
+
+        if (drag == Drag::marker && ! markerDragged)
+        {
+            if (std::abs (e.x - dragStartX) < 4)
+                return;
+            markerDragged = true;
+        }
+        if (drag == Drag::select && rulerSpanSelect && std::abs (e.x - dragStartX) < 4)
+            return;
+        rulerSpanSelect = false;
+        clickedMarkerInWave = -1;
 
         // auto-scroll past the edges
         if (e.x < waveArea.getX())
@@ -890,8 +960,10 @@ public:
         repaint();
     }
 
-    void mouseUp (const juce::MouseEvent&) override
+    void mouseUp (const juce::MouseEvent& e) override
     {
+        if (e.eventComponent == &sendButton)
+            return;
         if (drag == Drag::envPoint || drag == Drag::envBend)
         {
             drag = Drag::none;
@@ -899,6 +971,15 @@ public:
             if (envChanged)
                 commit (tr ("Edit envelope"));
             envChanged = false;
+            return;
+        }
+        if (drag == Drag::select && clickedMarkerInWave >= 0 && std::abs (e.x - dragStartX) < 4)
+        {
+            selection = ae::markerSpan (doc, clickedMarkerInWave);
+            cursor = selection.start;
+            clickedMarkerInWave = -1;
+            drag = Drag::none;
+            repaint();
             return;
         }
         if (drag == Drag::marker || drag == Drag::loopStart || drag == Drag::loopEnd)
@@ -913,6 +994,8 @@ public:
                 commit (drag == Drag::marker ? tr ("Move marker") : tr ("Move loop"));
             }
         }
+        clickedMarkerInWave = -1;
+        rulerSpanSelect = false;
         drag = Drag::none;
     }
 
@@ -921,23 +1004,7 @@ public:
         if (doc.audio.empty() || ! waveArea.contains (e.getPosition()))
             return;
         // the region under the mouse, else the stretch between the markers around it, else everything
-        const auto f = xToFrame (e.x);
-        std::int64_t from = 0, to = doc.audio.frames();
-        for (const auto& m : doc.markers)
-            if (m.isRegion() && f >= m.start && f < m.end)
-            {
-                selection = { m.start, m.end };
-                repaint();
-                return;
-            }
-        for (const auto& m : doc.markers)
-        {
-            if (m.start <= f)
-                from = std::max (from, m.start);
-            if (m.start > f)
-                to = std::min (to, m.start);
-        }
-        selection = { from, to };
+        selection = ae::spanAroundFrame (doc, xToFrame (e.x));
         repaint();
     }
 
@@ -1069,6 +1136,12 @@ public:
     // menus shared with the snapshot check
     juce::PopupMenu editMenu (bool contextual);
 
+    void watchSlot (int insert, int slot)
+    {
+        if (insert >= 0 && slot >= 0)
+            slotWatcher = std::make_unique<ui::SlotGoneWatcher> (engine, insert, slot, [this] { closeToolWindowOf (*this); });
+    }
+
 private:
     enum class Drag
     {
@@ -1148,11 +1221,28 @@ private:
         return ae::nearestZeroCrossing (doc.audio, f, (std::int64_t) juce::jmax (8.0, fpp * 6.0));
     }
 
-    int markerAt (int x) const
+    float markerLabelWidth (const ae::Marker& m) const
+    {
+        if (m.name.empty())
+            return 0.0f;
+        return juce::jmin (120.0f, juce::GlyphArrangement::getStringWidth (theme::font (theme::type::caption, true), juce::String::fromUTF8 (m.name.c_str())) + 10.0f);
+    }
+
+    int markerAt (int x, int y = -1) const
     {
         for (int i = (int) doc.markers.size() - 1; i >= 0; --i)
             if (std::abs (frameToX ((double) doc.markers[(std::size_t) i].start) - (float) x) < 5.0f)
                 return i;
+        if (y >= 0 && rulerArea.contains (x, y) && y >= rulerArea.getY() + 8)
+            for (int i = (int) doc.markers.size() - 1; i >= 0; --i)
+            {
+                const auto& m = doc.markers[(std::size_t) i];
+                const auto mx = frameToX ((double) m.start);
+                const auto nextX = i + 1 < (int) doc.markers.size() ? frameToX ((double) doc.markers[(std::size_t) i + 1].start) - 2.0f : (float) rulerArea.getRight();
+                const auto w = juce::jmax (7.0f, markerLabelWidth (m));
+                if ((float) x >= mx && (float) x <= juce::jmin (mx + w, nextX))
+                    return i;
+            }
         return -1;
     }
 
@@ -1464,23 +1554,38 @@ private:
                         juce::Justification::centredLeft);
         }
 
-        // regions and markers: flags with their names; the loop: a bar along the bottom
-        for (const auto& m : doc.markers)
+        // regions and markers: flags / take badges with their names; the loop: a bar along the bottom
+        for (std::size_t i = 0; i < doc.markers.size(); ++i)
         {
+            const auto& m = doc.markers[i];
             const auto x = frameToX ((double) m.start);
-            if (m.isRegion())
+            const auto span = ae::markerSpan (doc, (int) i);
+            const auto takeSelected = ! selection.empty() && selection.start == span.start && selection.end == span.end;
+            if (m.isRegion() || takeSelected)
             {
-                g.setColour (colour::warning.withAlpha (0.22f));
-                g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x, (float) rulerArea.getY() + 12.0f, frameToX ((double) m.end), (float) rulerArea.getBottom() - 5.0f));
+                g.setColour ((takeSelected ? colour::selection : colour::warning).withAlpha (takeSelected ? 0.28f : 0.22f));
+                g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x, (float) rulerArea.getY() + 11.0f, frameToX ((double) span.end), (float) rulerArea.getBottom() - 4.0f));
             }
-            juce::Path flag;
-            flag.addTriangle (x, (float) rulerArea.getY() + 12.0f, x + 7.0f, (float) rulerArea.getY() + 15.5f, x, (float) rulerArea.getY() + 19.0f);
-            g.setColour (colour::warning);
-            g.fillPath (flag);
-            g.drawVerticalLine ((int) x, (float) rulerArea.getY() + 12.0f, (float) rulerArea.getBottom());
-            if (! m.name.empty())
-                g.drawText (juce::String::fromUTF8 (m.name.c_str()), juce::Rectangle<float> (x + 8.0f, (float) rulerArea.getY() + 12.0f, 120.0f, 8.0f),
-                            juce::Justification::centredLeft);
+            const auto labelW = markerLabelWidth (m);
+            if (labelW > 0.0f)
+            {
+                auto pill = juce::Rectangle<float> (x, (float) rulerArea.getY() + 10.0f, labelW, 12.0f);
+                g.setColour ((takeSelected ? colour::selection : colour::warning).withAlpha (takeSelected ? 0.92f : 0.85f));
+                g.fillRoundedRectangle (pill, 2.5f);
+                g.setColour (colour::bg0);
+                g.setFont (font (type::caption, true));
+                g.drawText (juce::String::fromUTF8 (m.name.c_str()), pill.reduced (3.0f, 0.0f), juce::Justification::centredLeft, false);
+                g.setFont (font (type::caption));
+            }
+            else
+            {
+                juce::Path flag;
+                flag.addTriangle (x, (float) rulerArea.getY() + 12.0f, x + 7.0f, (float) rulerArea.getY() + 15.5f, x, (float) rulerArea.getY() + 19.0f);
+                g.setColour (colour::warning);
+                g.fillPath (flag);
+            }
+            g.setColour (takeSelected ? colour::selection : colour::warning);
+            g.drawVerticalLine ((int) x, (float) rulerArea.getY() + 10.0f, (float) rulerArea.getBottom());
         }
         if (doc.hasLoop())
         {
@@ -1500,9 +1605,12 @@ private:
         juce::Graphics::ScopedSaveState save (g);
         g.reduceClipRegion (waveArea);
 
-        for (const auto& m : doc.markers)
+        for (std::size_t i = 0; i < doc.markers.size(); ++i)
         {
-            g.setColour (colour::warning.withAlpha (0.55f));
+            const auto& m = doc.markers[i];
+            const auto span = ae::markerSpan (doc, (int) i);
+            const auto takeSelected = ! selection.empty() && selection.start == span.start && selection.end == span.end;
+            g.setColour ((takeSelected ? colour::selection : colour::warning).withAlpha (takeSelected ? 0.85f : 0.65f));
             g.drawVerticalLine ((int) frameToX ((double) m.start), (float) waveArea.getY(), (float) waveArea.getBottom());
             if (m.isRegion())
             {
@@ -1635,10 +1743,22 @@ private:
     }
 
     // --- edits ----------------------------------------------------------------------------------------------
+    void syncToSong (bool pushUndo)
+    {
+        if (source.kind == Source::Kind::file || source.kind == Source::Kind::channel)
+            return;
+        auto shared = (! doc.audio.empty() || ! doc.markers.empty() || doc.hasLoop())
+                          ? std::make_shared<const ae::Document> (doc)
+                          : std::shared_ptr<const ae::Document> {};
+        lastSyncedDoc = shared;
+        engine.editSong ([shared] (Song& s) { s.recorderDocument = shared; }, pushUndo);
+    }
+
     void commit (const juce::String& label)
     {
         history.commit (doc, label.toStdString());
         modified = true;
+        syncToSong (true);
         documentChanged();
     }
 
@@ -1695,6 +1815,7 @@ private:
         stopPlayback();
         doc = history.undo();
         modified = true;
+        syncToSong (false);
         documentChanged();
     }
 
@@ -1705,6 +1826,7 @@ private:
         stopPlayback();
         doc = history.redo();
         modified = true;
+        syncToSong (false);
         documentChanged();
     }
 
@@ -2409,6 +2531,7 @@ private:
         recordStereo = recordSource != AudioCapture::input || device->getActiveInputChannels().countNumberOfSetBits() > 1;
         recL.clear();
         recR.clear();
+        recWraps.clear();
         beforeRecording = doc;
         recordAt = selection.empty() ? cursor : selection.start;
         if (doc.audio.empty())
@@ -2428,7 +2551,8 @@ private:
     void drainRecording()
     {
         std::vector<float> l, r;
-        engine.getMeters().capture.pull (l, r);
+        std::vector<std::int64_t> wraps;
+        engine.getMeters().capture.pull (l, r, &wraps);
         if (l.empty())
             return;
         std::size_t from = 0;
@@ -2449,6 +2573,14 @@ private:
             recState = RecState::recording;
             setStatus (tr ("Recording from {0}", { sourceName (recordSource) }), false);
         }
+        const auto base = (std::int64_t) recL.size();
+        for (const auto w : wraps)
+            if (w >= (std::int64_t) from)
+            {
+                const auto offset = base + (w - (std::int64_t) from);
+                if (offset > 0 && (recWraps.empty() || recWraps.back() != offset))
+                    recWraps.push_back (offset);
+            }
         recL.insert (recL.end(), l.begin() + (std::ptrdiff_t) from, l.end());
         recR.insert (recR.end(), r.begin() + (std::ptrdiff_t) from, r.end());
         if (recordMode == RecordMode::onPlay && ! engine.getTransport().playing.load())
@@ -2465,7 +2597,7 @@ private:
         return a;
     }
 
-    // the document = what it was, with the recording inserted at the cursor
+    // the document = what it was, with the recording inserted at the cursor and any loop-take markers placed
     void showRecording()
     {
         doc = beforeRecording;
@@ -2478,6 +2610,7 @@ private:
         else
             ae::insert (doc, recordAt, rec);
         const auto length = doc.audio.frames() - beforeRecording.audio.frames();
+        ae::addLoopTakeMarkers (doc, recordAt, length, recWraps);
         selection = { recordAt, recordAt + length };
         cursor = recordAt + length;
         rebuildSummary();
@@ -2529,6 +2662,7 @@ private:
         }
         recL.clear();
         recR.clear();
+        recWraps.clear();
     }
 
     juce::String sourceName (int s) const
@@ -2565,12 +2699,35 @@ private:
         return t.isEmpty() ? juce::String ("Audio") : t;
     }
 
-    // the edited audio as a new WAV in Music\LYNX\Edits (a new name each time: the Sampler and the waveform caches
-    // key on the path, so nothing stale is ever shown)
-    juce::File writeEditFile()
+    // the edited audio (or a selected take/range) as a new WAV in Music\LYNX\Edits (a new name each time: the Sampler
+    // and the waveform caches key on the path, so nothing stale is ever shown)
+    juce::File writeEditFile (ae::Range range = {})
     {
+        range = ae::clamp (doc, range);
         const auto folder = juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile ("LYNX/Edits");
         folder.createDirectory();
+        if (! range.empty() && (range.start > 0 || range.end < doc.audio.frames()))
+        {
+            ae::Document part;
+            part.audio = ae::copy (doc.audio, range);
+            part.title = doc.title;
+            juce::String suffix = " (part)";
+            for (std::size_t i = 0; i < doc.markers.size(); ++i)
+                if (ae::markerSpan (doc, (int) i) == range && ! doc.markers[i].name.empty())
+                {
+                    suffix = " (" + juce::File::createLegalFileName (juce::String::fromUTF8 (doc.markers[i].name.c_str())) + ")";
+                    break;
+                }
+            const auto file = folder.getNonexistentChildFile (safeTitle() + suffix, ".wav");
+            const auto bytes = ae::encodeWav (part, bits);
+            if (! file.replaceWithData (bytes.data(), bytes.size()))
+            {
+                setStatus (tr ("Could not write {0}", { file.getFullPathName() }), true);
+                return {};
+            }
+            engine.getSampleLibrary().forget (file.getFullPathName());
+            return file;
+        }
         const auto file = folder.getNonexistentChildFile (safeTitle() + " (edit)", ".wav");
         if (! writeWav (file, bits))
             return {};
@@ -2640,17 +2797,25 @@ private:
         if (parts.empty())
         {
             std::int64_t from = 0;
+            std::string currentName;
             for (const auto& m : doc.markers)
+            {
                 if (m.start > from)
                 {
                     parts.push_back ({ from, m.start });
-                    names.push_back ({});
+                    names.push_back (currentName);
                     from = m.start;
+                    currentName = m.name;
                 }
-            if (from > 0 && from < doc.audio.frames())
+                else if (m.start == from)
+                {
+                    currentName = m.name;
+                }
+            }
+            if ((from > 0 || ! currentName.empty()) && from < doc.audio.frames())
             {
                 parts.push_back ({ from, doc.audio.frames() });
-                names.push_back ({});
+                names.push_back (currentName);
             }
         }
         if (parts.empty())
@@ -2678,15 +2843,19 @@ private:
                               });
     }
 
-    void sendToPlaylist()
+    void sendToPlaylist (ae::Range range = {})
     {
         if (doc.audio.empty())
             return;
-        const auto file = writeEditFile();
+        if (range.empty())
+            range = selection;
+        const auto file = writeEditFile (range);
         if (file == juce::File {})
             return;
         const auto& song = engine.getSong();
-        const auto length = juce::jmax<std::int64_t> (ppq / 4, (std::int64_t) (doc.audio.seconds() * song.bpm / 60.0 * ppq));
+        const auto activeFrames = range.empty() ? doc.audio.frames() : range.length();
+        const auto seconds = doc.audio.sampleRate > 0.0 ? (double) activeFrames / doc.audio.sampleRate : 0.0;
+        const auto length = juce::jmax<std::int64_t> (ppq / 4, (std::int64_t) (seconds * song.bpm / 60.0 * ppq));
         const auto start = (std::int64_t) (engine.getTransport().positionTicks.load() / ppq) * ppq; // at the beat of the song position
         // the first track with room for it
         int track = 0;
@@ -2698,7 +2867,7 @@ private:
                 break;
         }
         const auto path = file.getFullPathName().toStdString();
-        const auto name = safeTitle().toStdString();
+        const auto name = file.getFileNameWithoutExtension().toStdString();
         engine.editSong ([=] (Song& s) {
             ChannelDef c;
             c.name = name;
@@ -2818,6 +2987,7 @@ private:
                 stopPlayback();
                 doc = history.jumpTo (i);
                 modified = true;
+                syncToSong (false);
                 documentChanged();
             });
         return menu;
@@ -2877,20 +3047,26 @@ private:
     {
         juce::PopupMenu menu;
         const auto m = doc.markers[(std::size_t) index];
+        const auto span = ae::markerSpan (doc, index);
         menu.addSectionHeader (m.name.empty() ? (m.isRegion() ? tr ("Region") : tr ("Marker")) : juce::String::fromUTF8 (m.name.c_str()));
         menu.addItem (tr ("Rename..."), [this, index] { renameMarker (index); });
-        if (m.isRegion())
+        if (! span.empty())
         {
-            menu.addItem (tr ("Select"), [this, m] {
-                selection = { m.start, m.end };
+            menu.addItem (tr ("Select"), [this, span] {
+                selection = span;
+                cursor = span.start;
                 repaint();
             });
-            menu.addItem (tr ("Zoom on"), [this, m] { zoomTo ({ m.start, m.end }); });
-            menu.addItem (tr ("Send to a new Sampler channel"), [this, m] { sendRangeToNewSampler ({ m.start, m.end }); });
-            menu.addItem (tr ("Set loop"), [this, m] {
-                ae::setLoop (doc, { m.start, m.end });
+            menu.addItem (tr ("Zoom on"), [this, span] { zoomTo (span); });
+            menu.addItem (tr ("Send to the Playlist as an audio clip"), [this, span] { sendToPlaylist (span); });
+            menu.addItem (tr ("Send to a new Sampler channel"), [this, span] { sendRangeToNewSampler (span); });
+            menu.addItem (tr ("Set loop"), [this, span] {
+                ae::setLoop (doc, span);
                 commit (tr ("Set loop"));
             });
+        }
+        if (m.isRegion())
+        {
             menu.addItem (tr ("Turn into marker"), [this, index] {
                 doc.markers[(std::size_t) index].end = doc.markers[(std::size_t) index].start;
                 commit (tr ("Turn into marker"));
@@ -2948,6 +3124,17 @@ private:
 
     void timerCallback() override
     {
+        if (recState == RecState::idle && (source.kind == Source::Kind::none || source.kind == Source::Kind::insert))
+        {
+            const auto& songDoc = engine.getSong().recorderDocument;
+            if (songDoc != lastSyncedDoc)
+            {
+                lastSyncedDoc = songDoc;
+                doc = songDoc != nullptr ? *songDoc : ae::Document {};
+                history.reset (doc, tr ("Open").toStdString());
+                documentChanged();
+            }
+        }
         if (recState != RecState::idle)
         {
             drainRecording();
@@ -3295,7 +3482,9 @@ private:
 
     AudioEngine& engine;
     Source source;
+    std::unique_ptr<ui::SlotGoneWatcher> slotWatcher;
     ae::Document doc;
+    std::shared_ptr<const ae::Document> lastSyncedDoc;
     ae::History history;
     std::shared_ptr<wave::Summary> summary;
     int docVersion = 0;
@@ -3308,6 +3497,8 @@ private:
     double viewStart = 0.0, fpp = 1.0;
     Drag drag = Drag::none;
     int dragMarkerIndex = -1;
+    int dragStartX = 0, clickedMarkerInWave = -1;
+    bool markerDragged = false, rulerSpanSelect = false, sendDragged = false;
 
     bool spectrumView = false, logFrequency = true;
     int fftSize = 2048;
@@ -3330,6 +3521,7 @@ private:
     RecordMode recordMode = RecordMode::now;
     int recordSource = AudioCapture::input;
     std::vector<float> recL, recR;
+    std::vector<std::int64_t> recWraps;
     ae::Document beforeRecording;
     std::int64_t recordAt = 0;
     double recordRate = 44100.0;
@@ -3357,6 +3549,78 @@ private:
         ui::setHint (volumeKnob, text + "  " + tr ("[LMB] drag  [Wheel] step  [2xLMB] 100%  [RMB] type a value"), true);
     }
 
+public:
+    void startLoopRecordForTest (int recSource)
+    {
+        stopPlayback();
+        recordSource = recSource;
+        recordMode = RecordMode::now;
+        const auto trRate = engine.getTransport().sampleRate.load();
+        recordRate = trRate > 0.0 ? trRate : 48000.0;
+        recordStereo = true;
+        recL.clear();
+        recR.clear();
+        recWraps.clear();
+        beforeRecording = doc;
+        recordAt = selection.empty() ? cursor : selection.start;
+        if (doc.audio.empty())
+            recordAt = 0;
+        engine.getMeters().capture.setSource (recordSource);
+        recState = RecState::recording;
+        recordButton.setToggleState (true, juce::dontSendNotification);
+        setStatus (tr ("Recording from {0}", { sourceName (recordSource) }), false);
+        repaint();
+    }
+
+    void drainRecordForTest()
+    {
+        if (recState != RecState::idle)
+        {
+            drainRecording();
+            if (recState == RecState::recording)
+                showRecording();
+        }
+    }
+
+    void stopRecordForTest()
+    {
+        stopRecording();
+    }
+
+    void clickTakeForTest (int markerIndex, std::int64_t frame)
+    {
+        if (getWidth() <= 0 || getHeight() <= 0)
+            setBounds (0, 0, 960, 440);
+        zoomToFit();
+        if (markerIndex >= 0 && juce::isPositiveAndBelow (markerIndex, (int) doc.markers.size()))
+        {
+            const auto mx = (int) std::round (frameToX ((double) doc.markers[(std::size_t) markerIndex].start)) + 4;
+            const auto my = rulerArea.getY() + 6;
+            const auto hit = markerAt (mx, my);
+            if (hit >= 0)
+            {
+                selection = ae::markerSpan (doc, hit);
+                cursor = doc.markers[(std::size_t) hit].start;
+            }
+        }
+        else
+        {
+            const auto rx = (int) std::round (frameToX ((double) frame));
+            const auto f = snapFrame (xToFrame (rx));
+            const auto hitSpan = ae::spanAroundFrame (doc, f);
+            if (! hitSpan.empty())
+            {
+                selection = hitSpan;
+                cursor = hitSpan.start;
+            }
+        }
+        repaint();
+    }
+
+    void syncFromSongForTest()
+    {
+        timerCallback();
+    }
 };
 
 juce::PopupMenu AudioEditor::editMenu (bool contextual)
@@ -3687,10 +3951,11 @@ void openAudioEditorRecording (AudioEngine& engine)
     openWindow (engine, {})->recordInputWithSong();
 }
 
-void openAudioEditorForInsert (AudioEngine& engine, int insert)
+void openAudioEditorForInsert (AudioEngine& engine, int insert, int slot)
 {
-    auto* editor = openWindow (engine, { Source::Kind::insert, insert, {} });
+    auto* editor = openWindow (engine, { Source::Kind::insert, insert, {}, slot });
     editor->setRecordSource (insert);
+    editor->watchSlot (insert, slot);
 }
 
 std::unique_ptr<juce::Component> makeAudioEditorForSnapshot (AudioEngine& engine, audioedit::Document doc, bool spectrum)
@@ -3745,5 +4010,57 @@ juce::StringArray audioEditorMenuForSnapshot (juce::Component& component)
     };
     walk (editor->mainMenu(), {});
     return lines;
+}
+
+std::unique_ptr<juce::Component> makeAudioEditorForTest (AudioEngine& engine)
+{
+    auto editor = std::make_unique<AudioEditor> (engine, Source {});
+    editor->setBounds (0, 0, 960, 440);
+    return editor;
+}
+
+void startAudioEditorLoopRecordForTest (juce::Component& editor, int source)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+        e->startLoopRecordForTest (source);
+}
+
+void drainAudioEditorRecordForTest (juce::Component& editor)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+        e->drainRecordForTest();
+}
+
+void stopAudioEditorRecordForTest (juce::Component& editor)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+        e->stopRecordForTest();
+}
+
+audioedit::Document getAudioEditorDocumentForTest (const juce::Component& editor)
+{
+    if (auto* e = dynamic_cast<const AudioEditor*> (&editor))
+    {
+        const_cast<AudioEditor*> (e)->syncFromSongForTest();
+        return e->toolDocument();
+    }
+    return {};
+}
+
+audioedit::Range getAudioEditorSelectionForTest (const juce::Component& editor)
+{
+    if (auto* e = dynamic_cast<const AudioEditor*> (&editor))
+        return e->toolSelection();
+    return {};
+}
+
+audioedit::Range clickAudioEditorTakeForTest (juce::Component& editor, int markerIndex, std::int64_t frame)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+    {
+        e->clickTakeForTest (markerIndex, frame);
+        return e->toolSelection();
+    }
+    return {};
 }
 } // namespace lynx

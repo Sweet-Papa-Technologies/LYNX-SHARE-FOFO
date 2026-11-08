@@ -22,11 +22,11 @@ namespace lynx::crashreport
 // ---- consent -----------------------------------------------------------------------------------------------------
 enum class Consent
 {
-    ask,    // default: the start-up dialog asks every time
+    ask,    // the start-up dialog asks every time
     always, // send without asking
-    never   // never send, never ask (the plain "closed unexpectedly" notice only)
+    never   // default: never send, never ask (the plain "closed unexpectedly" notice only)
 };
-Consent parseConsent (std::string_view text); // "ask" / "always" / "never"; anything else = ask
+Consent parseConsent (std::string_view text); // "ask" / "always" / "never"; anything else = never
 const char* consentName (Consent);
 
 enum class Action
@@ -132,7 +132,7 @@ struct IssueFields
 {
     std::string title, version, os, osDetails, audio, kind, steps, expected, plugins, logs;
 };
-constexpr const char* issueFormBase = "https://github.com/Ka1-S/LYNX-SHARE/issues/new";
+constexpr const char* issueFormBase = "https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new";
 constexpr std::size_t defaultMaxUrl = 8000;
 
 // The new-issue URL with the form prefilled; at most `maxLength` bytes: the longest fields (logs, steps, plugins)

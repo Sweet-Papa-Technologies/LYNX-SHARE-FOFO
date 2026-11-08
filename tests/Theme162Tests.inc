@@ -7,11 +7,20 @@ TEST (theme162_default_palette_is_the_built_in_look)
     using namespace lynx::themes;
     const auto p = derivePalette (defaultAccent, defaultBackground);
     CHECK (p == defaultPalette());
-    CHECK (p.accent == 0xffe5383b && p.accentHover == 0xfff2545a && p.accentPressed == 0xffc12a30 && p.accentMuted == 0xff5c1f24);
-    CHECK (p.bg0 == 0xff0e0f12 && p.bg1 == 0xff15161a && p.bg6 == 0xff434852 && p.textPrimary == 0xffeceef2 && p.onAccent == 0xffffffff);
+    CHECK (p.accent == 0xffe02844 && p.accentHover == 0xfff5425d && p.accentPressed == 0xffba1e36 && p.accentMuted == 0xff5e1c2b);
+    CHECK (p.bg0 == 0xff0a0d14 && p.bg1 == 0xff111520 && p.bg6 == 0xff404c68 && p.textPrimary == 0xfff4f6fb && p.onAccent == 0xffffffff);
+    CHECK (contrastRatio (p.textPrimary, p.bg2) >= 12.0);
+    CHECK (contrastRatio (p.textSecondary, p.bg2) >= 7.0);
+    CHECK (contrastRatio (p.textDisabled, p.bg2) >= 4.5);
+    CHECK (contrastRatio (p.onAccent, p.accent) >= 4.5);
     CHECK (Spec {}.isDefaultLook());
-    CHECK (workspaceColour (Spec {}) == 0xff0e0f12);
-    CHECK (builtInThemes().size() >= 5 && builtInThemes()[0].accent == defaultAccent && builtInThemes()[0].background == defaultBackground);
+    CHECK (workspaceColour (Spec {}) == 0xff0a0d14);
+    CHECK (builtInThemes().size() >= 6 && builtInThemes()[0].accent == defaultAccent && builtInThemes()[0].background == defaultBackground);
+    CHECK (builtInThemes()[1].name == "LYNX Classic" && builtInThemes()[1].accent == classicAccent && builtInThemes()[1].background == classicBackground);
+    const auto classic = derivePalette (classicAccent, classicBackground);
+    CHECK (classic.accent == 0xffe5383b && classic.bg0 == 0xff0e0f12 && classic.bg1 == 0xff15161a && classic.textPrimary == 0xffeceef2);
+    CHECK (windowAccent (0) == playlistAccent && windowAccent (1) == channelRackAccent && windowAccent (2) == pianoRollAccent
+           && windowAccent (3) == mixerAccent && windowAccent (4) == browserAccent);
 }
 
 TEST (theme162_derived_palettes_keep_relations_and_contrast)

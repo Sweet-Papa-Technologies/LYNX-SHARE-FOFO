@@ -28,7 +28,7 @@ BEGIN
             VALUE "OriginalFilename", "LYNX.exe"
             VALUE "ProductName",      "LYNX SHARE"
             VALUE "ProductVersion",   LYNX_VERSION_STR
-            VALUE "Comments",         "https://github.com/Ka1-S/LYNX-SHARE"
+            VALUE "Comments",         "https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO"
         END
     END
     BLOCK "VarFileInfo"

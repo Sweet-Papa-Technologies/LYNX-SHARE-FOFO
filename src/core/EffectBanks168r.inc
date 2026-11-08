@@ -8,7 +8,7 @@ namespace lynx::presets
 {
 namespace
 {
-const char* const effectBanks168r = R"PRESETS(
+const char* const effectBanks168rA = R"PRESETS(
 
 [Fruity Fast LP]
 Open                 | Cutoff = 100 %; Resonance = 0 %
@@ -111,7 +111,9 @@ G minor              | C = yes; C# = no; D = yes; D# = no; E = no; F = yes; F# =
 folder Effects
 Lower voice          | Gender =#0.3; Formant = on; Speed =#0.6
 Higher voice         | Gender =#0.7; Formant = on; Speed =#0.6
+)PRESETS";
 
+const char* const effectBanks168rB = R"PRESETS(
 [EQ]
 Flat                 | Low = 0 dB; Mid = 0 dB; High = 0 dB; Output = 0 dB
 Bass boost           | Low = 4 dB; Output = -2 dB
