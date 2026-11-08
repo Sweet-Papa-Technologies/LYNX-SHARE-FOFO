@@ -7,14 +7,24 @@ set -euo pipefail
 PLATFORM="$1"; OUT="$2"
 VERSION=1.23.2
 case "$PLATFORM" in
-    windows) ASSET="onnxruntime-win-x64-$VERSION.zip";        SHA=0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd; LIB=lib/onnxruntime.dll ;;
-    linux)   ASSET="onnxruntime-linux-x64-$VERSION.tgz";      SHA=1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b; LIB="lib/libonnxruntime.so.$VERSION" ;;
-    macos)   ASSET="onnxruntime-osx-universal2-$VERSION.tgz"; SHA=49ae8e3a66ccb18d98ad3fe7f5906b6d7887df8a5edd40f49eb2b14e20885809; LIB="lib/libonnxruntime.$VERSION.dylib" ;;
+    windows) ASSET="onnxruntime-win-x64-$VERSION.zip";        ASSET_ID=308474632; SHA=0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd; LIB=lib/onnxruntime.dll ;;
+    linux)   ASSET="onnxruntime-linux-x64-$VERSION.tgz";      ASSET_ID=308474688; SHA=1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b; LIB="lib/libonnxruntime.so.$VERSION" ;;
+    macos)   ASSET="onnxruntime-osx-universal2-$VERSION.tgz"; ASSET_ID=308474678; SHA=49ae8e3a66ccb18d98ad3fe7f5906b6d7887df8a5edd40f49eb2b14e20885809; LIB="lib/libonnxruntime.$VERSION.dylib" ;;
     *) echo "unknown platform: $PLATFORM" >&2; exit 1 ;;
 esac
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$WORK/$ASSET" "https://github.com/microsoft/onnxruntime/releases/download/v$VERSION/$ASSET"
+AUTH_ARGS=()
+TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+if [[ -n "$TOKEN" ]]; then
+    AUTH_ARGS=(-H "Authorization: Bearer $TOKEN")
+fi
+
+curl -fsSL -H "Accept: application/octet-stream" "${AUTH_ARGS[@]}" --retry 5 --retry-delay 5 --retry-all-errors \
+    -o "$WORK/$ASSET" "https://api.github.com/repos/microsoft/onnxruntime/releases/assets/$ASSET_ID" \
+    || curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+    -o "$WORK/$ASSET" "https://github.com/microsoft/onnxruntime/releases/download/v$VERSION/$ASSET"
+
 if command -v sha256sum > /dev/null; then echo "$SHA  $WORK/$ASSET" | sha256sum -c -
 else echo "$SHA  $WORK/$ASSET" | shasum -a 256 -c -; fi
 case "$ASSET" in

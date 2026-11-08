@@ -37,6 +37,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   ZIG_VERSION: 0.14.1
   ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
   JUCE_VERSION: 8.0.4
@@ -100,21 +101,26 @@ jobs:
           tar xzf juce.tar.gz && mv "JUCE-$JUCE_VERSION" "juce-$JUCE_VERSION" && rm juce.tar.gz
 
       - name: Cache compiled object files
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/lynx-objcache
           key: release-objcache-${{ github.run_id }}
           restore-keys: |
             release-objcache-
             round-objcache-
+          save-always: true
+
+      - name: Fetch ONNX Runtime (Windows x64)
+        shell: bash
+        run: ./scripts/fetch-onnxruntime.sh windows build-win
 
       - name: Build (Zig cross compile)
         shell: bash
         run: |
+          ulimit -s 1048576 || true
           ZIG="$HOME/opt/zig-x86_64-linux-$ZIG_VERSION/zig" JUCE_DIR="$HOME/opt/juce-$JUCE_VERSION" OUT=build-win \
             ./scripts/build-windows-zig.sh 2>&1 | grep -v '^1 warning generated\.$'
           sha256sum build-win/LYNX.exe
-          ./scripts/fetch-onnxruntime.sh windows build-win
 
       - name: Upload unsigned LYNX.exe
         id: upload
