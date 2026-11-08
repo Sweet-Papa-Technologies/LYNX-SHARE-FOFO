@@ -104,4 +104,28 @@ TEST (input_reaches_insert_and_meters)
     renderer.process (none.get(), true, 0.0, 256, l.data(), r.data());
     renderer.process (none.get(), true, 0.0, 256, l.data(), r.data());
     CHECK (std::abs (l[200]) < 1e-6f);
+
+    // Edison on an insert with inputChannel >= 0 and monitor == automatic receives input even while playing without
+    // transport recording and without playlist disk-arm; and Edison capturing an unconfigured insert (inputChannel == -1,
+    // no channels/sends) falls back to the active hardware input pair.
+    input.numChannels = 3;
+    input.armed[2].store (false);
+    input.recording.store (false);
+    song.mixer[2].effects.push_back (lynx::makeEffectSlot (lynx::EffectKind::edison));
+    song.mixer[1].inputChannel = -1;
+    song.mixer[1].effects.push_back (lynx::makeEffectSlot (lynx::EffectKind::edison));
+    auto edisonState = lynx::RackState::build (song, none.get(), 48000.0);
+    lynx::MeterBank meters;
+    const auto s1 = meters.capture.acquireStream();
+    const auto s2 = meters.capture.acquireStream();
+    meters.capture.setSource (s1, 1);
+    meters.capture.setSource (s2, 2);
+    renderer.process (edisonState.get(), true, 0.0, 256, l.data(), r.data(), nullptr, &meters);
+    std::vector<float> cap1L, cap1R, cap2L, cap2R;
+    CHECK (meters.capture.pull (s1, cap1L, cap1R) == 256);
+    CHECK (meters.capture.pull (s2, cap2L, cap2R) == 256);
+    CHECK (std::abs (cap1L[100] - 0.25f) < 1e-3f && std::abs (cap1R[100] + 0.5f) < 1e-3f);
+    CHECK (std::abs (cap2L[100] - 0.25f) < 1e-3f && std::abs (cap2R[100] + 0.5f) < 1e-3f);
+    meters.capture.releaseStream (s1);
+    meters.capture.releaseStream (s2);
 }

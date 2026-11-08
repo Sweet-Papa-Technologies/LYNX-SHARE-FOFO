@@ -551,4 +551,28 @@ TEST (audioedit_loop_take_markers_and_selection)
     for (int k = 0; k < passes; ++k)
         CHECK (decoded.markers[(std::size_t) k].start == (std::int64_t) (k * loopSamples)
                && decoded.markers[(std::size_t) k].name == "Take " + std::to_string (k + 1));
+
+    // Multi-instance concurrent AudioCapture streams and per-slot EffectSlot::recorderDocument
+    lynx::AudioCapture multiCap;
+    const auto s1 = multiCap.acquireStream();
+    const auto s2 = multiCap.acquireStream();
+    CHECK (s1 > 0 && s2 > 0 && s1 != s2);
+    multiCap.setSource (s1, 1); // Insert 1
+    multiCap.setSource (s2, 2); // Insert 2
+    CHECK (multiCap.isCapturing (1) && multiCap.isCapturing (2) && ! multiCap.isCapturing (3) && multiCap.isAnyActive());
+
+    std::vector<float> in1L (256, 0.35f), in1R (256, -0.35f);
+    std::vector<float> in2L (256, 0.70f), in2R (256, -0.70f);
+    multiCap.push (1, in1L.data(), in1R.data(), 256);
+    multiCap.push (2, in2L.data(), in2R.data(), 256);
+
+    std::vector<float> out1L, out1R, out2L, out2R;
+    CHECK (multiCap.pull (s1, out1L, out1R) == 256);
+    CHECK (multiCap.pull (s2, out2L, out2R) == 256);
+    CHECK (std::abs (out1L[10] - 0.35f) < 1e-6f && std::abs (out2L[10] - 0.70f) < 1e-6f);
+
+    multiCap.releaseStream (s1);
+    CHECK (! multiCap.isCapturing (1) && multiCap.isCapturing (2));
+    multiCap.releaseStream (s2);
+    CHECK (! multiCap.isAnyActive());
 }

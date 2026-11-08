@@ -557,8 +557,8 @@ private:
     int overrideTrack = -1, overrideSlot = -1;
     int metronomeTarget (const RackState& state) const noexcept;
     void mixMetronome (const RackState& state, int track, int n) noexcept;
-    void mixLiveInput (const RackState& state, bool playing, int n) noexcept;
-    void mixLiveInputTrack (const RackState& state, int track, bool recording, bool playing, int n) noexcept;
+    void mixLiveInput (const RackState& state, bool playing, int n, MeterBank* meters = nullptr) noexcept;
+    void mixLiveInputTrack (const RackState& state, int track, bool recording, bool playing, int n, MeterBank* meters = nullptr) noexcept;
     // the task graph run (RackState::graphOk): per chunk, each task's unfinished predecessors and the ready queue
     // (positions are taken in order by the pool's indices; a task is written to the next free position when its last
     // predecessor finishes)

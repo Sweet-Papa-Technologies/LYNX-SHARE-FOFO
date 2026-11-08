@@ -3546,7 +3546,7 @@ void RackRenderer::processChunk (const RackState& state, bool playing, double st
         }
 
         if (liveInput != nullptr && liveInput->numChannels > 0)
-            mixLiveInput (state, playing, numSamples);
+            mixLiveInput (state, playing, numSamples, meters);
         mixMetronome (state, metronomeTarget (state), numSamples);
 
         // 2) inserts by layers: within a layer nothing depends on anything else; each track pulls the
@@ -3657,17 +3657,17 @@ void RackRenderer::mixHardwareOutputs (const RackState& state, int n) noexcept
     }
 }
 
-void RackRenderer::mixLiveInput (const RackState& state, bool playing, int n) noexcept
+void RackRenderer::mixLiveInput (const RackState& state, bool playing, int n, MeterBank* meters) noexcept
 {
     const auto recording = liveInput->recording.load (std::memory_order_relaxed);
 
     // the Master too (FL's slot panel has its audio input selector; REA round 143): it plays whenever its
     // monitoring is not off (it has no record arm)
     for (int t = 0; t < (int) state.song.mixer.size() && t < maxMixerTracks; ++t)
-        mixLiveInputTrack (state, t, recording, playing, n);
+        mixLiveInputTrack (state, t, recording, playing, n, meters);
 }
 
-void RackRenderer::mixLiveInputTrack (const RackState& state, int t, bool recording, bool playing, int n) noexcept
+void RackRenderer::mixLiveInputTrack (const RackState& state, int t, bool recording, bool playing, int n, MeterBank* meters) noexcept
 {
     if (t >= (int) state.song.mixer.size() || t >= maxMixerTracks)
         return;
@@ -3685,8 +3685,15 @@ void RackRenderer::mixLiveInputTrack (const RackState& state, int t, bool record
 
     liveInput->meters.accumulate (t, peakOf (a, n), peakOf (b, n));
 
-    if (t == 0 ? track.monitor == InputMonitor::off
-               : ! inputMonitored (track.monitor, liveInput->armed[(std::size_t) t].load (std::memory_order_relaxed), playing, recording))
+    const auto edisonCapturing = meters != nullptr && meters->capture.isCapturing (t);
+    const auto hasEdison = std::any_of (track.effects.begin(), track.effects.end(),
+                                        [] (const EffectSlot& s) { return s.enabled && s.kind == EffectKind::edison; });
+    const auto armed = liveInput->armed[(std::size_t) t].load (std::memory_order_relaxed) || hasEdison;
+    if (! edisonCapturing
+        && (t == 0 ? track.monitor == InputMonitor::off
+                   : ! (hasEdison && track.monitor == InputMonitor::automatic
+                            ? true
+                            : inputMonitored (track.monitor, armed, playing, recording))))
         return;
 
     auto* dl = trackBuffer (t, 0);
@@ -3799,7 +3806,7 @@ bool RackRenderer::runTaskGraph (const RackState& state, bool playing, int chann
             const auto t = id - channels + 1;
             sumChannelsInto (state, t, channels, n);
             if (live)
-                mixLiveInputTrack (state, t, recording, playing, n);
+                mixLiveInputTrack (state, t, recording, playing, n, meters);
             mixMetronome (state, t, n);
             processTrack (state, t, n, meters);
         }
@@ -3815,7 +3822,7 @@ bool RackRenderer::runTaskGraph (const RackState& state, bool playing, int chann
     // the Master's own channels and input (its effects run after, as before)
     sumChannelsInto (state, 0, channels, n);
     if (live)
-        mixLiveInputTrack (state, 0, recording, playing, n);
+        mixLiveInputTrack (state, 0, recording, playing, n, meters);
     mixMetronome (state, 0, n);
     return true;
 }
@@ -3899,11 +3906,43 @@ void RackRenderer::processTrack (const RackState& state, int t, int n, MeterBank
     const auto& track = state.song.mixer[(std::size_t) t];
     pullInputs (state, t, n);
 
+    const auto edisonCapturing = meters != nullptr && meters->capture.isCapturing (t);
+    auto* l = trackBuffer (t, 0);
+    auto* r = trackBuffer (t, 1);
+
+    // If Edison is recording this insert and the insert has no explicit inputChannel and no generator/send feeding it,
+    // fall back to the first active hardware audio input pair so recording into Edison on a fresh insert captures input.
+    if (edisonCapturing && t > 0 && track.inputChannel < 0 && liveInput != nullptr && liveInput->numChannels > 0
+        && ((std::size_t) t >= state.trackChannels.size() || state.trackChannels[(std::size_t) t].empty())
+        && ((std::size_t) t >= state.mixerInputs.size() || state.mixerInputs[(std::size_t) t].empty())
+        && isSilentBlock (l, r, n))
+    {
+        int firstActive = -1;
+        for (int c = 0; c < liveInput->numChannels; ++c)
+            if (liveInput->channel (c, liveInputOffset) != nullptr)
+            {
+                firstActive = c;
+                break;
+            }
+        if (firstActive >= 0)
+        {
+            const auto* a = liveInput->channel (firstActive, liveInputOffset);
+            const auto* b = (firstActive + 1 < liveInput->numChannels && liveInput->channel (firstActive + 1, liveInputOffset) != nullptr)
+                                ? liveInput->channel (firstActive + 1, liveInputOffset)
+                                : a;
+            for (int i = 0; i < n; ++i)
+            {
+                l[i] += a[i];
+                r[i] += b[i];
+            }
+        }
+    }
+
     // recording taps on this insert (round 168x, issue #41): FL's "Record" positions after the input
     const auto taps = liveInput != nullptr && t > 0 ? liveInput->tappedPoints (t) : 0u;
-    auto tap = [&] (RecordSource point, const float* l, const float* r) {
+    auto tap = [&] (RecordSource point, const float* tl, const float* tr) {
         if ((taps & (1u << (unsigned) point)) != 0)
-            liveInput->tap (t, point, l, r, liveInputOffset, n);
+            liveInput->tap (t, point, tl, tr, liveInputOffset, n);
     };
 
     const auto silent = track.muted || ! state.mixerAudible[(std::size_t) t];
@@ -3912,7 +3951,7 @@ void RackRenderer::processTrack (const RackState& state, int t, int n, MeterBank
     MixerMatrix target { 0.0f, 0.0f, 0.0f, 0.0f };
     MixerMatrix level { 0.0f, 0.0f, 0.0f, 0.0f }; // the same without the mute (the "Post level and panning" tap)
 
-    if (! silent || (taps & (1u << (unsigned) RecordSource::postLevel)) != 0)
+    if (! silent || (taps & (1u << (unsigned) RecordSource::postLevel)) != 0 || edisonCapturing)
     {
         const auto fader = liveLevel (state, &LiveLevels::mixerVolume, t, track.volume);
         const auto knob = liveLevel (state, &LiveLevels::mixerPan, t, track.pan);
@@ -3943,10 +3982,7 @@ void RackRenderer::processTrack (const RackState& state, int t, int n, MeterBank
     const auto from = std::isnan (last.ll) ? target : last;
     constexpr MixerMatrix zero { 0.0f, 0.0f, 0.0f, 0.0f };
 
-    auto* l = trackBuffer (t, 0);
-    auto* r = trackBuffer (t, 1);
-
-    if (silent && from == zero && taps == 0) // (a muted insert being recorded still runs its effects for the take)
+    if (silent && from == zero && taps == 0 && ! edisonCapturing) // (a muted insert being recorded still runs its effects for the take)
     {
         if (meters != nullptr)
             meters->capture.pushSilence (t, n);
@@ -3980,6 +4016,15 @@ void RackRenderer::processTrack (const RackState& state, int t, int n, MeterBank
             const auto fromLevel = std::isnan (lastLevel.ll) ? level : lastLevel;
             lastLevel = applyMatrix (l, r, dest.first, dest.second, n, fromLevel, level);
         }
+    if (silent && from == zero && taps == 0 && edisonCapturing)
+    {
+        applyMatrix (l, r, l, r, n, level, level);
+        meters->capture.push (t, l, r, n);
+        std::fill (l, l + n, 0.0f);
+        std::fill (r, r + n, 0.0f);
+        last = target;
+        return;
+    }
     last = applyMatrix (l, r, l, r, n, from, target);
     tap (RecordSource::postTrack, l, r);
 
