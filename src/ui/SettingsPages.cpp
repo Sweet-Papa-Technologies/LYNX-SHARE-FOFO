@@ -488,10 +488,13 @@ public:
         driverBox.onChange = [this] {
             if (updating)
                 return;
+            const auto hadInput = engine.hasAudioInput() || engine.audioInputNeeded();
             auto& types = devices.getAvailableDeviceTypes();
             const auto index = driverBox.getSelectedId() - 1;
             if (juce::isPositiveAndBelow (index, types.size()))
                 devices.setCurrentAudioDeviceType (types[index]->getTypeName(), true);
+            if (hadInput && ! engine.hasAudioInput())
+                engine.openAudioInput();
             refresh();
         };
         outputBox.onChange = [this] {
@@ -505,7 +508,7 @@ public:
                     s.inputDeviceName = {};
                     s.useDefaultInputChannels = false;
                     s.inputChannels.clear();
-                });
+                }, false);
             else
             {
                 // every channel of the device opens: each mixer insert picks its own (pair or single channel)
@@ -629,13 +632,16 @@ private:
         };
     }
 
-    void apply (const std::function<void (juce::AudioDeviceManager::AudioDeviceSetup&)>& change)
+    void apply (const std::function<void (juce::AudioDeviceManager::AudioDeviceSetup&)>& change, bool preserveInput = true)
     {
         if (updating)
             return;
+        const auto hadInput = preserveInput && (engine.hasAudioInput() || engine.audioInputNeeded());
         auto setup = devices.getAudioDeviceSetup();
         change (setup);
         error = devices.setAudioDeviceSetup (setup, true);
+        if (hadInput && ! engine.hasAudioInput())
+            engine.openAudioInput();
         refresh();
     }
 

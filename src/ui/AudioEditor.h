@@ -41,6 +41,7 @@ void setAudioEditorEnvelopeModeForSnapshot (juce::Component& editor, int mode);
 
 // Headless test helpers for loop-take recording and take selection in the audio editor (phase 2.2):
 std::unique_ptr<juce::Component> makeAudioEditorForTest (AudioEngine& engine);
+std::unique_ptr<juce::Component> makeAudioEditorForInsertForTest (AudioEngine& engine, int insert, int slot = -1);
 void startAudioEditorLoopRecordForTest (juce::Component& editor, int source);
 void drainAudioEditorRecordForTest (juce::Component& editor);
 void stopAudioEditorRecordForTest (juce::Component& editor);

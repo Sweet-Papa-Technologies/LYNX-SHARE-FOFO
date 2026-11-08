@@ -763,6 +763,82 @@ void readSendSpans (Song& song, const juce::var& root)
             }
         }
 }
+
+juce::var recorderDocToVar (const std::shared_ptr<const audioedit::Document>& docPtr)
+{
+    if (docPtr == nullptr || (docPtr->audio.empty() && docPtr->markers.empty() && ! docPtr->hasLoop()))
+        return {};
+    const auto& doc = *docPtr;
+    auto rec = std::make_unique<juce::DynamicObject>();
+    if (! doc.title.empty())
+        rec->setProperty ("title", str (doc.title));
+    if (doc.hasLoop())
+        rec->setProperty ("loop", juce::Array<juce::var> { (juce::int64) doc.loopStart, (juce::int64) doc.loopEnd });
+    if (! doc.markers.empty())
+    {
+        juce::Array<juce::var> markers;
+        for (const auto& m : doc.markers)
+        {
+            auto mo = std::make_unique<juce::DynamicObject>();
+            mo->setProperty ("start", (juce::int64) m.start);
+            mo->setProperty ("end", (juce::int64) m.end);
+            mo->setProperty ("name", str (m.name));
+            if (! m.info.empty())
+                mo->setProperty ("info", str (m.info));
+            if (m.time != 0.0)
+                mo->setProperty ("time", m.time);
+            if (m.keyNum >= 0)
+                mo->setProperty ("keyNum", m.keyNum);
+            markers.add (juce::var (mo.release()));
+        }
+        rec->setProperty ("markers", markers);
+    }
+    if (! doc.audio.empty())
+    {
+        const auto wav = audioedit::encodeWav (doc, audioedit::WavFormat::float32);
+        rec->setProperty ("wav", juce::Base64::toBase64 (wav.data(), wav.size()));
+    }
+    return juce::var (rec.release());
+}
+
+std::shared_ptr<const audioedit::Document> recorderDocFromVar (const juce::var& rec)
+{
+    if (! rec.isObject())
+        return {};
+    auto doc = std::make_shared<audioedit::Document>();
+    doc->title = rec.getProperty ("title", {}).toString().toStdString();
+    if (const auto wav64 = rec.getProperty ("wav", {}).toString(); wav64.isNotEmpty())
+    {
+        juce::MemoryOutputStream bytes;
+        if (juce::Base64::convertFromBase64 (bytes, wav64))
+            audioedit::decodeWav (static_cast<const std::uint8_t*> (bytes.getData()), bytes.getDataSize(), *doc);
+    }
+    if (const auto& loop = rec["loop"]; loop.isArray() && loop.size() == 2)
+    {
+        doc->loopStart = juce::jmax<juce::int64> (0, (juce::int64) loop[0]);
+        doc->loopEnd = juce::jmax<juce::int64> (doc->loopStart, (juce::int64) loop[1]);
+    }
+    if (auto* markers = rec["markers"].getArray())
+    {
+        doc->markers.clear();
+        for (const auto& m : *markers)
+            if (m.isObject())
+            {
+                audioedit::Marker mk;
+                mk.start = juce::jmax<juce::int64> (0, (juce::int64) m.getProperty ("start", 0));
+                mk.end = juce::jmax<juce::int64> (mk.start, (juce::int64) m.getProperty ("end", (juce::int64) mk.start));
+                mk.name = m.getProperty ("name", {}).toString().toStdString();
+                mk.info = m.getProperty ("info", {}).toString().toStdString();
+                mk.time = (double) m.getProperty ("time", 0.0);
+                mk.keyNum = (int) m.getProperty ("keyNum", -1);
+                doc->markers.push_back (std::move (mk));
+            }
+        audioedit::sortMarkers (*doc);
+    }
+    if (! doc->audio.empty() || ! doc->markers.empty() || doc->hasLoop())
+        return doc;
+    return {};
+}
 } // namespace
 
 juce::var effectToVar (const EffectSlot& slot)
@@ -801,6 +877,8 @@ juce::var effectToVar (const EffectSlot& slot)
         e->setProperty ("sample", str (slot.samplePath));
     if (! slot.flOrigin.empty()) // the FL effect it was imported from (round 171e)
         e->setProperty ("flOrigin", flOriginToVar (slot.flOrigin));
+    if (const auto rec = recorderDocToVar (slot.recorderDocument); rec.isObject())
+        e->setProperty ("recorder", rec);
     if (! slot.presetName.empty()) // the editor's preset name and A/B compare (round 129)
         e->setProperty ("preset", str (slot.presetName));
     if (! slot.abOther.empty())
@@ -907,6 +985,8 @@ std::optional<EffectSlot> effectFromVar (const juce::var& e)
     }
     if (e.hasProperty ("flOrigin"))
         slot.flOrigin = flOriginFromVar (e["flOrigin"]);
+    if (e.hasProperty ("recorder"))
+        slot.recorderDocument = recorderDocFromVar (e["recorder"]);
 
     if (auto* branches = e["branches"].getArray())
         for (const auto& b : *branches)
@@ -1978,6 +2058,8 @@ juce::var mixerTrackToVar (const MixerTrack& t)
         o->setProperty ("effects", effects);
     if (! t.standIns.empty())
         o->setProperty ("standIns", standInsToVar (t.standIns));
+    if (const auto rec = recorderDocToVar (t.recorderDocument); rec.isObject())
+        o->setProperty ("recorder", rec);
 
     return juce::var (o.release());
 }
@@ -2047,6 +2129,8 @@ MixerTrack mixerTrackFromVar (const juce::var& t)
                 track.effects.push_back (std::move (*slot));
         }
     track.standIns = standInsFromVar (t["standIns"]);
+    if (t.hasProperty ("recorder"))
+        track.recorderDocument = recorderDocFromVar (t["recorder"]);
 
     return track;
 }
@@ -2533,40 +2617,8 @@ juce::String toJson (const Song& song)
     if (song.hasLoop())
         root->setProperty ("loop", juce::Array<juce::var> { (juce::int64) song.loopStart, (juce::int64) song.loopEnd });
 
-    if (song.recorderDocument != nullptr && (! song.recorderDocument->audio.empty() || ! song.recorderDocument->markers.empty() || song.recorderDocument->hasLoop()))
-    {
-        const auto& doc = *song.recorderDocument;
-        auto rec = std::make_unique<juce::DynamicObject>();
-        if (! doc.title.empty())
-            rec->setProperty ("title", str (doc.title));
-        if (doc.hasLoop())
-            rec->setProperty ("loop", juce::Array<juce::var> { (juce::int64) doc.loopStart, (juce::int64) doc.loopEnd });
-        if (! doc.markers.empty())
-        {
-            juce::Array<juce::var> markers;
-            for (const auto& m : doc.markers)
-            {
-                auto mo = std::make_unique<juce::DynamicObject>();
-                mo->setProperty ("start", (juce::int64) m.start);
-                mo->setProperty ("end", (juce::int64) m.end);
-                mo->setProperty ("name", str (m.name));
-                if (! m.info.empty())
-                    mo->setProperty ("info", str (m.info));
-                if (m.time != 0.0)
-                    mo->setProperty ("time", m.time);
-                if (m.keyNum >= 0)
-                    mo->setProperty ("keyNum", m.keyNum);
-                markers.add (juce::var (mo.release()));
-            }
-            rec->setProperty ("markers", markers);
-        }
-        if (! doc.audio.empty())
-        {
-            const auto wav = audioedit::encodeWav (doc, audioedit::WavFormat::float32);
-            rec->setProperty ("wav", juce::Base64::toBase64 (wav.data(), wav.size()));
-        }
-        root->setProperty ("recorder", juce::var (rec.release()));
-    }
+    if (const auto rec = recorderDocToVar (song.recorderDocument); rec.isObject())
+        root->setProperty ("recorder", rec);
 
     // Online Sessions (round 168a): the lineage, the uid counter, the arrangements' uids (the arrangements list itself
     // is only written when there is more than one) and who works on the project
@@ -3071,41 +3123,8 @@ std::optional<Song> fromJson (const juce::String& json, juce::String& error)
         song.loopEnd = juce::jmax<juce::int64> (song.loopStart, (juce::int64) loop[1]);
     }
 
-    if (const auto& rec = root["recorder"]; rec.isObject())
-    {
-        auto doc = std::make_shared<audioedit::Document>();
-        doc->title = rec.getProperty ("title", {}).toString().toStdString();
-        if (const auto wav64 = rec.getProperty ("wav", {}).toString(); wav64.isNotEmpty())
-        {
-            juce::MemoryOutputStream bytes;
-            if (juce::Base64::convertFromBase64 (bytes, wav64))
-                audioedit::decodeWav (static_cast<const std::uint8_t*> (bytes.getData()), bytes.getDataSize(), *doc);
-        }
-        if (const auto& loop = rec["loop"]; loop.isArray() && loop.size() == 2)
-        {
-            doc->loopStart = juce::jmax<juce::int64> (0, (juce::int64) loop[0]);
-            doc->loopEnd = juce::jmax<juce::int64> (doc->loopStart, (juce::int64) loop[1]);
-        }
-        if (auto* markers = rec["markers"].getArray())
-        {
-            doc->markers.clear();
-            for (const auto& m : *markers)
-                if (m.isObject())
-                {
-                    audioedit::Marker mk;
-                    mk.start = juce::jmax<juce::int64> (0, (juce::int64) m.getProperty ("start", 0));
-                    mk.end = juce::jmax<juce::int64> (mk.start, (juce::int64) m.getProperty ("end", (juce::int64) mk.start));
-                    mk.name = m.getProperty ("name", {}).toString().toStdString();
-                    mk.info = m.getProperty ("info", {}).toString().toStdString();
-                    mk.time = (double) m.getProperty ("time", 0.0);
-                    mk.keyNum = (int) m.getProperty ("keyNum", -1);
-                    doc->markers.push_back (std::move (mk));
-                }
-            audioedit::sortMarkers (*doc);
-        }
-        if (! doc->audio.empty() || ! doc->markers.empty() || doc->hasLoop())
-            song.recorderDocument = std::move (doc);
-    }
+    if (const auto doc = recorderDocFromVar (root["recorder"]))
+        song.recorderDocument = doc;
 
     if (auto* mixer = root["mixer"].getArray())
         for (const auto& t : *mixer)

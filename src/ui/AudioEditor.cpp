@@ -581,13 +581,22 @@ public:
 
         setWantsKeyboardFocus (true);
         setSize (1120, 600);
-        if ((source.kind == Source::Kind::none || source.kind == Source::Kind::insert) && engine.getSong().recorderDocument != nullptr)
+        captureStream = engine.getMeters().capture.acquireStream();
+        if (source.kind == Source::Kind::none || source.kind == Source::Kind::insert)
         {
-            lastSyncedDoc = engine.getSong().recorderDocument;
-            doc = *lastSyncedDoc;
-            history.reset (doc, tr ("Open").toStdString());
-            documentChanged();
-            zoomToFit();
+            if (const auto& existing = songDocument (engine.getSong()); existing != nullptr)
+            {
+                lastSyncedDoc = existing;
+                doc = *lastSyncedDoc;
+                history.reset (doc, tr ("Open").toStdString());
+                documentChanged();
+                zoomToFit();
+            }
+            else
+            {
+                history.reset (doc, tr ("Empty").toStdString());
+                updateButtons();
+            }
         }
         else
         {
@@ -601,8 +610,7 @@ public:
     {
         if (playing)
             engine.previewSample (nullptr);
-        if (recState != RecState::idle)
-            engine.getMeters().capture.setSource (AudioCapture::off);
+        engine.getMeters().capture.releaseStream (captureStream);
         releaseInput();
     }
 
@@ -1113,9 +1121,12 @@ public:
         {
             stopPlayback();
             const auto previous = source;
-            source = { Source::Kind::file, -1, files[0] };
+            if (source.kind != Source::Kind::insert)
+                source = { Source::Kind::file, -1, files[0] };
             if (! loadFile (juce::File (files[0])))
                 source = previous;
+            else if (source.kind == Source::Kind::insert)
+                syncToSong (true);
             return;
         }
         // into a document: pasted at the cursor
@@ -1743,6 +1754,25 @@ private:
     }
 
     // --- edits ----------------------------------------------------------------------------------------------
+    const std::shared_ptr<const ae::Document>& songDocument (const Song& s) const
+    {
+        static const std::shared_ptr<const ae::Document> empty {};
+        if (source.kind == Source::Kind::insert)
+        {
+            if (juce::isPositiveAndBelow (source.index, (int) s.mixer.size()))
+            {
+                const auto& track = s.mixer[(std::size_t) source.index];
+                if (juce::isPositiveAndBelow (source.slot, (int) track.effects.size()))
+                    return track.effects[(std::size_t) source.slot].recorderDocument;
+                return track.recorderDocument;
+            }
+            return empty;
+        }
+        if (source.kind == Source::Kind::none)
+            return s.recorderDocument;
+        return empty;
+    }
+
     void syncToSong (bool pushUndo)
     {
         if (source.kind == Source::Kind::file || source.kind == Source::Kind::channel)
@@ -1751,7 +1781,24 @@ private:
                           ? std::make_shared<const ae::Document> (doc)
                           : std::shared_ptr<const ae::Document> {};
         lastSyncedDoc = shared;
-        engine.editSong ([shared] (Song& s) { s.recorderDocument = shared; }, pushUndo);
+        const auto src = source;
+        engine.editSong ([src, shared] (Song& s) {
+            if (src.kind == Source::Kind::insert)
+            {
+                if (juce::isPositiveAndBelow (src.index, (int) s.mixer.size()))
+                {
+                    auto& track = s.mixer[(std::size_t) src.index];
+                    if (juce::isPositiveAndBelow (src.slot, (int) track.effects.size()))
+                        track.effects[(std::size_t) src.slot].recorderDocument = shared;
+                    else
+                        track.recorderDocument = shared;
+                }
+            }
+            else
+            {
+                s.recorderDocument = shared;
+            }
+        }, pushUndo);
     }
 
     void commit (const juce::String& label)
@@ -2527,6 +2574,17 @@ private:
                 return;
             }
         }
+        else if (! engine.hasAudioInput())
+        {
+            if (engine.openAudioInput().issue == AudioEngine::InputIssue::none)
+                openedInput = true;
+            device = engine.getDeviceManager().getCurrentAudioDevice();
+            if (device == nullptr)
+            {
+                setStatus (tr ("No audio device is open (Settings > Audio)"), true);
+                return;
+            }
+        }
         recordRate = device->getCurrentSampleRate();
         recordStereo = recordSource != AudioCapture::input || device->getActiveInputChannels().countNumberOfSetBits() > 1;
         recL.clear();
@@ -2536,7 +2594,7 @@ private:
         recordAt = selection.empty() ? cursor : selection.start;
         if (doc.audio.empty())
             recordAt = 0;
-        engine.getMeters().capture.setSource (recordSource);
+        engine.getMeters().capture.setSource (captureStream, recordSource);
         recState = recordMode == RecordMode::now ? RecState::recording : RecState::waiting;
         recordButton.setToggleState (true, juce::dontSendNotification);
         if (recordMode == RecordMode::onPlay && ! engine.getTransport().playing.load())
@@ -2552,7 +2610,7 @@ private:
     {
         std::vector<float> l, r;
         std::vector<std::int64_t> wraps;
-        engine.getMeters().capture.pull (l, r, &wraps);
+        engine.getMeters().capture.pull (captureStream, l, r, &wraps);
         if (l.empty())
             return;
         std::size_t from = 0;
@@ -2642,10 +2700,10 @@ private:
         if (recState == RecState::idle)
             return;
         drainRecording();
-        engine.getMeters().capture.setSource (AudioCapture::off);
+        engine.getMeters().capture.setSource (captureStream, AudioCapture::off);
         releaseInput();
         const auto got = ! recL.empty();
-        const auto dropped = engine.getMeters().capture.droppedFrames();
+        const auto dropped = engine.getMeters().capture.droppedFrames (captureStream);
         recState = RecState::idle;
         recordButton.setToggleState (false, juce::dontSendNotification);
         if (got)
@@ -2778,8 +2836,10 @@ private:
             if (self == nullptr || ! fc.getResult().existsAsFile())
                 return;
             self->stopPlayback();
-            self->source = { Source::Kind::file, -1, fc.getResult().getFullPathName() };
-            self->loadFile (fc.getResult());
+            if (self->source.kind != Source::Kind::insert)
+                self->source = { Source::Kind::file, -1, fc.getResult().getFullPathName() };
+            if (self->loadFile (fc.getResult()) && self->source.kind == Source::Kind::insert)
+                self->syncToSong (true);
         });
     }
 
@@ -3117,7 +3177,16 @@ private:
     void updateTitle()
     {
         if (auto* window = findParentComponentOfClass<juce::DocumentWindow>())
-            window->setName (tr ("Audio editor") + (doc.title.empty() ? juce::String() : " - " + juce::String::fromUTF8 (doc.title.c_str())) + (modified ? " *" : ""));
+        {
+            juce::String where;
+            if (source.kind == Source::Kind::insert && source.index >= 0)
+            {
+                where = " - " + (source.index == 0 ? tr ("Master") : sourceName (source.index));
+                if (source.slot >= 0)
+                    where += " (" + tr ("Slot {0}", { juce::String (source.slot + 1) }) + ")";
+            }
+            window->setName (tr ("Audio editor") + where + (doc.title.empty() ? juce::String() : " - " + juce::String::fromUTF8 (doc.title.c_str())) + (modified ? " *" : ""));
+        }
     }
 
     void parentHierarchyChanged() override { updateTitle(); }
@@ -3126,7 +3195,7 @@ private:
     {
         if (recState == RecState::idle && (source.kind == Source::Kind::none || source.kind == Source::Kind::insert))
         {
-            const auto& songDoc = engine.getSong().recorderDocument;
+            const auto& songDoc = songDocument (engine.getSong());
             if (songDoc != lastSyncedDoc)
             {
                 lastSyncedDoc = songDoc;
@@ -3518,6 +3587,7 @@ private:
 
     RecState recState = RecState::idle;
     bool openedInput = false; // startRecording opened the device input itself (released when it stops)
+    int captureStream = 0;    // dedicated AudioCapture stream slot for this editor instance
     RecordMode recordMode = RecordMode::now;
     int recordSource = AudioCapture::input;
     std::vector<float> recL, recR;
@@ -3565,7 +3635,7 @@ public:
         recordAt = selection.empty() ? cursor : selection.start;
         if (doc.audio.empty())
             recordAt = 0;
-        engine.getMeters().capture.setSource (recordSource);
+        engine.getMeters().capture.setSource (captureStream, recordSource);
         recState = RecState::recording;
         recordButton.setToggleState (true, juce::dontSendNotification);
         setStatus (tr ("Recording from {0}", { sourceName (recordSource) }), false);
@@ -3685,8 +3755,11 @@ juce::PopupMenu AudioEditor::mainMenu()
     juce::PopupMenu file;
     file.addItem (tr ("New (empty)"), [this] {
         stopPlayback();
-        source = {};
+        if (source.kind != Source::Kind::insert)
+            source = {};
         setDocument ({}, tr ("Empty"));
+        if (source.kind == Source::Kind::insert)
+            syncToSong (true);
     });
     file.addItem (tr ("Open audio file..."), [this] { openFileDialog(); });
     juce::PopupMenu save;
@@ -3904,7 +3977,7 @@ juce::String windowKey (const Source& s)
     {
         case Source::Kind::file: return "audioeditor:" + s.path;
         case Source::Kind::channel: return "audioeditor:channel:" + juce::String (s.index);
-        case Source::Kind::insert: return "audioeditor:insert:" + juce::String (s.index);
+        case Source::Kind::insert: return "audioeditor:insert:" + juce::String (s.index) + (s.slot >= 0 ? ":slot:" + juce::String (s.slot) : juce::String());
         case Source::Kind::none: break;
     }
     return "audioeditor";
@@ -3953,6 +4026,8 @@ void openAudioEditorRecording (AudioEngine& engine)
 
 void openAudioEditorForInsert (AudioEngine& engine, int insert, int slot)
 {
+    if (! engine.hasAudioInput())
+        engine.openAudioInput();
     auto* editor = openWindow (engine, { Source::Kind::insert, insert, {}, slot });
     editor->setRecordSource (insert);
     editor->watchSlot (insert, slot);
@@ -4015,6 +4090,14 @@ juce::StringArray audioEditorMenuForSnapshot (juce::Component& component)
 std::unique_ptr<juce::Component> makeAudioEditorForTest (AudioEngine& engine)
 {
     auto editor = std::make_unique<AudioEditor> (engine, Source {});
+    editor->setBounds (0, 0, 960, 440);
+    return editor;
+}
+
+std::unique_ptr<juce::Component> makeAudioEditorForInsertForTest (AudioEngine& engine, int insert, int slot)
+{
+    auto editor = std::make_unique<AudioEditor> (engine, Source { Source::Kind::insert, insert, {}, slot });
+    editor->setRecordSource (insert);
     editor->setBounds (0, 0, 960, 440);
     return editor;
 }

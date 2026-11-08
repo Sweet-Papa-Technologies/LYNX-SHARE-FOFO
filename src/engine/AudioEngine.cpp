@@ -241,11 +241,11 @@ AudioEngine::AudioEngine (bool openAudioDevice, int workerThreads)
         rackExchange.dispose = [this] (const RackState* rack) { rackDisposer.add (rack); };
     publishSong();
     buildInitialGraph();
+    player.setProcessor (&graph);
     mark ("  engine: graph");
 
     if (openAudioDevice)
     {
-        player.setProcessor (&graph);
 
         // LYNX ASIO without installation: lynx-asio.dll next to LYNX.exe, when it is not registered (REA round 106)
         if (auto lynxAsio = makeBuiltInLynxAsioType())
@@ -1959,9 +1959,13 @@ AudioEngine::RecordingNotice AudioEngine::openAudioInput (const juce::String& de
 
 bool AudioEngine::audioInputNeeded() const
 {
-    if (audioArmed || ! armedInserts.empty() || hwinsert::returnsFromInput (song))
+    if (audioArmed || ! armedInserts.empty() || meters.capture.isAnyActive() || hwinsert::returnsFromInput (song))
         return true;
-    return std::any_of (song.mixer.begin(), song.mixer.end(), [] (const MixerTrack& t) { return t.inputChannel >= 0 || t.flInput >= 0; });
+    return std::any_of (song.mixer.begin(), song.mixer.end(), [] (const MixerTrack& t) {
+        if (t.inputChannel >= 0 || t.flInput >= 0)
+            return true;
+        return std::any_of (t.effects.begin(), t.effects.end(), [] (const EffectSlot& s) { return s.enabled && s.kind == EffectKind::edison; });
+    });
 }
 
 void AudioEngine::releaseAudioInputIfUnused()
@@ -4532,6 +4536,13 @@ void AudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputCha
             liveInput.channels[(std::size_t) c] = slot >= 0 && slot < numInputChannels ? inputs[(std::size_t) slot] : nullptr;
             if (liveInput.channels[(std::size_t) c] != nullptr)
                 liveInput.numChannels = c + 1;
+        }
+        if (liveInput.numChannels == 0 && numInputChannels > 0)
+        {
+            const auto fallbackCount = std::min (numInputChannels, (int) LiveInput::maxChannels);
+            for (int c = 0; c < fallbackCount; ++c)
+                if ((liveInput.channels[(std::size_t) c] = inputs[(std::size_t) c]) != nullptr)
+                    liveInput.numChannels = c + 1;
         }
 
         // audio recording: this block's input goes to the takes' streams (without waiting on a lock). Every take gets

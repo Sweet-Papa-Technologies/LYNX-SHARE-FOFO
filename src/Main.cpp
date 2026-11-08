@@ -3199,6 +3199,53 @@ private:
                         loopTakeResult = "ERROR undo/redo";
                 }
             }
+
+            // Verify multiple Edison instances on different mixer inserts/slots record independently and persist per-slot documents
+            if (loopTakeResult == "OK")
+            {
+                recEngine.editSong ([] (lynx::Song& s) {
+                    if (s.mixer.size() < 3)
+                        s.mixer.resize (3);
+                    s.mixer[1].effects = { lynx::makeEffectSlot (lynx::EffectKind::edison) };
+                    s.mixer[2].effects = { lynx::makeEffectSlot (lynx::EffectKind::edison) };
+                }, false);
+
+                auto ed1 = lynx::makeAudioEditorForInsertForTest (recEngine, 1, 0);
+                auto ed2 = lynx::makeAudioEditorForInsertForTest (recEngine, 2, 0);
+                cb.audioDeviceAboutToStart (&standIn);
+                lynx::startAudioEditorLoopRecordForTest (*ed1, 1);
+                lynx::startAudioEditorLoopRecordForTest (*ed2, 2);
+
+                std::fill (inL.begin(), inL.end(), 0.4f);
+                std::fill (inR.begin(), inR.end(), -0.4f);
+                cb.audioDeviceIOCallbackWithContext (ins, 2, outs, 2, 500, context);
+                lynx::drainAudioEditorRecordForTest (*ed1);
+                lynx::drainAudioEditorRecordForTest (*ed2);
+                lynx::stopAudioEditorRecordForTest (*ed1);
+
+                // Continue recording into ed2 alone with a different signal
+                std::fill (inL.begin(), inL.end(), 0.6f);
+                std::fill (inR.begin(), inR.end(), -0.6f);
+                cb.audioDeviceIOCallbackWithContext (ins, 2, outs, 2, 500, context);
+                lynx::drainAudioEditorRecordForTest (*ed2);
+                lynx::stopAudioEditorRecordForTest (*ed2);
+                cb.audioDeviceStopped();
+
+                const auto doc1 = lynx::getAudioEditorDocumentForTest (*ed1);
+                const auto doc2 = lynx::getAudioEditorDocumentForTest (*ed2);
+                juce::String slotSaveErr;
+                const auto roundTripSong = lynx::ProjectFile::fromJson (lynx::ProjectFile::toJson (recEngine.getSong()), slotSaveErr);
+                if (doc1.audio.frames() != 500 || doc2.audio.frames() != 1000
+                    || ! roundTripSong
+                    || roundTripSong->mixer[1].effects[0].recorderDocument == nullptr
+                    || roundTripSong->mixer[2].effects[0].recorderDocument == nullptr
+                    || roundTripSong->mixer[1].effects[0].recorderDocument->audio.frames() != 500
+                    || roundTripSong->mixer[2].effects[0].recorderDocument->audio.frames() != 1000)
+                {
+                    loopTakeResult = "ERROR multi-instance edison frames=" + juce::String ((juce::int64) doc1.audio.frames())
+                                     + "/" + juce::String ((juce::int64) doc2.audio.frames()) + " " + slotSaveErr;
+                }
+            }
         }
 
         const auto mixerBasics = lynx::mixerbasics::run();

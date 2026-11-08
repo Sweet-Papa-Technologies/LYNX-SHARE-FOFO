@@ -931,6 +931,8 @@ struct EffectSlot
     // order is the vector's order; the rows only grow along it (core/MixerOps.h effectRows).
     int row = -1;
     FlOrigin flOrigin;    // imported from FL: the original effect plugin (round 171e)
+    // Per-slot Edison document (audio, take/cue markers, regions, loop): each Edison effect slot holds its own buffer.
+    std::shared_ptr<const audioedit::Document> recorderDocument;
     InstanceTag instance; // runtime identity of the slot (never saved, not compared)
 
     bool operator== (const EffectSlot& o) const; // every field (Song.cpp)
@@ -1117,6 +1119,8 @@ struct MixerTrack
     std::vector<StandIn> standIns;
     // FL's mixer track icon ("Change icon…", .flp 0x5F, REA round 168j): FL's icon index, 0 = none. Kept and saved.
     int icon = 0;
+    // Per-insert Edison document when opened for the insert without a specific effect slot.
+    std::shared_ptr<const audioedit::Document> recorderDocument;
     bool operator== (const MixerTrack&) const = default; // (Online Sessions P2: entity comparison, round 169b)
 };
 

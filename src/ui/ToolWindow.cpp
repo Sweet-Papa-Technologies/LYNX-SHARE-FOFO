@@ -62,10 +62,19 @@ juce::DocumentWindow* openToolWindow (std::unique_ptr<juce::Component> content, 
     window->setContentOwned (fitContentToScreen (std::move (content)).release(), true); // (scrolls when taller than the screen)
     window->setResizable (false, false);
 
+    const int cascade = (ToolWindow::all().size() - 1) % 8;
+    const int offset = cascade * 28;
     if (auto* main = juce::TopLevelWindow::getActiveTopLevelWindow())
-        window->setCentrePosition (main->getScreenBounds().getCentre());
+    {
+        const auto c = main->getScreenBounds().getCentre();
+        window->setCentrePosition (c.x + offset, c.y + offset);
+    }
     else
+    {
         window->centreWithSize (window->getWidth(), window->getHeight());
+        if (offset != 0)
+            window->setTopLeftPosition (window->getX() + offset, window->getY() + offset);
+    }
 
     window->setVisible (true);
     keepAboveMainWindow (*window);
