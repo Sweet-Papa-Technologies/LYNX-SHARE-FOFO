@@ -17124,3 +17124,211 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Mixer177a4Tests.inc"
 #include "Sc177bTests.inc"
 #include "Issue97Tests.inc"
+
+TEST (live_playback_reactivity)
+{
+    const double sr = 48000.0;
+    const std::int64_t bar = (std::int64_t) lynx::ppq * 4;
+
+    auto provider = [&] (const std::string&) {
+        auto d = std::make_shared<lynx::SampleData>();
+        d->sampleRate = sr;
+        d->left.assign ((std::size_t) sr * 8, 0.5f);
+        d->right.assign ((std::size_t) sr * 8, 0.5f);
+        return std::shared_ptr<const lynx::SampleData> (d);
+    };
+
+    // 1. Audio clip live track mute/unmute, clip mute/unmute, index shift, delete/add mid-playback
+    {
+        auto song = lynx::Song::makeDefault();
+        song.bpm = 120.0;
+        song.mode = lynx::PlayMode::song;
+        song.playlist.clear();
+        song.playlistTracks.resize (4);
+        for (auto& p : song.patterns)
+            p.notes.clear();
+
+        lynx::ChannelDef audioCh;
+        audioCh.name = "AudioLoop";
+        audioCh.instrument = lynx::InstrumentKind::audioClip;
+        audioCh.samplePath = "ones";
+        audioCh.volume = 1.0f;
+        const int chIdx = (int) song.channels.size();
+        song.channels.push_back (audioCh);
+
+        lynx::Clip ac;
+        ac.kind = lynx::ClipKind::audio;
+        ac.channel = chIdx;
+        ac.track = 1;
+        ac.start = 0;
+        ac.length = bar * 2;
+        ac.uid = 1001;
+        song.playlist.push_back (ac);
+
+        lynx::RackRenderer renderer;
+        renderer.prepare (sr, 256);
+        renderer.setTransportOptions (true, false, 0);
+        auto state = lynx::RackState::build (song, nullptr, sr, provider);
+        const auto tps = lynx::ticksPerSample (song.bpm, sr);
+        std::vector<float> l (256), r (256);
+        double tick = 0.0;
+
+        auto renderBlocks = [&] (int blocks) {
+            float peak = 0.0f;
+            for (int b = 0; b < blocks; ++b)
+            {
+                renderer.process (state.get(), true, tick, 256, l.data(), r.data());
+                tick += 256.0 * tps;
+                for (int i = 0; i < 256; ++i)
+                    peak = std::max ({ peak, std::abs (l[(std::size_t) i]), std::abs (r[(std::size_t) i]) });
+            }
+            return peak;
+        };
+
+        CHECK (renderBlocks (8) > 0.1f); // playing normally
+
+        // Mute playlist track 1 mid-clip -> stops immediately
+        song.playlistTracks[1].muted = true;
+        state = lynx::RackState::build (song, state.get(), sr, provider);
+        renderBlocks (2); // allow 64-sample anti-click release fade
+        CHECK (renderBlocks (4) < 1.0e-4f);
+
+        // Unmute playlist track 1 mid-clip -> resumes immediately mid-clip
+        song.playlistTracks[1].muted = false;
+        state = lynx::RackState::build (song, state.get(), sr, provider);
+        CHECK (renderBlocks (4) > 0.1f);
+
+        // Mute audio clip directly mid-clip -> stops immediately
+        song.playlist[0].muted = true;
+        state = lynx::RackState::build (song, state.get(), sr, provider);
+        renderBlocks (2);
+        CHECK (renderBlocks (4) < 1.0e-4f);
+
+        // Unmute audio clip mid-clip -> resumes immediately
+        song.playlist[0].muted = false;
+        state = lynx::RackState::build (song, state.get(), sr, provider);
+        CHECK (renderBlocks (4) > 0.1f);
+
+        // Delete audio clip mid-clip -> stops immediately
+        const auto savedClip = song.playlist[0];
+        song.playlist.clear();
+        state = lynx::RackState::build (song, state.get(), sr, provider);
+        renderBlocks (2);
+        CHECK (renderBlocks (4) < 1.0e-4f);
+
+        // Add audio clip back under the playhead -> starts immediately mid-clip
+        song.playlist.push_back (savedClip);
+        state = lynx::RackState::build (song, state.get(), sr, provider);
+        CHECK (renderBlocks (4) > 0.1f);
+
+        // Insert another clip at index 0 (shifting our playing audio clip from index 0 to index 1) -> keeps playing smoothly
+        lynx::Clip dummy;
+        dummy.kind = lynx::ClipKind::audio;
+        dummy.channel = chIdx;
+        dummy.track = 2;
+        dummy.start = bar * 3;
+        dummy.length = bar;
+        dummy.uid = 1002;
+        song.playlist.insert (song.playlist.begin(), dummy);
+        state = lynx::RackState::build (song, state.get(), sr, provider);
+        CHECK (renderBlocks (4) > 0.1f);
+    }
+
+    // 2. Pattern clip & Channel Rack live mute/unmute and mode switch mid-playback
+    {
+        auto song = lynx::Song::makeDefault();
+        song.bpm = 120.0;
+        song.mode = lynx::PlayMode::pattern;
+        song.playlist.clear();
+        song.playlistTracks.resize (4);
+        for (auto& p : song.patterns)
+            p.notes.clear();
+
+        int synthCh = -1;
+        for (std::size_t c = 0; c < song.channels.size(); ++c)
+            if (song.channels[c].instrument == lynx::InstrumentKind::synth)
+                synthCh = (int) c;
+        CHECK (synthCh >= 0);
+        song.channels[(std::size_t) synthCh].synth.release = 0.01f;
+
+        lynx::Note n;
+        n.channel = synthCh;
+        n.key = 60;
+        n.start = 0;
+        n.length = bar * 2;
+        n.velocity = 0.9f;
+        song.patterns[0].notes.push_back (n);
+        lynx::Pattern emptyPat;
+        emptyPat.name = "Empty";
+        song.patterns.push_back (emptyPat);
+        song.currentPattern = 1; // start in Pattern mode on the empty pattern
+
+        lynx::RackRenderer renderer;
+        renderer.prepare (sr, 256);
+        renderer.setTransportOptions (true, false, 0);
+        auto state = lynx::RackState::build (song, nullptr, sr);
+        const auto tps = lynx::ticksPerSample (song.bpm, sr);
+        std::vector<float> l (256), r (256);
+        double tick = 0.0;
+
+        auto renderBlocks = [&] (int blocks) {
+            float peak = 0.0f;
+            for (int b = 0; b < blocks; ++b)
+            {
+                renderer.process (state.get(), true, tick, 256, l.data(), r.data());
+                tick += 256.0 * tps;
+                for (int i = 0; i < 256; ++i)
+                    peak = std::max ({ peak, std::abs (l[(std::size_t) i]), std::abs (r[(std::size_t) i]) });
+            }
+            return peak;
+        };
+
+        CHECK (renderBlocks (6) < 1.0e-4f); // silent on empty pattern 1
+
+        // Paint pattern 0 into Playlist and switch to Song mode on the fly while playing
+        lynx::Clip pc;
+        pc.kind = lynx::ClipKind::pattern;
+        pc.pattern = 0;
+        pc.track = 0;
+        pc.start = 0;
+        pc.length = bar * 2;
+        pc.uid = 2001;
+        song.playlist.push_back (pc);
+        song.mode = lynx::PlayMode::song;
+        state = lynx::RackState::build (song, state.get(), sr);
+        CHECK (renderBlocks (8) > 0.01f); // immediately chases and plays pattern 0 in Song mode!
+
+        // Mute playlist track 0 while playing -> note is cut immediately
+        song.playlistTracks[0].muted = true;
+        state = lynx::RackState::build (song, state.get(), sr);
+        renderBlocks (6); // allow short synth release
+        CHECK (renderBlocks (4) < 1.0e-3f);
+
+        // Unmute playlist track 0 while playing -> note is chased and resumes immediately
+        song.playlistTracks[0].muted = false;
+        state = lynx::RackState::build (song, state.get(), sr);
+        CHECK (renderBlocks (8) > 0.01f);
+
+        // Mute channel in Channel Rack while playing -> note is cut immediately
+        song.channels[(std::size_t) synthCh].muted = true;
+        state = lynx::RackState::build (song, state.get(), sr);
+        renderBlocks (6);
+        CHECK (renderBlocks (4) < 1.0e-3f);
+
+        // Unmute channel in Channel Rack while playing -> note is chased and resumes immediately
+        song.channels[(std::size_t) synthCh].muted = false;
+        state = lynx::RackState::build (song, state.get(), sr);
+        CHECK (renderBlocks (8) > 0.01f);
+
+        // Mute pattern clip directly while playing -> note is cut immediately
+        song.playlist[0].muted = true;
+        state = lynx::RackState::build (song, state.get(), sr);
+        renderBlocks (6);
+        CHECK (renderBlocks (4) < 1.0e-3f);
+
+        // Unmute pattern clip directly while playing -> note is chased and resumes immediately
+        song.playlist[0].muted = false;
+        state = lynx::RackState::build (song, state.get(), sr);
+        CHECK (renderBlocks (8) > 0.01f);
+    }
+}

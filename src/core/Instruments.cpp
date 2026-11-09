@@ -1471,6 +1471,8 @@ struct SamplerVoice
     double first = 0.0, last = 0.0; // played region: first and last frame (inclusive)
     float clipElapsed = 0.0f, clipRemaining = 0.0f, fadeIn = 0.0f, fadeOut = 0.0f; // clip fades
     std::uint8_t fadeShape = 0; // bit 0 / 1: the fade-in / fade-out is an automatic crossfade (S curve, round 166e)
+    std::uint64_t clipUid = 0;
+    int clipTrack = -1;
     float panL = 1.0f, panR = 1.0f;
     double glideRatio = 1.0;
     int glideLeft = 0;
@@ -1671,6 +1673,8 @@ public:
     void noteOnAt (int key, float velocity, double startSeconds) noexcept override
     {
         const auto noteGain = std::exchange (nextGain, 1.0f);
+        const auto noteClipUid = std::exchange (nextClipUid, (std::uint64_t) 0);
+        const auto noteClipTrack = std::exchange (nextClipTrack, -1);
         // this note's clip fades and flags, taken now so a note that does not sound leaves none to the next one
         const auto clipFades = std::exchange (nextClip, {});
         const auto clipShape = std::exchange (nextClipShape, (std::uint8_t) 0);
@@ -1772,6 +1776,8 @@ public:
         *target = {};
         target->active = true;
         target->key = key;
+        target->clipUid = noteClipUid;
+        target->clipTrack = noteClipTrack;
         // FL plays a Playlist audio clip at unity gain at the channel's default volume (78%): the channel volume
         // curve is relative to that point for clips (REA_rodada89 §4.2 [EXEC]: +5.2 dB at every volume and pan)
         target->velocity = clipMode                                         ? velocity * audioClipUnity()
@@ -2123,6 +2129,80 @@ public:
     {
         nextClip = { elapsed, remaining, in, out };
         nextClipShape = shape;
+    }
+
+    void setNextClipIdentity (std::uint64_t uid, int track) noexcept override
+    {
+        nextClipUid = uid;
+        nextClipTrack = track;
+    }
+
+    bool rekeyAndSyncClipVoice (int key, std::uint64_t clipUid, int track, float gain,
+                                float clipRemaining, float fadeIn, float fadeOut, std::uint8_t fadeShape) noexcept override
+    {
+        if (! clipMode)
+            return false;
+        for (auto& v : voices)
+            if (v.active && ! v.stolen && ((clipUid != 0 && v.clipUid == clipUid) || (clipUid == 0 && v.key == key)))
+            {
+                v.key = key;
+                v.clipUid = clipUid;
+                v.clipTrack = track;
+                v.velocity = gain * audioClipUnity();
+                v.clipRemaining = clipRemaining;
+                v.fadeIn = fadeIn;
+                v.fadeOut = fadeOut;
+                v.fadeShape = (std::uint8_t) (fadeShape & 3);
+                return true;
+            }
+        return false;
+    }
+
+    void stopClipVoicesExcept (const int* activeKeys, int count) noexcept override
+    {
+        if (! clipMode)
+            return;
+        for (auto& v : voices)
+            if (v.active && ! v.stolen)
+            {
+                auto keep = false;
+                for (int k = 0; k < count; ++k)
+                    if (v.key == activeKeys[k])
+                    {
+                        keep = true;
+                        break;
+                    }
+                if (! keep)
+                    v.stolen = true;
+            }
+    }
+
+    void cutVoicesOnTrack (int track) noexcept override
+    {
+        if (track < 0)
+            return;
+        for (auto& v : voices)
+            if (v.active && ! v.stolen && v.clipTrack == track)
+            {
+                if (clipMode)
+                    v.stolen = true;
+                else
+                    startCut (v, true);
+            }
+    }
+
+    void cutVoicesOfClip (std::uint64_t clipUid) noexcept override
+    {
+        if (clipUid == 0)
+            return;
+        for (auto& v : voices)
+            if (v.active && ! v.stolen && v.clipUid == clipUid)
+            {
+                if (clipMode)
+                    v.stolen = true;
+                else
+                    startCut (v, true);
+            }
     }
 
     bool setNextNoteGain (float gain) noexcept override
@@ -2933,6 +3013,8 @@ private:
     float nextClipStretch = 1.0f;     // the next clip's own stretch (round 167l, audio thread)
     bool clipShift = false;           // pitch shifters for the clips' own pitch (set before prepareKeyShift)
     std::uint8_t nextClipShape = 0;
+    std::uint64_t nextClipUid = 0;
+    int nextClipTrack = -1;
 
     struct SliceTable
     {

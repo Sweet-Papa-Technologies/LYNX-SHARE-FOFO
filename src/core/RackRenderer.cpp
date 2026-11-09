@@ -1868,8 +1868,13 @@ void RackRenderer::updateAutomation (const RackState& state, double startTick) n
     const auto tick = std::fmod (std::max (0.0, startTick), length);
 
     for (std::size_t a = 0; a < state.automationClips.size(); ++a)
-        if (! state.automationClips[a].empty() && state.automationFollowers[a] == 0)
-            automationValues[a] = automationValueAt (state, (int) a, tick);
+        if (state.automationFollowers[a] == 0)
+        {
+            if (! state.automationClips[a].empty())
+                automationValues[a] = automationValueAt (state, (int) a, tick);
+            else if (a < song.automations.size() && ! song.automations[a].isLive())
+                automationValues[a] = std::numeric_limits<float>::quiet_NaN();
+        }
 
     // Performance mode: the launched automation clips (the last block's passes) drive their automation
     if (perfRunning)
@@ -2239,6 +2244,7 @@ void RackRenderer::renderChannel (const RackState& state, int i, int n) noexcept
                     instrument.setNextClipStretch (e.clipStretch);
                 if (e.fadeIn > 0.0f || e.fadeOut > 0.0f || e.fadeShape != 0)
                     instrument.setNextClipFades (e.clipElapsed, e.clipRemaining, e.fadeIn, e.fadeOut, e.fadeShape);
+                instrument.setNextClipIdentity (e.clipUid, e.track);
 
                 // an echo's volume: the instrument scales the voice, else (engines without it) the velocity
                 auto velocity = e.velocity;
@@ -2665,16 +2671,27 @@ void RackRenderer::process (const RackState* state,
             if (c < polyLayers.size() && c < polyScratch.size()) // (round 168l's mono / porta layers move too)
                 polyLayers[c] = from >= 0 && (std::size_t) from < polyScratch.size() ? polyScratch[(std::size_t) from] : channelpoly::Layer {};
         }
+        std::array<char, maxChannels> mutedScratch = channelWasMuted;
+        for (std::size_t c = 0; c < (std::size_t) maxChannels; ++c)
+        {
+            const auto from = c < state->channelFrom.size() ? state->channelFrom[c] : -1;
+            channelWasMuted[c] = from >= 0 && from < maxChannels
+                                     ? mutedScratch[(std::size_t) from]
+                                     : (c < state->song.channels.size() && state->song.channels[c].muted ? 1 : 0);
+        }
         scheduledNotes->moveChannels (state->channelFrom); // (round 169d)
     }
+    snapshotChanged = (state != lastState);
     lastState = state; // so prepare() knows which instruments to reconfigure
     lastSerial = state->serial;
 
-    // Stopping, or jumping to another position (seek/rewind), releases held notes:
-    // their "off" events will no longer happen.
+    // Stopping, or jumping to another position (seek/rewind), or switching Pattern <-> Song mode while playing
+    // releases held notes: their "off" events will no longer happen.
     const auto jumped = playing && wasPlaying && std::abs (startTick - expectedTick) > 1.0;
+    const auto modeChanged = playing && wasPlaying && state->song.mode != lastPlayMode;
+    lastPlayMode = state->song.mode;
 
-    if ((wasPlaying && ! playing) || (playing && ! wasPlaying))
+    if ((wasPlaying && ! playing) || (playing && ! wasPlaying) || modeChanged)
     {
         // the arpeggiators / echoes ran on the live clock while stopped (round 149): they restart on the song's
         liveRoutedCount = 0;
@@ -2686,14 +2703,14 @@ void RackRenderer::process (const RackState* state,
                 echo->reset();
     }
 
-    // a start, a stop or a jump: every note was released (or none sounds yet)
-    if (playing != wasPlaying || jumped)
+    // a start, a stop, a jump, or a mode switch: every note was released (or none sounds yet)
+    if (playing != wasPlaying || jumped || modeChanged)
         scheduledNotes->clear();
 
-    if ((wasPlaying && ! playing) || jumped)
+    if ((wasPlaying && ! playing) || jumped || modeChanged)
     {
         for (auto& instrument : state->instruments)
-            if (jumped)
+            if (jumped || modeChanged)
                 instrument->allNotesOff();
             else
                 instrument->transportStopped(); // (a hosted plugin: FL's "Send All Notes Off when playback stops")
@@ -2715,14 +2732,14 @@ void RackRenderer::process (const RackState* state,
             if (state->song.channels[c].instrument == InstrumentKind::midiOut && state->instruments[c] != nullptr)
                 state->instruments[c]->transportStarted();
 
-    // started playing or jumped: audio clips in progress must start mid-way
-    resumeAudio = playing && (! wasPlaying || jumped);
+    // started playing, jumped, or switched Pattern <-> Song mode: audio clips in progress must start mid-way
+    resumeAudio = playing && (! wasPlaying || jumped || modeChanged);
     // FL's "Play truncated notes on transport": at the start of playback, and after the user moves the position while
     // playing (FL's set-position FUN_011e7a10 → FUN_011e78a0 → FUN_011e7470 with its catch-up flag set, round 167k),
     // the notes already sounding there play. The loop's wrap is not a set-position and chases nothing.
     const auto userJump = jumped && userJumpSerial != seenUserJumpSerial;
     seenUserJumpSerial = userJumpSerial;
-    chaseNotes = playing && (! wasPlaying || userJump) && playTruncatedOnTransport;
+    chaseNotes = playing && (! wasPlaying || userJump || modeChanged) && playTruncatedOnTransport;
     // FL's "Reset plugins on transport" (FUN_011e7a10 → FUN_011c8a40 mode 2 → FUN_012b5210, every registered plugin's
     // reset, generators included): the effects' tails and buffers are cleared and the plugin generators stop when
     // playback starts or jumps (round 167k: instruments too, hosted plugins with their wrapper's reset option)
@@ -2910,6 +2927,7 @@ void RackRenderer::process (const RackState* state,
         processChunk (*state, playing, startTick + done * tps, n, left + done, right + done, meters);
         resumeAudio = false;
         chaseNotes = false;
+        snapshotChanged = false;
         done += n;
     }
     publishSoundingKeys ((int) state->song.channels.size());
@@ -3342,6 +3360,11 @@ void RackRenderer::processChunk (const RackState& state, bool playing, double st
                              ticksPerSample (bpm, sampleRate), events, song.swing, &song.channels, chaseNotes,
                              liveInput != nullptr ? liveInput->patternOrigin.load (std::memory_order_relaxed) : -1.0);
     }
+
+    const auto wrapSong = liveInput == nullptr || ! liveInput->linearSong.load (std::memory_order_relaxed);
+    if (playing && ! resumeAudio && snapshotChanged)
+        syncLiveEdits (state, startTick, numSamples, chunkTps, wrapSong);
+    updateActiveTracking (state, playing, startTick, numSamples, chunkTps, wrapSong);
 
     // each started note ends where it was going to, whatever was edited meanwhile (FL, round 169d)
     if (playing)
@@ -4034,6 +4057,313 @@ void RackRenderer::processTrack (const RackState& state, int t, int n, MeterBank
     {
         meters->accumulate (t, peakOf (l, n), peakOf (r, n));
         meters->capture.push (t, l, r, n);
+    }
+}
+
+void RackRenderer::syncLiveEdits (const RackState& state, double startTick, int numSamples, double tps, bool wrap) noexcept
+{
+    const auto& song = state.song;
+    const auto songPlaying = song.mode == PlayMode::song;
+    const auto numCh = std::min ((int) song.channels.size(), maxChannels);
+    const auto numInst = (int) state.instruments.size();
+    const auto eventsBefore = events.size();
+
+    // 1. Channel mute / unmute transitions
+    auto anyChannelUnmuted = false;
+    for (int ch = 0; ch < numCh; ++ch)
+    {
+        const auto nowMuted = song.channels[(std::size_t) ch].muted;
+        const auto prevMuted = channelWasMuted[(std::size_t) ch] != 0;
+        if (nowMuted && ! prevMuted)
+        {
+            scheduledNotes->shortenChannel (ch, 0.0);
+            if (ch < numInst && state.instruments[(std::size_t) ch] != nullptr)
+            {
+                if (song.channels[(std::size_t) ch].instrument == InstrumentKind::audioClip
+                    || song.channels[(std::size_t) ch].instrument == InstrumentKind::sampler)
+                    state.instruments[(std::size_t) ch]->cut();
+                else
+                    state.instruments[(std::size_t) ch]->allNotesOff();
+            }
+            heldNotes[(std::size_t) ch] = {};
+            voiceOrders[(std::size_t) ch].clear();
+        }
+        else if (! nowMuted && prevMuted)
+        {
+            anyChannelUnmuted = true;
+        }
+    }
+
+    if (! songPlaying)
+    {
+        if (anyChannelUnmuted && playTruncatedOnTransport && ! song.patterns.empty() && tps > 0.0)
+        {
+            const auto patternIndex = std::clamp (song.currentPattern, 0, (int) song.patterns.size() - 1);
+            const auto& pattern = song.patterns[(std::size_t) patternIndex];
+            const auto patLen = pattern.effectiveLength (song.beatsPerBar);
+            if (patLen > 0)
+            {
+                const auto origin = liveInput != nullptr ? liveInput->patternOrigin.load (std::memory_order_relaxed) : -1.0;
+                const auto patTick = origin >= 0.0
+                                         ? std::fmod (std::fmod (startTick - origin, (double) patLen) + (double) patLen, (double) patLen)
+                                         : std::fmod (std::max (0.0, startTick), (double) patLen);
+                for (const auto& note : pattern.notes)
+                {
+                    if (note.muted || note.slide || note.channel < 0 || note.channel >= numCh)
+                        continue;
+                    if (song.channels[(std::size_t) note.channel].muted || channelWasMuted[(std::size_t) note.channel] == 0)
+                        continue;
+                    const auto timing = playedTiming (note, song.swing, &song.channels[(std::size_t) note.channel]);
+                    const auto on = (double) timing.start;
+                    const auto off = (double) (timing.start + timing.length);
+                    if (on + tps <= patTick && off > patTick)
+                    {
+                        NoteEvent e;
+                        e.type = NoteEvent::Type::on;
+                        e.channel = note.channel;
+                        e.key = note.key;
+                        e.velocity = note.velocity;
+                        e.pan = note.pan;
+                        e.cents = note.finePitch;
+                        e.porta = note.porta;
+                        e.modX = note.modX;
+                        e.modY = note.modY;
+                        e.release = note.release;
+                        e.colour = (std::int8_t) (note.colour & 15);
+                        e.sampleOffset = 0;
+                        e.lengthTicks = (float) (off - patTick);
+                        events.add (e);
+                    }
+                }
+            }
+        }
+        if (events.size() != eventsBefore)
+            events.sortByOffset();
+        return;
+    }
+
+    // 2. Song mode: compute current loop position
+    const auto endTick = startTick + numSamples * tps;
+    auto loopLen = state.schedule.songLength > 0 ? state.schedule.songLength : song.songLength();
+    if (! wrap)
+        loopLen = std::max<std::int64_t> (loopLen, (std::int64_t) std::ceil (endTick) + 1) * 2;
+    if (loopLen <= 0 || tps <= 0.0)
+        return;
+    const auto loopStart = std::fmod (std::max (0.0, startTick), (double) loopLen);
+    const auto loopEnd = loopStart + (double) numSamples * tps;
+    const auto zoneEnd = song.performanceZoneEnd();
+    const auto secondsPerTick = 60.0 / (std::max (song.bpm, 1.0) * ppq);
+
+    // 3. Playlist track mute transitions -> cut one-shot sampler voices on newly muted tracks
+    const auto numTracks = std::min ((int) song.playlistTracks.size(), maxPlaylistTracksTracked);
+    for (int t = 0; t < numTracks; ++t)
+    {
+        if (song.isTrackMuted (t) && trackWasMuted[(std::size_t) t] == 0)
+        {
+            for (int ch = 0; ch < numCh && ch < numInst; ++ch)
+                if (state.instruments[(std::size_t) ch] != nullptr && song.channels[(std::size_t) ch].instrument != InstrumentKind::audioClip)
+                    state.instruments[(std::size_t) ch]->cutVoicesOnTrack (t);
+        }
+    }
+
+    // 4. Shorten any ScheduledNotes entries whose track, clip, or channel became inactive/muted
+    scheduledNotes->shortenInactiveSongNotes (song, loopStart, 0.0);
+
+    // 5. Audio clips: reconcile active audio clips crossing loopStart with each audioClip channel's voices
+    for (int ch = 0; ch < numCh && ch < numInst; ++ch)
+    {
+        if (song.channels[(std::size_t) ch].instrument != InstrumentKind::audioClip || state.instruments[(std::size_t) ch] == nullptr)
+            continue;
+        auto& inst = *state.instruments[(std::size_t) ch];
+        if (song.channels[(std::size_t) ch].muted)
+        {
+            inst.stopClipVoicesExcept (nullptr, 0);
+            continue;
+        }
+        std::array<int, 32> activeKeys {};
+        int activeKeyCount = 0;
+        for (std::size_t i = 0; i < song.playlist.size(); ++i)
+        {
+            const auto& clip = song.playlist[i];
+            if (clip.kind != ClipKind::audio || clip.channel != ch || clip.length <= 0)
+                continue;
+            if (clip.muted || song.isTrackMuted (clip.track) || clip.start < zoneEnd)
+                continue;
+            if (loopStart > (double) clip.start && loopStart < (double) clip.end())
+            {
+                const auto key = audioClipKey (i);
+                const auto fadeIn = (float) ((double) clip.effectiveFadeIn() / tps);
+                const auto fadeOut = (float) ((double) clip.effectiveFadeOut() / tps);
+                const auto fadeShape = (std::uint8_t) ((clip.crossfadeIn > 0 ? 1 : 0) | (clip.crossfadeOut > 0 ? 2 : 0) | (clip.reversed ? 4 : 0));
+                const auto clipRem = (float) (((double) clip.end() - loopStart) / tps);
+                if (! inst.rekeyAndSyncClipVoice (key, clip.uid, clip.track, clip.gain, clipRem, fadeIn, fadeOut, fadeShape))
+                {
+                    NoteEvent on;
+                    on.type = NoteEvent::Type::on;
+                    on.channel = ch;
+                    on.key = key;
+                    on.velocity = clip.gain;
+                    on.pan = clip.pan;
+                    on.fadeIn = fadeIn;
+                    on.fadeOut = fadeOut;
+                    on.fadeShape = fadeShape;
+                    on.clipPitch = clip.pitch;
+                    on.clipStretch = (float) clip.stretch;
+                    on.track = (std::int16_t) std::clamp (clip.track, -1, 32767);
+                    on.clipUid = clip.uid;
+                    on.sampleOffset = 0;
+                    on.startSeconds = ((double) clip.offset + (double) clip.offsetFraction + loopStart - (double) clip.start) * secondsPerTick;
+                    on.clipElapsed = (float) ((loopStart - (double) clip.start) / tps);
+                    on.clipRemaining = clipRem;
+                    events.add (on);
+                }
+                if (activeKeyCount < (int) activeKeys.size())
+                    activeKeys[(std::size_t) activeKeyCount++] = key;
+            }
+            else if ((double) clip.start >= loopStart && (double) clip.start < loopEnd)
+            {
+                if (activeKeyCount < (int) activeKeys.size())
+                    activeKeys[(std::size_t) activeKeyCount++] = audioClipKey (i);
+            }
+        }
+        inst.stopClipVoicesExcept (activeKeys.data(), activeKeyCount);
+    }
+
+    // 6. Pattern clips: cut sampler voices of newly muted/deleted pattern clips, and chase notes for newly active pattern clips or unmuted channels
+    for (int a = 0; a < activePatternClipCount; ++a)
+    {
+        const auto& prev = activePatternClips[(std::size_t) a];
+        auto stillActive = false;
+        if (prev.uid != 0)
+        {
+            for (const auto& clip : song.playlist)
+                if (clip.kind == ClipKind::pattern && clip.uid == prev.uid)
+                {
+                    if (! clip.muted && ! song.isTrackMuted (clip.track) && clip.start >= zoneEnd)
+                        stillActive = true;
+                    break;
+                }
+        }
+        else
+        {
+            auto mutedAtPrev = false;
+            for (const auto& clip : song.playlist)
+                if (clip.kind == ClipKind::pattern && clip.pattern == prev.pattern && clip.track == prev.track
+                    && clip.start == prev.start && clip.end() == prev.end && clip.start >= zoneEnd)
+                {
+                    if (! clip.muted && ! song.isTrackMuted (clip.track))
+                        stillActive = true;
+                    else
+                        mutedAtPrev = true;
+                    break;
+                }
+            if (! stillActive && ! mutedAtPrev)
+            {
+                for (const auto& clip : song.playlist)
+                    if (clip.kind == ClipKind::pattern && clip.pattern == prev.pattern
+                        && ! clip.muted && ! song.isTrackMuted (clip.track) && clip.start >= zoneEnd)
+                    {
+                        stillActive = true;
+                        break;
+                    }
+            }
+        }
+        if (! stillActive)
+        {
+            for (int ch = 0; ch < numCh && ch < numInst; ++ch)
+                if (state.instruments[(std::size_t) ch] != nullptr && song.channels[(std::size_t) ch].instrument != InstrumentKind::audioClip)
+                {
+                    if (prev.uid != 0)
+                        state.instruments[(std::size_t) ch]->cutVoicesOfClip (prev.uid);
+                    else if (prev.track >= 0)
+                        state.instruments[(std::size_t) ch]->cutVoicesOnTrack (prev.track);
+                }
+        }
+    }
+
+    if (playTruncatedOnTransport)
+    {
+        for (std::size_t clipIdx = 0; clipIdx < song.playlist.size(); ++clipIdx)
+        {
+            const auto& clip = song.playlist[clipIdx];
+            if (clip.kind != ClipKind::pattern || clip.muted || song.isTrackMuted (clip.track) || clip.start < zoneEnd || clip.length <= 0)
+                continue;
+            if (! (loopStart > (double) clip.start && loopStart < (double) clip.end()))
+                continue;
+
+            auto wasActive = false;
+            for (int a = 0; a < activePatternClipCount; ++a)
+            {
+                const auto& prev = activePatternClips[(std::size_t) a];
+                if (clip.uid != 0 && prev.uid != 0)
+                {
+                    if (prev.uid == clip.uid)
+                    {
+                        wasActive = true;
+                        break;
+                    }
+                }
+                else if (prev.pattern == clip.pattern && prev.start == clip.start && prev.end == clip.end()
+                         && (prev.track == clip.track || ! (clip.track >= 0 && clip.track < maxPlaylistTracksTracked && trackWasMuted[(std::size_t) clip.track] != 0)))
+                {
+                    wasActive = true;
+                    break;
+                }
+            }
+
+            if (! wasActive)
+                schedulePatternClipChased (song, clip, clipIdx, startTick, numSamples, tps, &state.schedule, wrap, -1, events);
+            else if (anyChannelUnmuted)
+            {
+                for (int ch = 0; ch < numCh; ++ch)
+                    if (! song.channels[(std::size_t) ch].muted && channelWasMuted[(std::size_t) ch] != 0)
+                        schedulePatternClipChased (song, clip, clipIdx, startTick, numSamples, tps, &state.schedule, wrap, ch, events);
+            }
+        }
+    }
+
+    if (events.size() != eventsBefore)
+        events.sortByOffset();
+}
+
+void RackRenderer::updateActiveTracking (const RackState& state, bool playing, double startTick, int numSamples, double tps, bool wrap) noexcept
+{
+    const auto& song = state.song;
+    const auto numCh = std::min ((int) song.channels.size(), maxChannels);
+    for (int ch = 0; ch < numCh; ++ch)
+        channelWasMuted[(std::size_t) ch] = song.channels[(std::size_t) ch].muted ? 1 : 0;
+    for (int ch = numCh; ch < maxChannels; ++ch)
+        channelWasMuted[(std::size_t) ch] = 0;
+
+    const auto numTracks = std::min ((int) song.playlistTracks.size(), maxPlaylistTracksTracked);
+    for (int t = 0; t < numTracks; ++t)
+        trackWasMuted[(std::size_t) t] = song.isTrackMuted (t) ? 1 : 0;
+    for (int t = numTracks; t < maxPlaylistTracksTracked; ++t)
+        trackWasMuted[(std::size_t) t] = 0;
+
+    activePatternClipCount = 0;
+    if (! playing || song.mode != PlayMode::song || tps <= 0.0)
+        return;
+
+    const auto endTick = startTick + numSamples * tps;
+    auto loopLen = state.schedule.songLength > 0 ? state.schedule.songLength : song.songLength();
+    if (! wrap)
+        loopLen = std::max<std::int64_t> (loopLen, (std::int64_t) std::ceil (endTick) + 1) * 2;
+    if (loopLen <= 0)
+        return;
+    const auto loopStart = std::fmod (std::max (0.0, startTick), (double) loopLen);
+    const auto loopEnd = loopStart + (double) numSamples * tps;
+    const auto zoneEnd = song.performanceZoneEnd();
+
+    for (const auto& clip : song.playlist)
+    {
+        if (clip.kind != ClipKind::pattern || clip.muted || song.isTrackMuted (clip.track) || clip.start < zoneEnd || clip.length <= 0)
+            continue;
+        if ((double) clip.start < loopEnd && (double) clip.end() > loopStart)
+        {
+            if (activePatternClipCount < (int) activePatternClips.size())
+                activePatternClips[(std::size_t) activePatternClipCount++] = { clip.uid, clip.pattern, clip.track, clip.start, clip.end() };
+        }
     }
 }
 } // namespace lynx

@@ -186,10 +186,10 @@ void SplashScreen::paint (juce::Graphics& g)
     juce::Graphics::ScopedSaveState clip (g);
     g.reduceClipRegion (cardShape);
 
-    // the pepper's resting place, and its drop
-    const auto pepperHeight = 212.0f;
+    // the badge's resting place, and its drop
+    const auto pepperHeight = 200.0f;
     const auto pepperWidth = pepperHeight * (float) pepper.getWidth() / (float) juce::jmax (1, pepper.getHeight());
-    const auto restX = 168.0f, restBottom = 270.0f;
+    const auto restX = 152.0f, restBottom = 264.0f;
     const auto fall = 300.0f;
     const auto lift = (float) (1.0 - easeOutBounce (t / dropTime)) * fall;
     const auto impact = (float) impactAt (t);
@@ -213,19 +213,19 @@ void SplashScreen::paint (juce::Graphics& g)
         g.drawEllipse (restX - r, restBottom - r * 0.16f, 2.0f * r, r * 0.32f, 1.5f);
     }
 
-    // shadow: grows and darkens as the pepper comes down
+    // shadow: grows and darkens as the badge comes down
     {
         const auto near = 1.0f - juce::jlimit (0.0f, 1.0f, lift / fall);
-        const auto w = 92.0f * (0.35f + 0.65f * near) * (1.0f + 0.15f * impact);
+        const auto w = 160.0f * (0.35f + 0.65f * near) * (1.0f + 0.15f * impact);
         g.setColour (juce::Colours::black.withAlpha (0.55f * near * (float) clamp01 (t / 0.15)));
         g.fillEllipse (restX - w / 2.0f, restBottom - 7.0f, w, 12.0f);
     }
 
-    // the pepper: fades in, falls, squashes a little on each touch and settles with a slight tilt
+    // the badge: fades in, falls, squashes a little on each touch and settles upright
     if (pepper.isValid() && t > 0.0)
     {
-        const auto angle = juce::degreesToRadians ((float) (-12.0 - 26.0 * (1.0 - easeOutBack (t / 0.95))));
-        const auto squashY = 1.0f - 0.10f * impact, squashX = 1.0f + 0.06f * impact;
+        const auto angle = juce::degreesToRadians ((float) (-14.0 * (1.0 - easeOutBack (t / 0.95))));
+        const auto squashY = 1.0f - 0.08f * impact, squashX = 1.0f + 0.05f * impact;
         const auto transform = juce::AffineTransform::scale (pepperWidth / (float) pepper.getWidth() * squashX,
                                                              pepperHeight / (float) pepper.getHeight() * squashY)
                                    .translated (-pepperWidth * squashX / 2.0f, -pepperHeight * squashY)

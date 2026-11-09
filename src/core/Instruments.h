@@ -105,6 +105,14 @@ public:
     virtual void setNextClipStretch (float /*stretch*/) noexcept {}
     virtual void setClipShift (bool) {}
     virtual void setNextClipFades (float /*elapsed*/, float /*remaining*/, float /*fadeIn*/, float /*fadeOut*/, std::uint8_t /*shape*/ = 0) noexcept {}
+    // Identity of the next note or audio clip (Playlist clip uid and track, before noteOn) so live track/clip
+    // mutes, deletes, or re-indexing can match or cut already-sounding voices on the audio thread.
+    virtual void setNextClipIdentity (std::uint64_t /*uid*/, int /*track*/) noexcept {}
+    virtual bool rekeyAndSyncClipVoice (int /*key*/, std::uint64_t /*clipUid*/, int /*track*/, float /*gain*/,
+                                        float /*clipRemaining*/, float /*fadeIn*/, float /*fadeOut*/, std::uint8_t /*fadeShape*/) noexcept { return false; }
+    virtual void stopClipVoicesExcept (const int* /*activeKeys*/, int /*count*/) noexcept {}
+    virtual void cutVoicesOnTrack (int /*track*/) noexcept {}
+    virtual void cutVoicesOfClip (std::uint64_t /*clipUid*/) noexcept {}
     // Pan, fine tuning and "porta" (inverts the channel's porta) of the next note (called right before
     // noteOn). Ignored if unsupported.
     virtual void setNextNoteExpression (float /*pan*/, float /*cents*/, bool /*porta*/ = false) noexcept {}

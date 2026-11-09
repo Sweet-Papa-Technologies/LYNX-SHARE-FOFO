@@ -59,6 +59,9 @@ struct NoteEvent
     std::int16_t port = -1;
     // a scheduled note's "on" (round 169d): the ticks from it to the note's "off" (0 = not known), for ScheduledNotes
     float lengthTicks = 0.0f;
+    std::int16_t track = -1;
+    std::int16_t pattern = -1;
+    std::uint64_t clipUid = 0;
 };
 
 // Fixed-capacity buffer. Events beyond capacity are dropped
@@ -123,6 +126,13 @@ public:
             }
         return found;
     }
+    void shortenChannel (int channel, double offsetTicks) noexcept
+    {
+        for (int k = 0; k < count; ++k)
+            if (auto& entry = entries[(std::size_t) k]; entry.channel == channel)
+                entry.end = std::min (entry.end, clock + offsetTicks);
+    }
+    void shortenInactiveSongNotes (const Song& song, double loopStart, double offsetTicks) noexcept;
     // channels inserted, removed or moved: from[c] = the old index of channel c (−1 = a new channel)
     void moveChannels (const std::vector<int>& from) noexcept;
     int sounding() const noexcept { return count; }
@@ -132,6 +142,8 @@ private:
     {
         int channel = 0, key = 0;
         double end = 0.0; // on `clock`; +inf = its "off" comes from the scheduler only
+        std::int16_t track = -1, pattern = -1;
+        std::uint64_t clipUid = 0;
     };
     std::array<Entry, capacity> entries {};
     int count = 0;
@@ -225,5 +237,9 @@ void scheduleSongAround (const Song& song, const TrackMask& taken, const TrackMa
 // One clip played once where it is (no song loop), its events in the block (not sorted): Performance mode's passes.
 void scheduleSingleClip (const Song& song, const Clip& clip, std::size_t clipIndex, double startTick, int numSamples, double tps,
                          EventBuffer& out, const ScheduleIndex* index = nullptr) noexcept;
+// Emits chased note-ons (and note-offs falling in the block) for notes in `clip` that cross `loopStart`
+// (`onlyChannel >= 0` filters to that channel), used when a pattern clip or channel becomes newly audible during playback.
+void schedulePatternClipChased (const Song& song, const Clip& clip, std::size_t clipIndex, double startTick, int numSamples,
+                                double tps, const ScheduleIndex* index, bool wrap, int onlyChannel, EventBuffer& out) noexcept;
 // (wrap = false: the song plays once and is silent past its end — audio recording without a loop region, round 163)
 } // namespace lynx
