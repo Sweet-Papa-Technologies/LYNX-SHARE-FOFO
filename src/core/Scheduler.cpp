@@ -201,7 +201,8 @@ void ScheduledNotes::process (EventBuffer& events, int numSamples, double tps) n
             if (count < capacity)
                 entries[(std::size_t) count++] = { e.channel, e.key,
                                                    e.lengthTicks > 0.0f ? clock + e.sampleOffset * tps + (double) e.lengthTicks
-                                                                        : std::numeric_limits<double>::infinity() };
+                                                                        : std::numeric_limits<double>::infinity(),
+                                                   e.track, e.pattern, e.clipUid };
             else
                 overflow = true;
         }
@@ -243,6 +244,9 @@ void ScheduledNotes::process (EventBuffer& events, int numSamples, double tps) n
         off.channel = entries[(std::size_t) k].channel;
         off.key = entries[(std::size_t) k].key;
         off.velocity = 0.0f;
+        off.track = entries[(std::size_t) k].track;
+        off.pattern = entries[(std::size_t) k].pattern;
+        off.clipUid = entries[(std::size_t) k].clipUid;
         off.sampleOffset = std::clamp ((int) std::ceil (due - 1.0e-6), 0, numSamples - 1);
         events.add (off);
         added = true;
@@ -251,6 +255,64 @@ void ScheduledNotes::process (EventBuffer& events, int numSamples, double tps) n
     if (added)
         events.sortByOffset();
     clock += numSamples * tps;
+}
+
+void ScheduledNotes::shortenInactiveSongNotes (const Song& song, double loopStart, double offsetTicks) noexcept
+{
+    const auto zoneEnd = song.performanceZoneEnd();
+    for (int k = 0; k < count; ++k)
+    {
+        auto& entry = entries[(std::size_t) k];
+        if (entry.channel >= 0 && (std::size_t) entry.channel < song.channels.size() && song.channels[(std::size_t) entry.channel].muted)
+        {
+            entry.end = std::min (entry.end, clock + offsetTicks);
+            continue;
+        }
+        if (entry.track < 0 || entry.end <= clock + dueSamples * 1.0e-9)
+            continue;
+        if (song.isTrackMuted (entry.track))
+        {
+            entry.end = std::min (entry.end, clock + offsetTicks);
+            continue;
+        }
+        auto active = false;
+        if (entry.clipUid != 0)
+        {
+            for (const auto& c : song.playlist)
+                if (c.kind == ClipKind::pattern && c.uid == entry.clipUid)
+                {
+                    if (! c.muted && ! song.isTrackMuted (c.track) && c.start >= zoneEnd)
+                        active = true;
+                    break;
+                }
+        }
+        else
+        {
+            auto mutedAtPlayhead = false;
+            for (const auto& c : song.playlist)
+                if (c.kind == ClipKind::pattern && c.pattern == entry.pattern && c.track == entry.track
+                    && c.start >= zoneEnd && (double) c.start <= loopStart && (double) c.end() > loopStart)
+                {
+                    if (! c.muted && ! song.isTrackMuted (c.track))
+                        active = true;
+                    else
+                        mutedAtPlayhead = true;
+                    break;
+                }
+            if (! active && ! mutedAtPlayhead)
+            {
+                for (const auto& c : song.playlist)
+                    if (c.kind == ClipKind::pattern && c.pattern == entry.pattern
+                        && ! c.muted && ! song.isTrackMuted (c.track) && c.start >= zoneEnd)
+                    {
+                        active = true;
+                        break;
+                    }
+            }
+        }
+        if (! active)
+            entry.end = std::min (entry.end, clock + offsetTicks);
+    }
 }
 
 void ScheduledNotes::moveChannels (const std::vector<int>& from) noexcept
@@ -338,6 +400,8 @@ void scheduleClip (const Song& song, const Clip& clip, std::size_t clipIndex, do
         e.fadeShape = (std::uint8_t) ((clip.crossfadeIn > 0 ? 1 : 0) | (clip.crossfadeOut > 0 ? 2 : 0) | (clip.reversed ? 4 : 0));
         e.clipPitch = clip.pitch; // FL 2026's clip pitch (round 167k): shifted, the clip's length stays
         e.clipStretch = (float) clip.stretch; // FL 2026's clip stretch (round 167l)
+        e.track = (std::int16_t) std::clamp (clip.track, -1, 32767);
+        e.clipUid = clip.uid;
 
         if (resume && loopStart > (double) clip.start && loopStart < (double) clip.end())
         {
@@ -436,6 +500,9 @@ void scheduleClip (const Song& song, const Clip& clip, std::size_t clipIndex, do
             e.modY = note.modY;
             e.release = note.release;
             e.colour = (std::int8_t) (note.colour & 15);
+            e.track = (std::int16_t) std::clamp (clip.track, -1, 32767);
+            e.pattern = (std::int16_t) std::clamp (clip.pattern, -1, 32767);
+            e.clipUid = clip.uid;
 
             if (note.slide)
             {
@@ -485,6 +552,89 @@ void scheduleSingleClip (const Song& song, const Clip& clip, std::size_t clipInd
     // a "loop" longer than anything played: the clip plays once, where it is
     const auto loop = (std::max<std::int64_t> ((std::int64_t) std::ceil (endTick), clip.end()) + 1) * 2;
     scheduleClip (song, clip, clipIndex, startTick, endTick, numSamples, tps, loop, startTick, endTick, false, index, out);
+}
+
+void schedulePatternClipChased (const Song& song, const Clip& clip, std::size_t /*clipIndex*/, double startTick, int numSamples,
+                                double tps, const ScheduleIndex* index, bool wrap, int onlyChannel, EventBuffer& out) noexcept
+{
+    if (numSamples <= 0 || tps <= 0.0 || clip.kind != ClipKind::pattern || clip.pattern < 0
+        || clip.pattern >= (int) song.patterns.size() || clip.length <= 0)
+        return;
+
+    const auto endTick = startTick + numSamples * tps;
+    auto loop = index != nullptr ? index->songLength : song.songLength();
+    if (! wrap)
+        loop = std::max<std::int64_t> (loop, (std::int64_t) std::ceil (endTick) + 1) * 2;
+    if (loop <= 0)
+        return;
+
+    const auto loopStart = std::fmod (startTick, (double) loop);
+    if (loopStart <= (double) clip.start || loopStart >= (double) clip.end())
+        return;
+
+    const auto& pattern = song.patterns[(std::size_t) clip.pattern];
+    const auto& notes = pattern.notes;
+    const auto period = index != nullptr && (std::size_t) clip.pattern < index->patternLength.size()
+                            ? index->patternLength[(std::size_t) clip.pattern]
+                            : std::max<std::int64_t> (1, pattern.effectiveLength (song.beatsPerBar));
+    const auto repeats = stretchedClipsLoop() && clip.offset + clip.length > period;
+    const auto firstPass = repeats ? clip.offset / period : 0, lastPass = repeats ? (clip.offset + clip.length - 1) / period : 0;
+
+    auto chasePass = [&] (std::int64_t shift) {
+        for (const auto& note : notes)
+        {
+            if (repeats && note.start >= period)
+                continue;
+            if (onlyChannel >= 0 && note.channel != onlyChannel)
+                continue;
+            const auto start = note.start + shift;
+            if (note.muted || note.slide || start >= clip.offset + clip.length)
+                continue;
+
+            const auto timing = noteTiming (note, song.swing, channelOf (&song.channels, note.channel));
+            auto on = std::min (clip.start + (start - clip.offset) + (timing.start - note.start), clip.end() - 1);
+            auto off = std::min (on + timing.length, clip.end());
+
+            if (start < clip.offset)
+            {
+                const auto left = start + timing.length - clip.offset;
+                if (! song.playTruncatedNotes || left < 1)
+                    continue;
+                on = clip.start;
+                off = std::min (clip.start + left, clip.end());
+            }
+
+            if ((double) on + tps <= loopStart && (double) off > loopStart)
+            {
+                NoteEvent e;
+                e.type = NoteEvent::Type::on;
+                e.channel = note.channel;
+                e.key = note.key;
+                e.velocity = note.velocity;
+                e.pan = note.pan;
+                e.cents = note.finePitch;
+                e.porta = note.porta;
+                e.modX = note.modX;
+                e.modY = note.modY;
+                e.release = note.release;
+                e.colour = (std::int8_t) (note.colour & 15);
+                e.track = (std::int16_t) std::clamp (clip.track, -1, 32767);
+                e.pattern = (std::int16_t) std::clamp (clip.pattern, -1, 32767);
+                e.clipUid = clip.uid;
+                e.sampleOffset = 0;
+                e.lengthTicks = (float) ((double) off - loopStart);
+                out.add (e);
+            }
+        }
+    };
+
+    if (! repeats)
+    {
+        chasePass (0);
+        return;
+    }
+    for (auto pass = firstPass; pass <= lastPass; ++pass)
+        chasePass (pass * period);
 }
 
 void scheduleSong (const Song& song, double startTick, int numSamples, double tps, EventBuffer& out, bool resume,

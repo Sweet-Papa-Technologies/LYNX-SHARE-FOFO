@@ -481,6 +481,21 @@ private:
     double expectedTick = -1.0; // where the next block should start, to detect jumps
     bool resumeAudio = false;
     bool chaseNotes = false; // this block starts playback: notes crossing the position play (setTransportOptions)
+    bool snapshotChanged = false;
+    PlayMode lastPlayMode = PlayMode::pattern;
+    std::array<char, maxChannels> channelWasMuted {};
+    static constexpr int maxPlaylistTracksTracked = 512;
+    std::array<char, maxPlaylistTracksTracked> trackWasMuted {};
+    struct ActivePatternClip
+    {
+        std::uint64_t uid = 0;
+        int pattern = -1, track = -1;
+        std::int64_t start = 0, end = 0;
+    };
+    std::array<ActivePatternClip, 256> activePatternClips {};
+    int activePatternClipCount = 0;
+    void syncLiveEdits (const RackState& state, double startTick, int numSamples, double tps, bool wrap) noexcept;
+    void updateActiveTracking (const RackState& state, bool playing, double startTick, int numSamples, double tps, bool wrap) noexcept;
     bool playTruncatedOnTransport = true, resetPluginsOnTransport = false;
     unsigned userJumpSerial = 0, seenUserJumpSerial = 0;
     const RackState* lastState = nullptr;
