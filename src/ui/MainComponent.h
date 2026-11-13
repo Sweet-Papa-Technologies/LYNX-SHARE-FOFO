@@ -85,6 +85,9 @@ public:
     // --uiperf (round 173f): the default layout with these panels shown too (the reporter's Channel Rack + Mixer)
     void showPanelsForSnapshot (std::initializer_list<workspace::Panel> panels);
     void openQuickAddForTest() { showQuickAdd(); } // --windowtest
+    // --savetest: File › Save to `file` without the dialog, and whether its file is still being written
+    void saveForTest (const juce::File& file, std::function<void()> saved) { saveProjectTo (file, true, std::move (saved)); }
+    bool isSavingForTest() const noexcept { return saving; }
     void waitForBrowserForSnapshot() { browser.waitForListing (5000); }
     juce::StringArray getMenuNamesForSnapshot() { return getMenuBarNames(); }
     juce::PopupMenu getMenuForSnapshot (int index) { return getMenuForIndex (index, {}); }
@@ -284,6 +287,24 @@ private:
     // `afterSaved`: runs once the project is on disk, also when a "Save as" dialog had to ask first (never after a
     // cancelled dialog or a failed save).
     void save (bool askForFile, std::function<void()> afterSaved = {});
+    // Writing the project file takes a while on a big project (every plugin's state and every recording inside it,
+    // encoded), and it used to run on the message thread: the window froze until the file was there. Now the song is
+    // copied (plugin states read first: they answer on the message thread) and the copy is written on a thread of its
+    // own, like the timed backup; the toolbar says "Saving..." meanwhile and the window keeps answering.
+    //  - `saved` runs on the message thread once `file` is on disk and is the project's file (title, recent list);
+    //    a failed save says why and does not run it.
+    //  - An edit made while the file is being written leaves the project modified (the file has the older state).
+    //  - One save at a time: a second one, and whatever needs the project on disk first ("Save changes?" before
+    //    opening another project or quitting), waits for the one in progress (afterSaving).
+    void saveProjectTo (const juce::File& file, bool keepOverwritten, std::function<void()> saved);
+    void saveEnded (const juce::File& file, const juce::File& overwrittenCopy, bool ok, const juce::String& error,
+                    std::uint64_t editsAtStart, std::uint64_t songAtStart, const std::function<void()>& saved);
+    void afterSaving (std::function<void()> then); // now, or when the save in progress has ended
+    bool saving = false;
+    juce::String savingName;                                // the file being written (the toolbar and the hint bar name it)
+    double savingSince = 0.0;                               // (ms) turns the toolbar's "Saving..." mark
+    std::vector<std::function<void()>> waitingForSave;
+    std::shared_ptr<juce::WaitableEvent> saveWritten;       // the writing thread is done with the file (closing waits for it)
     void exportAudio (int format = -1); // −1: the last export's format(s); 0 WAV, 1 MP3, 2 OGG, 3 FLAC alone
     void exportMidiFile();
     void switchSmartDisableForAll();
@@ -302,7 +323,6 @@ private:
     liveui::Context liveContext();       // the live session's (round 169b)
     void startLiveFromCommandLine();     // --live-host code.txt / --live-join CODE|@code.txt (scripted GUI checks)
     void collectSamples();
-    void keepOverwrittenCopy (const juce::File& file); // the previous file of a save, kept in the backup folder
     void rotateBackups (const juce::String& stem);
     // unused recordings (REA round 134, FL's "Delete unused recorded files" / "Delete unused files and save project")
     void offerToDeleteUnusedRecordings (bool keepsCurrentState, std::function<void()> then);

@@ -743,6 +743,8 @@ MainComponent::~MainComponent()
     live.reset(); // (a session still on ends: the others are told)
     setSecondaryWindowKeyHandler (nullptr);
     cancelProjectLoad(); // an open in progress uses the engine from its thread
+    if (saveWritten != nullptr) // a project file is being written: closing never cuts it short
+        saveWritten->wait (60000);
     if (sessionLock != nullptr) // a clean exit: no "LYNX did not close properly" next time
         sessionMarker.deleteFile();
     mixerinput::openAudioSettings = nullptr;
@@ -835,8 +837,27 @@ void MainComponent::paint (juce::Graphics& g)
         const auto name = projectName.isNotEmpty() ? projectName : tr ("Untitled");
         g.setFont (font (type::small, true));
         g.setColour (colour::textSecondary);
-        if (const auto rest = titleArea.withTrimmedLeft (people > 0 ? people + 10 : 0); rest.getWidth() >= 50)
-            g.drawFittedText ((engine.isModified() ? juce::String ("* ") : juce::String()) + name, rest, juce::Justification::centredRight, 1, 0.8f);
+        if (auto rest = titleArea.withTrimmedLeft (people > 0 ? people + 10 : 0); rest.getWidth() >= 50)
+        {
+            auto text = (engine.isModified() ? juce::String ("* ") : juce::String()) + name;
+            if (saving)
+            {
+                // the file is being written (on its own thread): a turning arc and "Saving..." before the name, or in
+                // its place where there is no room for both
+                const auto arc = (float) juce::jmin (12, rest.getHeight() - 4);
+                text = rest.getWidth() >= 170 ? tr ("Saving...") + "  " + text : tr ("Saving...");
+                const auto textWidth = juce::jmin ((float) rest.getWidth() - arc - 6.0f, juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), text));
+                const auto box = juce::Rectangle<float> (arc, arc).withCentre ({ (float) rest.getRight() - textWidth - 6.0f - arc * 0.5f, (float) rest.getCentreY() });
+                const auto turn = (float) (std::fmod ((juce::Time::getMillisecondCounterHiRes() - savingSince) / 900.0, 1.0) * juce::MathConstants<double>::twoPi);
+                juce::Path p;
+                p.addCentredArc (box.getCentreX(), box.getCentreY(), arc * 0.5f - 1.0f, arc * 0.5f - 1.0f, turn, 0.0f, juce::MathConstants<float>::pi * 1.4f, true);
+                g.setColour (colour::accent);
+                g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                g.setColour (colour::textSecondary);
+                rest = rest.withLeft (juce::roundToInt (box.getRight() + 6.0f));
+            }
+            g.drawFittedText (text, rest, juce::Justification::centredRight, 1, 0.8f);
+        }
     }
 
     // captions that name the snap and pattern selectors, after their icons (the magnet is a button)
@@ -4410,6 +4431,13 @@ void MainComponent::timerCallback()
         lastModified = engine.isModified();
         updateTitle();
     }
+    if (saving)
+    {
+        if (titleArea.isEmpty()) // (the narrowest toolbar has no title: the hint bar says it for as long as it takes)
+            ui::postHint ({ tr ("Saving...") + " " + savingName, {}, false, false }, 500);
+        else
+            repaint (titleArea); // the "Saving..." arc turns
+    }
 
     // the Browser's "Project folder" follows the project's file (.lynx, or the .flp it was imported from)
     const uitrace::Scope partFolders ("timer: project folder / recording target", false);
@@ -4618,7 +4646,8 @@ void MainComponent::updateTitle()
             liveState = " [" + (st == S::live ? tr ("LIVE") : st == S::reconnecting ? tr ("Reconnecting...") : st == S::waitingHost ? tr ("Waiting for the host...") : tr ("Connecting...")) + "]";
         }
         window->setName ((engine.isModified() ? "* " : "")
-                         + (projectName.isNotEmpty() ? "LYNX SHARE - " + projectName : juce::String ("LYNX SHARE")) + importedSuffix + liveState);
+                         + (projectName.isNotEmpty() ? "LYNX SHARE - " + projectName : juce::String ("LYNX SHARE")) + importedSuffix + liveState
+                         + (saving ? " (" + tr ("Saving...") + ")" : juce::String()));
     }
 }
 
@@ -4634,6 +4663,11 @@ std::unique_ptr<juce::AlertWindow> MainComponent::makeConfirmDiscardWindow()
 
 void MainComponent::confirmDiscard (std::function<void()> then)
 {
+    if (saving) // the answer depends on how the save in progress ends
+    {
+        afterSaving ([this, then = std::move (then)] { confirmDiscard (then); });
+        return;
+    }
     if (! engine.isModified())
     {
         offerToDeleteUnusedRecordings (true, std::move (then));
@@ -4643,7 +4677,12 @@ void MainComponent::confirmDiscard (std::function<void()> then)
     auto* window = makeConfirmDiscardWindow().release();
     window->enterModalState (true, juce::ModalCallbackFunction::create ([this, then] (int result) {
                                  if (result == 1)
-                                     save (false, [this, then] { offerToDeleteUnusedRecordings (true, then); }); // (not after a cancelled "save as")
+                                     save (false, [this, then] { // (not after a cancelled "save as")
+                                         if (engine.isModified()) // edited while the file was being written: ask again
+                                             confirmDiscard (then);
+                                         else
+                                             offerToDeleteUnusedRecordings (true, then);
+                                     });
                                  else if (result == 2)
                                      offerToDeleteUnusedRecordings (false, then);
                              }),
@@ -4740,8 +4779,7 @@ void MainComponent::deleteUnusedRecordingsAndSave()
 
     if (unused.empty())
     {
-        save (false);
-        ui::postHint ({ tr ("No unused recordings. Project saved."), {}, false, false }, 4000);
+        save (false, [] { ui::postHint ({ tr ("No unused recordings. Project saved."), {}, false, false }, 4000); });
         return;
     }
     askKeepOrDelete (tr ("This project has {0} unused recording(s). Deleting them cannot be undone (they go to the recycle bin).",
@@ -4832,19 +4870,6 @@ void MainComponent::rotateBackups (const juce::String& stem)
     }
 }
 
-void MainComponent::keepOverwrittenCopy (const juce::File& file)
-{
-    // FL moves the file a save replaces into its Backup folder as "Song (overwritten on ... at ...)"; LYNX copies it
-    // (the save itself still goes through a temporary file and a rename)
-    const auto folder = autosaveFolder();
-    if (! file.existsAsFile() || file.isAChildOf (folder))
-        return;
-    folder.createDirectory();
-    const auto stem = projectStem (file.getFileNameWithoutExtension());
-    if (file.copyFileTo (newBackupFile (folder, stem, safety::BackupKind::overwritten)))
-        rotateBackups (stem);
-}
-
 void MainComponent::saveNewVersion()
 {
     // FL's "Save new version": Song.flp -> Song_2.flp -> Song_3.flp, next to the current file
@@ -4858,20 +4883,7 @@ void MainComponent::saveNewVersion()
         return folder.getChildFile (juce::String::fromUTF8 (n.c_str()) + ProjectFile::extension).exists();
     });
     const auto file = folder.getChildFile (juce::String::fromUTF8 (name.c_str()) + ProjectFile::extension);
-    juce::String error;
-    engine.capturePluginStates();
-    if (! ProjectFile::save (engine.getSong(), file, error))
-    {
-        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not save"), error);
-        return;
-    }
-    engine.markSaved();
-    rememberRecent (file);
-    currentFile = file;
-    projectName = file.getFileNameWithoutExtension();
-    importedSuffix = {};
-    updateTitle();
-    ui::postHint ({ tr ("Saved as a new version: {0}", { file.getFileName() }), {}, false, false }, 5000);
+    saveProjectTo (file, false, [file] { ui::postHint ({ tr ("Saved as a new version: {0}", { file.getFileName() }), {}, false, false }, 5000); });
 }
 
 void MainComponent::revertToLastBackup()
@@ -5108,21 +5120,8 @@ void MainComponent::saveToNewProjectFolder()
         if (! relink.empty())
             self.engine.editSong ([&relink] (Song& song) { applyRelocations (song, relink); });
 
-        const auto file = folder.getChildFile (name + ProjectFile::extension);
-        juce::String error;
-        self.engine.capturePluginStates();
-        if (! ProjectFile::save (self.engine.getSong(), file, error))
-        {
-            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not save"), error);
-            return;
-        }
-        self.engine.markSaved();
-        self.rememberRecent (file);
-        self.currentFile = file;
-        self.projectName = name;
-        self.importedSuffix = {};
-        self.updateTitle();
-        ui::postHint ({ tr ("Saved in its own folder: {0}", { folder.getFullPathName() }), {}, false, false }, 5000);
+        self.saveProjectTo (folder.getChildFile (name + ProjectFile::extension), false,
+                            [folder] { ui::postHint ({ tr ("Saved in its own folder: {0}", { folder.getFullPathName() }), {}, false, false }, 5000); });
     });
 }
 
@@ -5919,27 +5918,119 @@ void MainComponent::exportMidiFile()
                               });
 }
 
+void MainComponent::afterSaving (std::function<void()> then)
+{
+    if (saving)
+        waitingForSave.push_back (std::move (then));
+    else
+        then();
+}
+
+void MainComponent::saveProjectTo (const juce::File& file, bool keepOverwritten, std::function<void()> saved)
+{
+    if (saving) // one file at a time: this save starts when the one in progress has ended
+    {
+        waitingForSave.push_back ([this, file, keepOverwritten, saved = std::move (saved)] { saveProjectTo (file, keepOverwritten, saved); });
+        return;
+    }
+    {
+        const uitrace::Scope trace ("save: plugin states", false);
+        engine.capturePluginStates(); // plugin state lives in the plugins; copy it before saving
+    }
+    // What is written is the project as it is now: a copy, so that editing can go on while the file is written
+    // (recordings and samples are shared, not copied).
+    std::shared_ptr<const Song> copy;
+    {
+        const uitrace::Scope trace ("save: copy of the song", false);
+        copy = std::make_shared<const Song> (engine.getSong());
+    }
+    // FL moves the file a save replaces into its Backup folder as "Song (overwritten on ... at ...)"; LYNX copies it
+    juce::File overwrittenCopy;
+    if (const auto folder = autosaveFolder(); keepOverwritten && file.existsAsFile() && ! file.isAChildOf (folder))
+    {
+        folder.createDirectory();
+        overwrittenCopy = newBackupFile (folder, projectStem (file.getFileNameWithoutExtension()), safety::BackupKind::overwritten);
+    }
+
+    saving = true;
+    savingName = file.getFileName();
+    savingSince = juce::Time::getMillisecondCounterHiRes();
+    saveWritten = std::make_shared<juce::WaitableEvent> (true);
+    saveButton.setEnabled (false);
+    updateTitle();
+    ui::postHint ({ tr ("Saving...") + " " + savingName, {}, false, false }, 2000);
+
+    // (Priority::high: the user is waiting for this file, unlike the timed backup's)
+    juce::Thread::launch (juce::Thread::Priority::high,
+                          [copy = std::move (copy), file, overwrittenCopy, written = saveWritten, saved = std::move (saved),
+                           safe = juce::Component::SafePointer<MainComponent> (this), edits = engine.getEditCount(),
+                           song = engine.getSongCount()] () mutable {
+        if (overwrittenCopy != juce::File())
+            file.copyFileTo (overwrittenCopy);
+        juce::String error;
+        const auto ok = ProjectFile::save (*copy, file, error);
+        copy.reset(); // (here, not on the message thread: freeing a big song takes a moment too)
+        written->signal();
+        juce::MessageManager::callAsync ([safe, file, overwrittenCopy, ok, error, edits, song, saved = std::move (saved)] {
+            if (safe != nullptr)
+                safe->saveEnded (file, overwrittenCopy, ok, error, edits, song, saved);
+        });
+    });
+}
+
+void MainComponent::saveEnded (const juce::File& file, const juce::File& overwrittenCopy, bool ok, const juce::String& error,
+                               std::uint64_t editsAtStart, std::uint64_t songAtStart, const std::function<void()>& saved)
+{
+    saving = false;
+    saveWritten = nullptr;
+    saveButton.setEnabled (true);
+    if (overwrittenCopy.existsAsFile())
+        rotateBackups (projectStem (file.getFileNameWithoutExtension()));
+
+    if (! ok)
+    {
+        ui::clearPostedHint();
+        updateTitle();
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not save"), error);
+    }
+    else if (engine.getSongCount() != songAtStart)
+    {
+        // another project was opened meanwhile (what opens one waits for the save, so this is a path that did not
+        // ask): the file is written, but it is not the open project's
+        updateTitle();
+    }
+    else
+    {
+        if (engine.getEditCount() == editsAtStart) // (edited while the file was written: still modified)
+            engine.markSaved();
+        rememberRecent (file);
+        currentFile = file;
+        projectName = file.getFileNameWithoutExtension();
+        importedSuffix = {};
+        updateTitle();
+        ui::postHint ({ tr ("Saved {0}", { file.getFileName() }), {}, false, false }, 2500);
+        if (saved)
+            saved();
+    }
+
+    // what waited for this save (in order; a save among them starts the next wait)
+    auto waiting = std::move (waitingForSave);
+    waitingForSave.clear();
+    for (auto next = waiting.begin(); next != waiting.end(); ++next)
+    {
+        if (saving) // one of them started a save: the rest wait for that one
+        {
+            waitingForSave.insert (waitingForSave.end(), std::make_move_iterator (next), std::make_move_iterator (waiting.end()));
+            break;
+        }
+        (*next)();
+    }
+}
+
 void MainComponent::save (bool askForFile, std::function<void()> afterSaved)
 {
-    auto write = [this, afterSaved] (const juce::File& file) {
-        juce::String error;
-        engine.capturePluginStates(); // plugin state lives in the plugins; copy it before saving
-        keepOverwrittenCopy (file);   // the version this save replaces goes to the backup folder (like FL)
-
-        if (ProjectFile::save (engine.getSong(), file, error))
-        {
-            engine.markSaved();
-            rememberRecent (file);
-            currentFile = file;
-            projectName = file.getFileNameWithoutExtension();
-            importedSuffix = {};
-            updateTitle();
-            if (afterSaved)
-                afterSaved();
-        }
-        else
-            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not save"), error);
-    };
+    // (the version this save replaces goes to the backup folder, like FL)
+    auto write = [this, afterSaved] (const juce::File& file) { saveProjectTo (file, true, afterSaved); };
 
     // a project opened from the backup folder is saved somewhere else (old backups there are deleted)
     if (! askForFile && currentFile != juce::File() && ! currentFile.isAChildOf (autosaveFolder()))
