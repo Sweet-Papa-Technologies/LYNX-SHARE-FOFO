@@ -174,6 +174,11 @@ struct Sources
 };
 
 double pickTempo (const Genre& genre, FlRand& rng); // update_pattern_tempo (randomise)
+// The tempo a genre suggests, as a whole number: what a starter button shows ("Lo-fi  84 BPM") and what the project
+// gets when the starter is added with "Use the suggested tempo" — the same number, not pickTempo's random one from the
+// genre's range (round 190t). The second form looks the genre up like generate() does (unknown: LYNX's own default).
+int suggestedTempo (const Genre& genre);
+int suggestedTempo (const Sources& sources, const std::string& genreId);
 // picks a sample of the category (or of its fallbacks), avoiding `recent`; "" = none in the library
 std::string pickSample (const Library& library, const std::string& category, FlRand& rng,
                         const std::vector<std::string>& recent = {}, std::string* pickedCategory = nullptr);
@@ -192,6 +197,12 @@ int apply (Song& song, const Plan& plan);
 // the Loop Starter channels of a pattern (channels whose loopStarter.pattern is it)
 std::vector<int> channelsOf (const Song& song, int pattern);
 void setChannelNotes (Song& song, int pattern, int channel, const std::vector<Note>& notes, int bars);
+// The Simple workflow's starter beats (round 184a, core/SimpleTracks.h): the plan's kit as plain channels (one per row,
+// in the plan's order, not Loop Starter channels: a sample or the built-in drum of the category) and its steps as one
+// pattern whose notes' `channel` is the row, `bars` × 16 steps long. No insert, no group: SimpleTracks places them.
+std::vector<ChannelDef> kitChannels (const Plan& plan);
+Pattern kitPattern (const Plan& plan);
+
 // Send to Playlist: the pattern at `at` on the first track with no clip from there to its end; the channels leave
 // Loop Starter (FL: "unset channel Loop Starter status"). Returns the track, -1 if no track is free.
 int sendToPlaylist (Song& song, int pattern, std::int64_t at);

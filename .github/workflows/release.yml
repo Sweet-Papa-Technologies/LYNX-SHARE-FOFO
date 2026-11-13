@@ -15,6 +15,10 @@
 #   macos    (macos)    CMake universal (arm64 + x86_64) build, self-test, ad-hoc signature (no Apple Developer ID,
 #                       not notarized), .dmg (scripts/package-macos.sh)
 #   publish  (ubuntu)   SHA256SUMS.txt over every file; on a tag push attaches everything to the (draft) GitHub release
+#   plugins             the optional plugin download (plugins.yml: LYNX's effects as CLAP + a short VST3 list for Windows,
+#                       Linux and macOS, each checked with plugexporttest, pluginval and clap-validator); never in the
+#                       app's installer, and the app's release doesn't wait for it
+#   plugins-publish     on a tag push attaches LYNX-Plugins-<label>-* (with their own SHA256SUMS file) to the same release
 #   store    (windows)  on a tag (push, or a manual store_build resubmission run on the tag): the .msix as a new Microsoft
 #                       Store submission (msstore CLI); skipped with a notice until the MSSTORE_* secrets exist
 #                       (docs/STORE.md › Automatic Store submission)
@@ -494,6 +498,10 @@ jobs:
       - name: AppImage starts offline and shows its window
         run: REQUIRE_OFFLINE=1 ./scripts/check-appimage-start.sh "dist/LYNX-$LABEL-x86_64.AppImage"
 
+      # issue #142 (NixOS): a system where JUCE finds no font at all; LYNX draws with the font it brings.
+      - name: AppImage starts on a system without fonts
+        run: FONTS=none ./scripts/check-appimage-start.sh "dist/LYNX-$LABEL-x86_64.AppImage"
+
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
@@ -638,6 +646,41 @@ jobs:
             gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes-file release-notes/release-notes.md
           fi
           gh release upload "$tag" dist/* --clobber
+
+  # LYNX's plugins for other hosts (round 188b, docs/PLUGIN_EXPORT.md): a separate, optional download with its own
+  # LYNX-Plugins-<label>-SHA256SUMS.txt. Its file names never end like the app's (the updater picks the app's by suffix).
+  plugins:
+    name: Plugins
+    needs: version
+    uses: ./.github/workflows/plugins.yml
+    with:
+      label: ${{ needs.version.outputs.label }}
+
+  # This fork: off unless the repository variable PUBLISH_PLUGINS is 'true'. The plugin files are not signed or notarised
+  # by this workflow (the app's files are), so they are built and checked on every run but not attached to a release
+  # until that is decided.
+  plugins-publish:
+    name: Plugins on the release
+    needs: [version, publish, plugins]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.plugins.result == 'success' && github.ref_type == 'tag' && vars.PUBLISH_PLUGINS == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # attach the files to the (draft) release that publish made
+    env:
+      LABEL: ${{ needs.version.outputs.label }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: LYNX-Plugins-${{ env.LABEL }}-all
+          path: dist
+
+      - name: Attach to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -la dist
+          gh release upload "$GITHUB_REF_NAME" dist/LYNX-Plugins-* --clobber
 
   # Microsoft Store (round 168y): the release's LYNX-<label>-store.msix as a new submission of product 9NQRFBFDCX6N. The
   # msstore CLI clones the last published submission (listings, pricing, "What's new" untouched), replaces its package

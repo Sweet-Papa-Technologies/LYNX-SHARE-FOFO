@@ -1,5 +1,6 @@
 #include "core/FruityDance.h"
 #include "core/Instruments.h"
+#include "core/FpcInstrument.h"
 #include "core/ControlSurface.h"
 #include "core/VoltageController.h"
 #include "core/Vfx.h"
@@ -30,6 +31,7 @@
 #include "core/Drumaxx.h"
 #include "core/Granulizer.h"
 #include "core/WaveTraveller.h"
+#include "core/SlicexInstrument.h"
 #include "core/Slayer.h"
 #include "core/Ogun.h"
 #include "core/TransistorBass.h"
@@ -54,14 +56,26 @@ namespace lynx
 {
 namespace
 {
-// An audio clip voice's fade gain at its position: linear fades, or FL's S curve for an automatic crossfade
-float clipFadeGainOf (float elapsed, float remaining, float in, float out, std::uint8_t shape) noexcept
+// An audio clip voice's fade gain at its position: FL's S curve (shape bits), with its tension, as FL's voices compute it (a
+// fade of N samples: x = (i + 1) / (N + 1), REA round 180d), or straight fades (FL's shape 1, and projects from before it).
+// A comp crossfade (shape bits 3 / 4, round 177c) is the equal-power curve, which wins over the others and has no tension.
+float clipFadeGainOf (float elapsed, float remaining, float in, float out, std::uint8_t shape, float inTension, float outTension) noexcept
 {
     auto gain = 1.0f;
-    if (in > 0.0f && elapsed < in)
-        gain *= (shape & 1) != 0 ? clipops::crossfadeCurve (elapsed / in) : elapsed / in;
-    if (out > 0.0f && remaining < out)
-        gain *= (shape & 2) != 0 ? clipops::crossfadeCurve (std::max (0.0f, remaining) / out) : std::max (0.0f, remaining) / out;
+    if (in > 0.0f && elapsed < in && (shape & 8) != 0)
+        gain *= clipops::equalPowerCurve (elapsed / in);
+    else if (in > 0.0f && elapsed < in)
+    {
+        const auto y = (shape & 1) != 0 ? clipops::crossfadeCurve ((elapsed + 1.0f) / (in + 1.0f)) : elapsed / in;
+        gain *= inTension != 0.0f ? clipops::fadeTensionCurve (y, inTension) : y;
+    }
+    if (out > 0.0f && remaining < out && (shape & 16) != 0)
+        gain *= clipops::equalPowerCurve (std::max (0.0f, remaining) / out);
+    else if (out > 0.0f && remaining < out)
+    {
+        const auto y = (shape & 2) != 0 ? clipops::crossfadeCurve (std::max (0.0f, remaining) / (out + 1.0f)) : std::max (0.0f, remaining) / out;
+        gain *= outTension != 0.0f ? clipops::fadeTensionCurve (y, outTension) : y;
+    }
     return gain;
 }
 
@@ -303,6 +317,9 @@ private:
             case InstrumentKind::flkeys:
             case InstrumentKind::granulizer:
             case InstrumentKind::wavetraveller:
+            case InstrumentKind::fruityslicer:
+            case InstrumentKind::slicex:
+            case InstrumentKind::fpc:
             case InstrumentKind::drumaxx:
             case InstrumentKind::slayer:
             case InstrumentKind::fruitydance:
@@ -1444,6 +1461,43 @@ private:
 // transposed by the key (60 = original pitch), with FL's sampler interpolation (core/FlResampler.h: 24-point sinc while
 // playing, 32-point when exporting, FL's defaults; REA_rodada69 §1).
 
+// Issue #63: a note's Mod X / Y move LYNX's own sampler filter as FL's voice moves its channel filter (REA_rodada76
+// §1 / §4): input X = the channel's X + (modX byte − 128) / 128, Y the same with Mod Y. LYNX's cutoff (Hz) and resonance
+// go to FL's X / Y through the laws of FL's 12 dB filters (the X → frequency law FlpImport's channelFilterHz uses for
+// types 1…5, the Y → Q law of FL's biquads, and the SVF's resonance = (2 − 1/Q) / 1.9 the import maps it with), get the
+// note's offsets and come back. A channel at 19.5 kHz or above counts as fully open (FL's X = 1).
+namespace notemod
+{
+constexpr double twoPi = 6.283185307179586;
+inline double xOfHz (double hz) noexcept
+{
+    if (hz >= 19500.0)
+        return 1.0;
+    return std::log (std::max (1.0e-6, (hz * twoPi / 44100.0 - 0.02) / 0.0596 + 1.0)) / std::log (51.0);
+}
+inline double hzOfX (double x) noexcept
+{
+    if (x >= 1.0)
+        return 20000.0;
+    return std::clamp (((std::pow (51.0, x) - 1.0) * 0.0596 + 0.02) * 44100.0 / twoPi, 20.0, 20000.0);
+}
+inline double yOfResonance (double res) noexcept
+{
+    const auto q = 1.0 / std::max (0.1, 2.0 - 1.9 * std::clamp (res, 0.0, 1.0));
+    return q <= 0.1 ? 0.0 : std::log ((q - 0.1) / 0.4 + 1.0) / (0.625 * std::log (51.0));
+}
+inline double resonanceOfY (double y) noexcept
+{
+    const auto q = y <= 0.0 ? 0.1 : (std::pow (51.0, 0.625 * std::min (y, 1.0)) - 1.0) * 0.4 + 0.1;
+    return std::clamp ((2.0 - 1.0 / q) / 1.9, 0.0, 1.0);
+}
+inline float cutoff (float hz, float offset) noexcept { return offset == 0.0f ? hz : (float) hzOfX (xOfHz (hz) + offset); }
+inline float resonance (float res, float offset) noexcept
+{
+    return offset == 0.0f ? res : (float) resonanceOfY (yOfResonance (res) + offset);
+}
+} // namespace notemod
+
 struct SamplerVoice
 {
     bool active = false;
@@ -1463,14 +1517,21 @@ struct SamplerVoice
     int cutShape = 3;            // FL's release shape: 3 raised cosine, 1 the follower declick (mode 1, "no bleeding")
     float cutCurve = 0.0f;       // the release curve (mode 5: 5)
     float cutC = 0.0f, folL = 0.0f, folR = 0.0f; // shape 1: the follower's coefficient and state per side
+    // an audio clip's start declick (round 189i, FL's declicker attack, FUN_00978250): atkShape 2 removes the first frame's
+    // step (out = x - x0 * table), 3 a raised-cosine fade in; over atkFrames frames, atkCurve = FL's curve (mode 5)
+    int atkFrames = 0, atkK = 0, atkShape = 0;
+    float atkCurve = 0.0f, atkX0L = 0.0f, atkX0R = 0.0f;
+    bool clipEndHard = false; // the clip's end is a sharp cut (FL: Disabled, a manual side, a seamless join, a fade out)
     int age = 0;
     int key = 60;
     float env = 1.0f;      // envelope
     float envStep = 0.0f;  // attack step (> 0) or release step (< 0)
     int stage = 1;         // 0 attack, 1 decay, 2 sustain, 3 release
     double first = 0.0, last = 0.0; // played region: first and last frame (inclusive)
+    double regionFirst = 0.0, regionLast = 0.0; // the whole region, before the start offset and slicing (round 190w: the locator)
     float clipElapsed = 0.0f, clipRemaining = 0.0f, fadeIn = 0.0f, fadeOut = 0.0f; // clip fades
-    std::uint8_t fadeShape = 0; // bit 0 / 1: the fade-in / fade-out is an automatic crossfade (S curve, round 166e)
+    std::uint8_t fadeShape = 0; // bit 0 / 1: the fade-in / fade-out is on the S curve (else straight)
+    float fadeInTension = 0.0f, fadeOutTension = 0.0f; // FL's raw fade tensions
     std::uint64_t clipUid = 0;
     int clipTrack = -1;
     float panL = 1.0f, panR = 1.0f;
@@ -1489,7 +1550,11 @@ struct SamplerVoice
     float zoneGain = 1.0f;
     double loopStart = 0.0, loopEnd = 0.0; // loopEnd > loopStart: the voice jumps back to the loop start
     bool loopWhileHeld = false;
-    SvfCoefficients filter;         // this voice's (only with a cutoff envelope)
+    SvfCoefficients filter;         // this voice's (with a cutoff envelope, or the note's own Mod X / Y)
+    // issue #63: the note's Mod X / Y on LYNX's own sampler, as FL's voice takes them (REA_rodada76 §1): offsets of the
+    // channel filter's X / Y, (b − 128) / 128 = modX · 2 − 1 (0 = the note leaves the channel filter as it is)
+    float noteCut = 0.0f, noteRes = 0.0f;
+    float noteFc = -1.0f, noteQ = -1.0f; int noteType = -1; // the channel values `filter` was last set from
     double pitchMul = 1.0;
     int controlCountdown = 0;
     // FL's native sampler voice (REA_rodada76): the channel's articulators and filter (flvp), the note's initial
@@ -1502,6 +1567,7 @@ struct SamplerVoice
     std::int64_t tickIndex = 0;
     double nextGap = 0.0;             // samples from this tick to the next one on the song's grid
     int endFade = -1;                 // ≥ 0: past the sample's end, the last frame fading out (FL's 10 ms end fade)
+    bool cutAtEnd = false;            // Fruity Slicer: no end fade, the voice ends with its slice
     bool endByDeclicker = false;      // that fade is the declicking mode's release (modes 1–5, round 167k)
     int offFade = -1;                 // ≥ 0: a looping voice fading out after its note-off (the same table)
     float holdL = 0.0f, holdR = 0.0f; // the last frame read
@@ -1651,6 +1717,9 @@ public:
         table.count = (int) std::min<std::size_t> (s.slices.size(), table.starts.size());
         for (int i = 0; i < table.count; ++i)
             table.starts[(std::size_t) i] = std::clamp (s.slices[(std::size_t) i], 0.0f, 1.0f);
+        table.firstKey = s.sliceFirstKey;
+        table.toEnd = s.slicesToEnd;
+        table.cutAtEnd = s.slicesCutAtEnd;
         sliceMailbox.write (table);
         bpm.store (std::max (1.0, songBpm));
     }
@@ -1677,7 +1746,7 @@ public:
         const auto noteClipTrack = std::exchange (nextClipTrack, -1);
         // this note's clip fades and flags, taken now so a note that does not sound leaves none to the next one
         const auto clipFades = std::exchange (nextClip, {});
-        const auto clipShape = std::exchange (nextClipShape, (std::uint8_t) 0);
+        const auto clipShape = std::exchange (nextClipShape, (std::uint16_t) 0);
         const auto clipPitch = clipMode ? (double) std::clamp (std::exchange (nextClipPitch, 0.0f), -12.0f, 12.0f) : 0.0;
         // FL 2026's clip stretch (round 167l, FL render of a 2 s 440 Hz ramp: ×2 lasts 4 s at 220 Hz in Resample, at
         // 440 Hz in the stretch modes; ×0.5 lasts 1 s): the clip reads its file `stretch` times slower
@@ -1708,6 +1777,8 @@ public:
         }
         auto first = clipMode ? 0.0 : std::floor (total * knobStart);
         auto last = clipMode ? total : std::max (first + 1.0, std::floor (total * knobEnd));
+        // (the locator counts over the whole region, from before the start offset and across slices; round 190w)
+        const auto regionFirst = first, regionLast = last;
         if (const auto offset = (double) startOffset.load (std::memory_order_relaxed); ! clipMode && offset > 0.0)
             first += offset * (last - first + 1.0); // FL: a fraction of the region's frames (not floored, FL render §4)
         auto sliced = false;
@@ -1715,15 +1786,19 @@ public:
         // sliced sample: each key from C5 up plays one slice, at the original pitch
         if (! clipMode && slices.count > 0)
         {
-            const auto index = key - 60;
+            const auto index = key - slices.firstKey;
 
             if (index < 0 || index >= slices.count)
                 return;
 
-            // the starts are fractions of the sample (floats): the nearest frame, as a float a hair under p/total made
-            // every Slicex slice start one frame early (round 170i2, REA_rodada170i §9)
-            first = std::round (total * slices.starts[(std::size_t) index]);
-            last = index + 1 < slices.count ? std::max (first, std::round (total * slices.starts[(std::size_t) index + 1]) - 1.0) : total;
+            // the starts are fractions of the sample's frame count (p / frames, as every slicer stores them): the
+            // nearest frame, as a float a hair under p / frames made every Slicex slice start one frame early (round
+            // 170i2, REA_rodada170i §9). Scaling by the last frame's index (frames − 1) instead started every slice in
+            // the sample's second half one frame early: notes "1 frame late" against FL from the middle slice on
+            // (round 180c's note-timing, fixed in round 188g)
+            const auto frames = (double) data->frames();
+            first = std::min (total, std::round (frames * slices.starts[(std::size_t) index]));
+            last = index + 1 < slices.count && ! slices.toEnd ? std::max (first, std::round (frames * slices.starts[(std::size_t) index + 1]) - 1.0) : total;
             sliced = true;
         }
         const auto base = baseRate (*data) / clipStretch;
@@ -1795,13 +1870,20 @@ public:
             target->loopWhileHeld = zone->zone.loopMode == 2;
         }
         target->position = startFrame;
+        newestVoice = (int) (target - voices.data()); // (the locator follows it, round 190w)
         target->first = first;
+        target->regionFirst = regionFirst;
+        target->regionLast = regionLast;
         target->last = last;
+        target->cutAtEnd = sliced && slices.cutAtEnd;
         target->clipElapsed = clipFades[0];
         target->clipRemaining = clipFades[1];
         target->fadeIn = clipFades[2];
         target->fadeOut = clipFades[3];
-        target->fadeShape = (std::uint8_t) (clipShape & 3);
+        target->fadeShape = (std::uint8_t) (clipShape & (3 | 8 | 16)); // (bits 3 / 4: a comp crossfade, round 177c)
+        startClipEdges (*target, clipShape, clipFades);
+        target->fadeInTension = std::exchange (nextClipTension[0], 0.0f);
+        target->fadeOutTension = std::exchange (nextClipTension[1], 0.0f);
         // FL's read speed: the rate ratio at the original pitch, else exp(cents·ln2/1200)·ratio
         target->rate = flrs::speedFor ((float) (semitones * 100.0), base);
         target->reversed = backwards;
@@ -1878,10 +1960,17 @@ public:
                 target->loopWhileHeld = false;
             }
         }
+        if (! clipMode && ! target->flVoice) // issue #63 (FL's voice above takes them as its noteCut / noteRes)
+        {
+            target->noteCut = nextModX * 2.0f - 1.0f;
+            target->noteRes = nextModY * 2.0f - 1.0f;
+        }
         voicePan (clipMode ? 0.0f : nextPan, target->panL, target->panR);
         target->basePan = clipMode ? 0.0f : nextPan;
         target->cents = clipMode ? 0.0f : nextCents;
         target->liveRef = clipMode ? std::numeric_limits<float>::quiet_NaN() : pitch.load() * 100.0f + liveRest;
+        if (shaper != nullptr)
+            shaper->voiceStarted ((int) (target - voices.data()));
 
         for (std::size_t i = 0; i < lfoTargets; ++i)
             if (lfos[i].active && ! clipMode)
@@ -2108,6 +2197,16 @@ public:
                 }
                 else if (prop == (int) vfx::Prop::velocity)
                     v.velocity = flVelocityLaw.load (std::memory_order_relaxed) ? flInitVolume (value) : std::clamp (value, 0.0f, 1.0f);
+                else if (prop == (int) vfx::Prop::modX || prop == (int) vfx::Prop::modY) // issue #63: the note's filter
+                {
+                    const auto offset = std::clamp (value, 0.0f, 1.0f) * 2.0f - 1.0f;
+                    auto& to = prop == (int) vfx::Prop::modX ? (v.flVoice ? v.flProc.noteCut : v.noteCut) : (v.flVoice ? v.flProc.noteRes : v.noteRes);
+                    if (to != offset)
+                    {
+                        to = offset;
+                        v.noteType = -1; // (its own filter is set again)
+                    }
+                }
             }
     }
 
@@ -2125,10 +2224,11 @@ public:
         nextModY = std::isfinite (modY) ? std::clamp (modY, 0.0f, 1.0f) : 0.5f;
     }
 
-    void setNextClipFades (float elapsed, float remaining, float in, float out, std::uint8_t shape) noexcept override
+    void setNextClipFades (float elapsed, float remaining, float in, float out, std::uint16_t shape, float inTension, float outTension) noexcept override
     {
         nextClip = { elapsed, remaining, in, out };
         nextClipShape = shape;
+        nextClipTension = { inTension, outTension };
     }
 
     void setNextClipIdentity (std::uint64_t uid, int track) noexcept override
@@ -2138,7 +2238,8 @@ public:
     }
 
     bool rekeyAndSyncClipVoice (int key, std::uint64_t clipUid, int track, float gain,
-                                float clipRemaining, float fadeIn, float fadeOut, std::uint8_t fadeShape) noexcept override
+                                float clipRemaining, float fadeIn, float fadeOut, std::uint16_t fadeShape,
+                                float inTension, float outTension) noexcept override
     {
         if (! clipMode)
             return false;
@@ -2152,7 +2253,9 @@ public:
                 v.clipRemaining = clipRemaining;
                 v.fadeIn = fadeIn;
                 v.fadeOut = fadeOut;
-                v.fadeShape = (std::uint8_t) (fadeShape & 3);
+                v.fadeShape = (std::uint8_t) (fadeShape & (3 | 8 | 16)); // (as noteOnAt keeps them: S curves and comp crossfades)
+                v.fadeInTension = inTension;
+                v.fadeOutTension = outTension;
                 return true;
             }
         return false;
@@ -2243,14 +2346,29 @@ public:
         {
             // the clip ended: its voice fades out quickly. A clip carries its own key (audioClipKey), so the next clip
             // of the same channel that already started (a crossfade) keeps playing; other callers stop everything.
+            // FL's per-clip edge declicker (round 189i, FUN_00d253d0 / FUN_00d24400): the channel's declicking release,
+            // or a sharp cut where the clip's end has no declick (Disabled, manual, a seamless join, a fade out)
             if (key < audioClipKeyBase)
                 allNotesOff();
             else
                 for (auto& v : voices)
-                    if (v.active && v.key == key)
-                        v.stolen = true;
+                    if (v.active && v.key == key && ! v.stolen)
+                    {
+                        if (v.clipEndHard)
+                        {
+                            v.stolen = true;
+                            v.fade = 0.0f;
+                        }
+                        else
+                            startCut (v, false);
+                    }
             return;
         }
+
+        if (shaper != nullptr)
+            for (auto& v : voices)
+                if (v.active && v.key == key)
+                    shaper->voiceReleased ((int) (&v - voices.data()));
 
         // the cutoff/pitch envelopes always release
         for (auto& v : voices)
@@ -2267,8 +2385,12 @@ public:
                 if (modulation.fl.recs[1].enabled != 0)
                     for (int k = 1; k < 5; ++k)
                         v.flProc.arts[(std::size_t) k].release (modulation.fl.recs[(std::size_t) k]);
-                else if (v.loopEnd > v.loopStart && v.offFade < 0)
-                    v.offFade = 0; // a looping sample without volume envelope fades out in 10 ms (EXEC, §8)
+                else if ((v.loopEnd > v.loopStart || v.cutAtEnd) && v.offFade < 0)
+                    // a looping sample without volume envelope fades out in 10 ms (EXEC, §8). So does a Fruity Slicer
+                    // voice: the plugins' voice processor starts its end fade at a note-off when the volume envelope
+                    // is off (Fruity Slicer FUN_007579d0 → FUN_00757a50, as 3x Osc's REA_rodada47 §3.1) — the channel
+                    // sampler above plays on instead (issue #129, round 190f)
+                    v.offFade = 0;
                 v.stage = 3;
             }
 
@@ -2318,6 +2440,7 @@ public:
 
     void setFastDeclick (bool fast) noexcept override { fastDeclick.store (fast, std::memory_order_relaxed); }
     void setPanTriangular (bool on) noexcept override { panTriangular.store (on, std::memory_order_relaxed); }
+    void setVoiceShaper (VoiceShaper* s) noexcept override { shaper = s; }
 
     // FL's declickers (FUN_012c6ae0: release ms of modes 0…5, and the fast one) as a raised cosine over
     // max(1, round(ms·rate/1000)) frames: g = (1 + cos(k·π/(n+1))) / 2 (FUN_00977870, shape 3)
@@ -2347,6 +2470,57 @@ public:
         v.folR += v.cutC * (r - v.folR);
         l -= v.folL;
         r -= v.folR;
+    }
+    // FL's declickers' attacks (FUN_012c6ae0 / FUN_00977870): modes 1, 2 the transient one (4 ms, shape 2), 3 / 4 / 5 a
+    // raised cosine of 20 / 100 / 200 ms (5 with curve 5); mode 0 has none.
+    // An audio clip's edges (round 189i, FL's PLFadeHandleMenu Declicker, FUN_00d27cf0 / FUN_00d253d0): the start takes the
+    // attack unless its declicker choice is Disabled or a seamless join (shape bit 5), or a fade in / manual start
+    // (bits 7) covers it — then only a voice that starts more than 12 frames past that fade still takes it.
+    // The end (bits 6 / 8, a fade out) is a sharp cut instead of the channel's declicking release.
+    void startClipEdges (SamplerVoice& v, std::uint16_t shape, const std::array<float, 4>& fades) const noexcept
+    {
+        v.atkFrames = v.atkK = v.atkShape = 0;
+        v.clipEndHard = false;
+        if (! clipMode)
+            return;
+        const auto mode = std::clamp (declickMode.load (std::memory_order_relaxed), 0, 5);
+        // FL /R renders (round 189l, the same clip Automatic / Enabled / Disabled on channels in modes 0-4): modes 0 and 1
+        // end the clip with a sharp cut whatever the choice; modes 2, 3 and 4 take the channel's release (20 / 20 / 100 ms)
+        v.clipEndHard = (shape & (64 | 256)) != 0 || fades[3] > 0.0f || mode < 2;
+        if ((shape & 32) != 0)
+            return;
+        const auto covered = fades[2] > 0.0f || (shape & 128) != 0;
+        if (covered && fades[0] <= fades[2] + 12.0f)
+            return;
+        static constexpr double attackMs[] = { 0.0, 4.0, 4.0, 20.0, 100.0, 200.0 };
+        if (mode == 0)
+            return;
+        v.atkFrames = std::max (1, (int) std::nearbyint (attackMs[mode] * 0.001 * sampleRate));
+        v.atkShape = mode <= 2 ? 2 : 3;
+        v.atkCurve = mode == 5 ? 5.0f : 0.0f;
+    }
+    // shape 2: out = x - x0 * T[k], T[k] = (1 + cos((k + 1) pi / (n + 1))) / 2 (x0 = the first frame); shape 3: out = x * g[k],
+    // g[k] = (1 + cos((n - k) pi / (n + 1))) / 2, bent by the curve as the releases are
+    static void clipAttack (SamplerVoice& v, float& l, float& r) noexcept
+    {
+        if (v.atkK >= v.atkFrames)
+            return;
+        const auto n = v.atkFrames;
+        const auto k = v.atkK++;
+        if (v.atkShape == 2)
+        {
+            if (k == 0)
+                v.atkX0L = l, v.atkX0R = r;
+            const auto t = (float) (0.5 * (1.0 + std::cos ((double) (k + 1) * 3.141592653589793 / (double) (n + 1))));
+            l -= v.atkX0L * t;
+            r -= v.atkX0R * t;
+            return;
+        }
+        auto g = 0.5 * (1.0 + std::cos ((double) (n - k) * 3.141592653589793 / (double) (n + 1)));
+        if (v.atkCurve > 0.0f)
+            g = 1.0 - (std::exp ((1.0 - g) * std::log ((double) v.atkCurve + 1.0)) - 1.0) / (double) v.atkCurve;
+        l *= (float) g;
+        r *= (float) g;
     }
     void stepFade (SamplerVoice& v) const noexcept
     {
@@ -2385,6 +2559,12 @@ public:
             int n;
             ~Advance() { at += n; }
         } advance { songSample, n };
+        // round 190w: the newest voice's place in its region, for the channel settings' locator, after every block
+        const struct Publish
+        {
+            SamplerInstrument& s;
+            ~Publish() { s.publishPosition(); }
+        } publish { *this };
 
         if (sample == nullptr && zones.empty())
             return;
@@ -2431,7 +2611,7 @@ public:
         const auto fc = cutoff.load(), res = resonance.load();
         const auto type = filterType.load();
         const auto filterModulated = modEnv[0].active || lfos[lfoCutoff].active;
-        const auto filtered = fc < 19500.0f || res > 0.0f || type != 0 || filterModulated;
+        const auto filtered = fc < 19500.0f || res > 0.0f || type != 0 || filterModulated; // (the channel's own)
         const auto modulated = modEnv[0].active || modEnv[1].active || anyLfo;
 
         if (filtered && (fc != filterCutoff || res != filterResonance || type != sharedFilter.mode))
@@ -2454,6 +2634,16 @@ public:
             const auto* l = v.data->leftData();
             const auto* r = v.data->rightData();
             const auto lastFrame = std::min ((double) (v.data->frames() - 1), v.last);
+            // the note's own Mod X / Y: its own filter, from the channel's moved by the note (issue #63)
+            const auto ownFilter = v.noteCut != 0.0f || v.noteRes != 0.0f;
+            const auto voiceFc = ownFilter ? notemod::cutoff (fc, v.noteCut) : fc;
+            const auto voiceRes = ownFilter ? notemod::resonance (res, v.noteRes) : res;
+            const auto voiceFiltered = filtered || ownFilter;
+            if (ownFilter && ! filterModulated && (v.noteFc != fc || v.noteQ != res || v.noteType != type))
+            {
+                v.noteFc = fc, v.noteQ = res, v.noteType = type;
+                v.filter.set (voiceFc, voiceRes, sampleRate, type);
+            }
 
             for (int i = 0; i < n; ++i)
             {
@@ -2470,6 +2660,13 @@ public:
                 // FL holds an audio clip's last value as DC to the clip's end (its note-off): the clip does not end with
                 // the sample (FL renders, REA_rodada167l §1 / round 168j); other voices end with their region
                 if ((pastEnd && ! clipMode) || (v.stolen && v.fade <= 0.0f) || (v.env <= 0.0f && v.stage >= 1))
+                {
+                    v.active = false;
+                    break;
+                }
+
+                float shapeL = 1.0f, shapeR = 1.0f;
+                if (shaper != nullptr && ! shaper->voiceGains ((int) (&v - voices.data()), shapeL, shapeR))
                 {
                     v.active = false;
                     break;
@@ -2532,19 +2729,20 @@ public:
                         v.pitchMul = semitones != 0.0f ? std::exp2 (semitones / 12.0) : 1.0;
 
                         if (filterModulated)
-                            v.filter.set (fc * std::exp2 (octaves), res, sampleRate, type);
+                            v.filter.set (voiceFc * std::exp2 (octaves), voiceRes, sampleRate, type);
                     }
 
                     v.lfoGain += v.lfoGainStep;
                 }
 
-                if (filtered)
+                if (voiceFiltered)
                 {
-                    const auto& f = filterModulated ? v.filter : sharedFilter;
+                    const auto& f = filterModulated || ownFilter ? v.filter : sharedFilter;
                     sl = f.process (sl, v.lowL, v.bandL);
                     sr = f.process (sr, v.lowR, v.bandR);
                 }
 
+                clipAttack (v, sl, sr);
                 cutFollow (v, sl, sr);
                 auto gain = v.velocity * v.fade * v.env * v.lfoGain * v.zoneGain;
 
@@ -2559,14 +2757,22 @@ public:
 
                 if (v.fadeIn > 0.0f || v.fadeOut > 0.0f)
                 {
-                    gain *= clipFadeGainOf (v.clipElapsed, v.clipRemaining, v.fadeIn, v.fadeOut, v.fadeShape);
+                    gain *= clipFadeGainOf (v.clipElapsed, v.clipRemaining, v.fadeIn, v.fadeOut, v.fadeShape, v.fadeInTension, v.fadeOutTension);
 
                     v.clipElapsed += 1.0f;
                     v.clipRemaining -= 1.0f;
                 }
 
-                left[i] += sl * gain * gl * v.panL;
-                right[i] += sr * gain * gr * v.panR;
+                if (shaper != nullptr)
+                {
+                    left[i] += sl * gain * gl * v.panL * shapeL;
+                    right[i] += sr * gain * gr * v.panR * shapeR;
+                }
+                else
+                {
+                    left[i] += sl * gain * gl * v.panL;
+                    right[i] += sr * gain * gr * v.panR;
+                }
 
                 v.position += ks.on ? v.rate : v.rate * v.pitchMul * bendMul;
                 ++v.age;
@@ -2740,6 +2946,11 @@ public:
                 // REA_rodada167k §10: 20 / 20 / 100 / 200 ms, mode 1 the follower, mode 5 curved).
                 if (v.endFade < 0 && ((double) flrs::wholeFrames (v.position) > lastFrame || v.position < v.first))
                 {
+                    if (v.cutAtEnd)
+                    {
+                        ended = true;
+                        break;
+                    }
                     v.endFade = 0;
                     if (! v.stolen && declickMode.load (std::memory_order_relaxed) != 0)
                     {
@@ -2770,11 +2981,12 @@ public:
                         readFrame (v, l, r, lastFrame, looping, sl, sr, v.rate * v.pitchMul * bendMul);
                     v.holdL = sl, v.holdR = sr;
                 }
+                clipAttack (v, sl, sr);
                 cutFollow (v, sl, sr);
                 auto gain = v.fade * v.zoneGain * outGain.load (std::memory_order_relaxed);
                 if (v.fadeIn > 0.0f || v.fadeOut > 0.0f)
                 {
-                    gain *= clipFadeGainOf (v.clipElapsed, v.clipRemaining, v.fadeIn, v.fadeOut, v.fadeShape);
+                    gain *= clipFadeGainOf (v.clipElapsed, v.clipRemaining, v.fadeIn, v.fadeOut, v.fadeShape, v.fadeInTension, v.fadeOutTension);
                     v.clipElapsed += 1.0f;
                     v.clipRemaining -= 1.0f;
                 }
@@ -2896,12 +3108,30 @@ public:
         return std::none_of (voices.begin(), voices.end(), [] (const auto& v) { return v.active; });
     }
 
+public:
+    float playPosition() const noexcept override { return shownPosition.load (std::memory_order_relaxed); }
+
 private:
+    void publishPosition() noexcept
+    {
+        auto at = -1.0f;
+        if (newestVoice >= 0 && newestVoice < (int) voices.size())
+        {
+            const auto& v = voices[(std::size_t) newestVoice];
+            if (v.active && ! v.stolen && v.regionLast > v.regionFirst)
+                at = (float) std::clamp ((v.position - v.regionFirst) / (v.regionLast - v.regionFirst), 0.0, 1.0);
+        }
+        shownPosition.store (at, std::memory_order_relaxed);
+    }
+
     std::shared_ptr<const SampleData> sample;
+    VoiceShaper* shaper = nullptr; // (FPC's layers, round 190z)
     bool clipMode = false;
     double sampleRate = 44100.0;
     float fadeStep = 0.01f;
     std::array<SamplerVoice, 16> voices {};
+    int newestVoice = -1;                     // the voice the last note started (audio thread)
+    std::atomic<float> shownPosition { -1.0f }; // playPosition()
     std::array<KeyShift, 16> shifts {};
     std::array<std::unique_ptr<VoicePitchShifter>, keyShiftVoices> shifterPool;
     std::array<int, keyShiftVoices> shifterUser {}; // the voice using each shifter (-1 = none)
@@ -3012,7 +3242,8 @@ private:
     float nextClipPitch = 0.0f;       // the next clip's own pitch (semitones, audio thread)
     float nextClipStretch = 1.0f;     // the next clip's own stretch (round 167l, audio thread)
     bool clipShift = false;           // pitch shifters for the clips' own pitch (set before prepareKeyShift)
-    std::uint8_t nextClipShape = 0;
+    std::uint16_t nextClipShape = 0;
+    std::array<float, 2> nextClipTension {};
     std::uint64_t nextClipUid = 0;
     int nextClipTrack = -1;
 
@@ -3020,6 +3251,9 @@ private:
     {
         std::array<float, 128> starts {};
         int count = 0;
+        int firstKey = 60;   // Fruity Slicer: the key of slice 1
+        bool toEnd = false;  // Fruity Slicer's "play to end"
+        bool cutAtEnd = false; // Fruity Slicer: the voice stops dead at the slice's end
     };
     SettingsMailbox<SliceTable> sliceMailbox;
     SliceTable slices; // audio thread's copy
@@ -3253,6 +3487,13 @@ void setOfflineRendering (bool on) noexcept { offlineRenderingFlag.store (on); }
 bool offlineRendering() noexcept { return offlineRenderingFlag.load(); }
 namespace
 {
+std::atomic<bool> renderInProgressFlag { false };
+}
+
+void setRenderInProgress (bool on) noexcept { renderInProgressFlag.store (on); }
+bool renderInProgress() noexcept { return renderInProgressFlag.load(); }
+namespace
+{
 std::atomic<bool> hqAllFlag { false };
 }
 void setHqForAllPlugins (bool on) noexcept { hqAllFlag.store (on); }
@@ -3439,6 +3680,12 @@ std::unique_ptr<Instrument> makeInstrument (InstrumentKind kind, std::shared_ptr
         return makeGranulizerInstrument (std::move (sample));
     if (kind == InstrumentKind::wavetraveller)
         return makeWaveTravellerInstrument (std::move (sample));
+    if (kind == InstrumentKind::fruityslicer) // the sampler's voices on the slices (the rack prepares the sample)
+        return makeInstrument (InstrumentKind::sampler, std::move (sample));
+    if (kind == InstrumentKind::slicex)
+        return makeSlicexInstrument (std::move (sample), nullptr); // (deck B's sample comes from RackRenderer)
+    if (kind == InstrumentKind::fpc) // (without its channel: no pads; the rack builds it from the channel's kit)
+        return makeFpcInstrument ({}, {});
     if (kind == InstrumentKind::drumaxx)
         return makeDrumaxxInstrument();
     if (kind == InstrumentKind::slayer)

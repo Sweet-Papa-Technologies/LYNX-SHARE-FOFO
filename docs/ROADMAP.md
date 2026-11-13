@@ -95,13 +95,28 @@ Ordered to get something usable as early as possible without ever breaking the a
 - [x] FLEX by preset name only (its packs are encrypted and never opened)
 
 ## Phase 7: Ableton Live interop (round 175a)
-- [x] Import Live 10–12 sets (.als): tracks, clips, warp, mixer, devices (`docs/analise/ALS_FORMAT.md`)
+- [x] Import Live 11/12 sets (.als): tracks, clips, warp, mixer, devices (`docs/analise/ALS_FORMAT.md`)
 - [x] Export Live 12 and Live 11 sets, with samples collected (N2)
 - [x] Warp modes Beats, Tones, Texture and Complex as LYNX stretch methods (N4)
 - [x] Beats transposition: each piece resampled offline by the clip's pitch, as Live does
 - [ ] Complex Pro formants (Live keeps formants when transposing; LYNX's +5 st is 3 dB louder with a different tilt)
 - [ ] Excess level at 60–95 Hz in the stretched renders
 - [ ] Beats and Texture parameters (Transient Loop Mode/Envelope, Grain Size, Flux) beyond the defaults
-- [ ] Clips with several warp markers at different rates (today one rate per clip)
+- [x] Clips with several warp markers at different rates: kept, rendered segment by segment (round 175a, M1; editing them = M3)
 - [ ] LYNX's built-in instruments and effects in exported sets (N3; listed in the export report for now)
-- [ ] Session view (N5) and an optional Live-style layout (N6)
+- [x] Session view ↔ LYNX's clip grid in .als import and export: scenes, launch modes, quantisation, follow actions (round 181c)
+- [x] Optional Clip-launch workflow layout style beside the default Pattern workflow (round 181a)
+- [x] Live-style Clip View and Device View, racks and note chance (0.1.26)
+- [x] Simple workflow layout style for beginners (0.1.26)
+- [x] Racks (round 183c, `docs/analise/REA_rodada183c.md`): Audio Effect and Instrument Racks as a Patcher in rack mode,
+      with chains, key / velocity / chain-select zones (Live's measured fade laws), chain volume / pan / solo, 16 macros
+      with Map mode, variations, Randomize; LYNX's optional variation morph and launch glide; .als import / export
+- [ ] Standalone MIDI Effect Rack playing its child channels (decision R1: the engine routing is still open)
+- [ ] VST3 parameter mappings in .als racks (Live stores plain units and parameter ids)
+
+## Phase 8: FL Studio Mobile import (round 182c)
+- [x] `.flm` reader: tempo, time signature, arrangement (note, drum and audio lanes), samples, drum kits (`docs/analise/FLM_FORMAT.md`)
+- [x] DirectWave single-sample programs, rack level / pan / routes on the inserts
+- [x] Mute / solo, automation lanes and the effects as Pocket effects (0.1.26)
+- [x] MiniSynth, Transistor Bass, 3x Osc and GMSynth instruments (0.1.26)
+- [ ] FL Studio Mobile's remaining instruments (they play LYNX's built-in synth for now)

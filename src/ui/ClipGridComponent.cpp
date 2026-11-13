@@ -5,6 +5,8 @@
 #include <cmath>
 
 #include "core/ClipLauncher.h"
+#include "core/DetailChain.h"
+#include "ui/ExportDialog.h"
 #include "engine/AudioEngine.h"
 #include "ui/I18n.h"
 #include "ui/Theme.h"
@@ -146,10 +148,19 @@ public:
         const auto hit = hitTestCell (e.getPosition());
         if (e.mods.isPopupMenu())
         {
-            if (hit.scene >= 0 && hit.track < 0)
+            if (const auto t = headerTrackAt (e.getPosition()); t >= 0) // (round 190ay: the track's own menu)
+                showHeaderMenu (t);
+            else if (hit.scene >= 0 && hit.track < 0)
                 showSceneMenu (hit.scene);
             else if (hit.track >= 0 && hit.scene >= 0)
                 showSlotMenu (hit.track, hit.scene);
+            return;
+        }
+        if (const auto t = headerTrackAt (e.getPosition()); t >= 0) // a column's title selects its track (round 183a)
+        {
+            selectedTrack = t;
+            repaint();
+            notify (GridPick::select);
             return;
         }
         if (hit.scene >= 0 && hit.track < 0)
@@ -165,6 +176,7 @@ public:
         selectedTrack = hit.track;
         selectedScene = hit.scene;
         repaint();
+        notify (GridPick::select);
         const auto* grid = gridOf();
         if (grid == nullptr)
             return;
@@ -191,11 +203,26 @@ public:
 
     void mouseDoubleClick (const juce::MouseEvent& e) override
     {
+        if (const auto t = headerTrackAt (e.getPosition()); t >= 0) // (round 183a: the track's devices)
+        {
+            selectedTrack = t;
+            notify (GridPick::openTrack);
+            return;
+        }
         const auto hit = hitTestCell (e.getPosition());
         if (hit.track >= 0 && hit.scene >= 0 && e.x - columnX (hit.track) >= launchZone)
-            if (const auto* grid = gridOf(); grid != nullptr && launcher::clipAt (*grid, hit.track, hit.scene) == nullptr)
-                putPattern (hit.track, hit.scene, engine.getSong().currentPattern);
+            if (const auto* grid = gridOf(); grid != nullptr)
+            {
+                if (launcher::clipAt (*grid, hit.track, hit.scene) == nullptr)
+                    putPattern (hit.track, hit.scene, engine.getSong().currentPattern);
+                else
+                    notify (GridPick::openClip); // (round 183a: the clip in the Detail View)
+            }
     }
+
+    // The Detail View's listener (round 183a; none in Pattern workflow, where no grid exists).
+    std::function<void (int, int, GridPick)> onPick;
+    std::pair<int, int> selection() const noexcept { return { selectedTrack, selectedScene }; }
 
     void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override
     {
@@ -220,6 +247,7 @@ public:
             selectedScene = juce::jlimit (0, rowCount() - 1, selectedScene + (code == juce::KeyPress::upKey ? -1 : code == juce::KeyPress::downKey ? 1 : 0));
             revealSelection();
             repaint();
+            notify (GridPick::select);
             return true;
         }
         if (code == juce::KeyPress::returnKey)
@@ -297,6 +325,19 @@ private:
             scrollY = (selectedScene + 1) * rowHeight - cells.getHeight();
         clampScroll();
     }
+    void notify (GridPick pick)
+    {
+        if (onPick != nullptr)
+            onPick (selectedTrack, selectedScene, pick);
+    }
+    // the track whose column title is at p, or -1
+    int headerTrackAt (juce::Point<int> p) const
+    {
+        if (p.y < 0 || p.y >= headerHeight || p.x < 0 || p.x >= cellArea().getRight())
+            return -1;
+        const auto t = (p.x + scrollX) / columnWidth;
+        return t >= 0 && t < columnCount() ? t : -1;
+    }
     Cell hitTestCell (juce::Point<int> p) const
     {
         Cell out;
@@ -341,7 +382,15 @@ private:
         g.setColour (c::textPrimary);
         g.setFont (theme::font (theme::type::small));
         const auto name = info != nullptr && ! info->name.empty() ? utf8 (info->name) : tr ("Track {0}", { juce::String (t + 1) });
-        g.drawText (name, r.reduced (6, 0).withTrimmedRight (taken ? 18 : 0), juce::Justification::centredLeft, true);
+        // Freeze (round 190ay): the track's instrument is frozen — the snowflake tag, the name dimmed
+        const auto frozen = frozenChannelOf (song, t) >= 0;
+        if (frozen)
+        {
+            g.setColour (c::textSecondary);
+            theme::drawFrozenTag (g, juce::Rectangle<float> ((float) r.getRight() - (taken ? 40.0f : 20.0f), (float) r.getCentreY() - 6.5f, 14.0f, 13.0f),
+                                  c::info.withAlpha (0.85f), c::bg1);
+        }
+        g.drawText (name, r.reduced (6, 0).withTrimmedRight ((taken ? 18 : 0) + (frozen ? 18 : 0)), juce::Justification::centredLeft, true);
         if (taken)
         {
             // the Playlist's clips on this track are silent: a struck-out timeline mark
@@ -550,6 +599,42 @@ private:
         return menu;
     }
 
+    // Freeze (round 190ay): a column is a Playlist track; its instrument is the channel its chain shows (core/DetailChain.h)
+    static int frozenChannelOf (const Song& song, int track)
+    {
+        const auto channel = detailchain::forTrack (song, track).channel;
+        return channel >= 0 && channel < (int) song.channels.size() && song.channels[(std::size_t) channel].freeze.on() ? channel : -1;
+    }
+
+    void showHeaderMenu (int track)
+    {
+        const auto& song = engine.getSong();
+        const auto channel = detailchain::forTrack (song, track).channel;
+        const auto valid = channel >= 0 && channel < (int) song.channels.size();
+        juce::PopupMenu menu;
+        if (! valid || ! song.channels[(std::size_t) channel].freeze.on())
+            menu.addItem (trc ("@channel: Freeze"), valid, false, [this, channel] {
+                freezeChannel (engine, channel, [safe = juce::Component::SafePointer<juce::Component> (this)] (bool) {
+                    if (safe != nullptr)
+                        safe->repaint();
+                });
+            });
+        else
+        {
+            menu.addItem (tr ("Unfreeze"), [this, channel] {
+                unfreezeChannel (engine, channel);
+                repaint();
+            });
+            menu.addItem (tr ("Re-freeze"), [this, channel] {
+                freezeChannel (engine, channel, [safe = juce::Component::SafePointer<juce::Component> (this)] (bool) {
+                    if (safe != nullptr)
+                        safe->repaint();
+                });
+            });
+        }
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMousePosition());
+    }
+
     void showSceneMenu (int scene)
     {
         juce::PopupMenu menu;
@@ -678,5 +763,18 @@ private:
 std::unique_ptr<juce::Component> makeClipGrid (AudioEngine& engine)
 {
     return std::make_unique<ClipGridComponent> (engine);
+}
+
+void setClipGridPickListener (juce::Component& grid, std::function<void (int, int, GridPick)> listener)
+{
+    if (auto* g = dynamic_cast<ClipGridComponent*> (&grid))
+        g->onPick = std::move (listener);
+}
+
+std::pair<int, int> clipGridSelection (juce::Component& grid)
+{
+    if (auto* g = dynamic_cast<ClipGridComponent*> (&grid))
+        return g->selection();
+    return { 0, 0 };
 }
 } // namespace lynx

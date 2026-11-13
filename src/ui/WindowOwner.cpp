@@ -1,4 +1,6 @@
 #include "ui/WindowOwner.h"
+#include "core/HostKeyGate.h"
+#include "ui/NativeChild.h"
 
 #include "core/WindowFit.h"
 
@@ -20,6 +22,12 @@
 
 #if JUCE_WINDOWS
  #include <windows.h>
+#endif
+#if JUCE_LINUX || JUCE_BSD || JUCE_MAC
+ #include <dlfcn.h>
+#endif
+#if JUCE_MAC
+ #include <CoreFoundation/CoreFoundation.h>
 #endif
 
 namespace lynx
@@ -175,7 +183,7 @@ void removeDialogTextFocus()
 
 juce::Image logoImage()
 {
-    return juce::ImageCache::getFromMemory (logo::png256, (int) sizeof (logo::png256));
+    return juce::ImageCache::getFromMemory (logo::png512, (int) sizeof (logo::png512));
 }
 
 void applyWindowChrome (juce::Component& window)
@@ -308,6 +316,186 @@ bool isAboveMainWindow (juce::Component& window)
    #endif
 }
 
+// Where a character key is on the keyboard, for the typing keyboard (FL's table goes by scan code)
+#if JUCE_WINDOWS
+namespace
+{
+// The scan code of the key that types `ch` in `layout` without Shift / AltGr; 0 for none
+int scanCodeOfCharacter (int ch, HKL layout)
+{
+    for (const auto c : { (WCHAR) towlower ((wint_t) ch), (WCHAR) ch })
+    {
+        const auto vk = VkKeyScanExW (c, layout);
+        if (vk == -1 || HIBYTE (vk) != 0) // (no such key, or only with Shift / Ctrl / Alt held)
+            continue;
+        const auto scanCode = (int) MapVirtualKeyExW ((UINT) LOBYTE (vk), MAPVK_VK_TO_VSC, layout);
+        return scanCode > 0 && scanCode < 0x80 ? scanCode : 0;
+    }
+    return 0;
+}
+} // namespace
+
+int scanCodeOfKeyCode (int juceKeyCode)
+{
+    // JUCE's code is MapVirtualKey (vk, MAPVK_VK_TO_CHAR) of the pressed key (upper case for letters). Back to the
+    // key: the layout's virtual key for that character, then that key's scan code.
+    if (juceKeyCode <= ' ' || juceKeyCode > 0xffff)
+        return 0; // (Space, F-keys, arrows, the numpad: not character keys)
+    return scanCodeOfCharacter (juceKeyCode, GetKeyboardLayout (0));
+}
+#elif JUCE_LINUX || JUCE_BSD
+namespace
+{
+// Xlib, looked up at run time (JUCE loads it the same way and keeps its own headers to itself). A connection of its
+// own, used for keyboard questions only and renewed every few seconds, so a keyboard map changed meanwhile is seen.
+struct XKeyboard
+{
+    using OpenDisplay = void* (*) (const char*);
+    using CloseDisplay = int (*) (void*);
+    using DisplayKeycodes = int (*) (void*, int*, int*);
+    using GetState = int (*) (void*, unsigned int, void*);
+    using KeycodeToKeysym = unsigned long (*) (void*, unsigned char, int, int);
+
+    XKeyboard()
+    {
+        if (auto* xlib = dlopen ("libX11.so.6", RTLD_LAZY | RTLD_LOCAL))
+        {
+            openDisplay = (OpenDisplay) dlsym (xlib, "XOpenDisplay");
+            closeDisplay = (CloseDisplay) dlsym (xlib, "XCloseDisplay");
+            displayKeycodes = (DisplayKeycodes) dlsym (xlib, "XDisplayKeycodes");
+            getState = (GetState) dlsym (xlib, "XkbGetState");
+            keycodeToKeysym = (KeycodeToKeysym) dlsym (xlib, "XkbKeycodeToKeysym");
+        }
+    }
+    ~XKeyboard() { close(); }
+
+    void close()
+    {
+        if (display != nullptr)
+            closeDisplay (display);
+        display = nullptr;
+    }
+
+    // The scan code (evdev's key code = Xlib's - 8; the typing block's are the PC scan codes) of the key whose
+    // unshifted keysym in the layout in use (the active XKB group) is `keysym` or `otherKeysym`; 0 for none
+    int scanCodeOf (unsigned long keysym, unsigned long otherKeysym)
+    {
+        if (openDisplay == nullptr || closeDisplay == nullptr || displayKeycodes == nullptr || getState == nullptr || keycodeToKeysym == nullptr)
+            return 0;
+        const auto now = std::time (nullptr);
+        if (display != nullptr && now - opened > 2)
+            close();
+        if (display == nullptr)
+        {
+            display = openDisplay (nullptr);
+            opened = now;
+        }
+        if (display == nullptr)
+            return 0;
+        alignas (16) unsigned char state[64] = {}; // XkbStateRec (18 bytes); its first field is the active group
+        const auto group = getState (display, 0x100 /* XkbUseCoreKbd */, state) == 0 ? (int) state[0] : 0;
+        int first = 8, last = 255;
+        displayKeycodes (display, &first, &last);
+        for (int keycode = std::max (first, 9); keycode <= std::min (last, 8 + 0x7f); ++keycode)
+            if (const auto sym = keycodeToKeysym (display, (unsigned char) keycode, group, 0); sym != 0 && (sym == keysym || sym == otherKeysym))
+                return keycode - 8;
+        return 0;
+    }
+
+    OpenDisplay openDisplay = nullptr;
+    CloseDisplay closeDisplay = nullptr;
+    DisplayKeycodes displayKeycodes = nullptr;
+    GetState getState = nullptr;
+    KeycodeToKeysym keycodeToKeysym = nullptr;
+    void* display = nullptr;
+    std::time_t opened = 0;
+};
+} // namespace
+
+int scanCodeOfKeyCode (int juceKeyCode)
+{
+    // JUCE's code is the character the key types. Back to the key: the key whose keysym is that character (Latin-1
+    // keysyms are the characters; the others' are 0x01000000 + the code point, which leaves out alphabets that have
+    // older keysyms of their own: those keys stay by character)
+    if (juceKeyCode <= ' ' || juceKeyCode > 0x10ffff)
+        return 0;
+    static XKeyboard keyboard;
+    const auto keysymOf = [] (int ch) { return (unsigned long) (ch < 0x100 ? ch : 0x01000000 + ch); };
+    return keyboard.scanCodeOf (keysymOf ((int) juce::CharacterFunctions::toLowerCase ((juce::juce_wchar) juceKeyCode)), keysymOf (juceKeyCode));
+}
+#elif JUCE_MAC
+int scanCodeOfKeyCode (int juceKeyCode)
+{
+    // JUCE's code is the key's character without modifiers. Back to the key: the virtual key code (a place on the
+    // keyboard: kVK_ANSI_*) whose character in the current layout is that one, asked from the Text Input Sources /
+    // UCKeyTranslate. Those live in Carbon's HIToolbox, which LYNX does not link: looked up at run time, and when
+    // anything is missing the answer is 0 (the typing keyboard then goes by character, as before).
+    if (juceKeyCode <= ' ' || juceKeyCode > 0xffff)
+        return 0;
+    struct Api
+    {
+        using CopyLayout = void* (*)();
+        using GetProperty = void* (*) (void*, CFStringRef);
+        using KbdType = std::uint8_t (*)();
+        using Translate = std::int32_t (*) (const void*, std::uint16_t, std::uint16_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t*,
+                                            unsigned long, unsigned long*, std::uint16_t*);
+        CopyLayout copyLayout = nullptr;
+        GetProperty getProperty = nullptr;
+        KbdType kbdType = nullptr;
+        Translate translate = nullptr;
+        CFStringRef* layoutDataKey = nullptr;
+        Api()
+        {
+            if (auto* carbon = dlopen ("/System/Library/Frameworks/Carbon.framework/Carbon", RTLD_LAZY | RTLD_LOCAL))
+            {
+                copyLayout = (CopyLayout) dlsym (carbon, "TISCopyCurrentKeyboardLayoutInputSource");
+                getProperty = (GetProperty) dlsym (carbon, "TISGetInputSourceProperty");
+                kbdType = (KbdType) dlsym (carbon, "LMGetKbdType");
+                translate = (Translate) dlsym (carbon, "UCKeyTranslate");
+                layoutDataKey = (CFStringRef*) dlsym (carbon, "kTISPropertyUnicodeKeyLayoutData");
+            }
+        }
+        bool ok() const { return copyLayout != nullptr && getProperty != nullptr && kbdType != nullptr && translate != nullptr && layoutDataKey != nullptr; }
+    };
+    static const Api api;
+    if (! api.ok())
+        return 0;
+    // kVK_ANSI_* (0x00..0x32) -> PC scan code; 0: not a key of the typing block
+    static const std::uint8_t scanOfVirtualKey[] = {
+        0x1E, 0x1F, 0x20, 0x21, 0x23, 0x22, 0x2C, 0x2D, 0x2E, 0x2F, 0x00, 0x30, 0x10, 0x11, 0x12, 0x13, // A S D F H G Z X C V - B Q W E R
+        0x15, 0x14, 0x02, 0x03, 0x04, 0x05, 0x07, 0x06, 0x0D, 0x0A, 0x08, 0x0C, 0x09, 0x0B, 0x1B, 0x18, // Y T 1 2 3 4 6 5 = 9 7 - 8 0 ] O
+        0x16, 0x1A, 0x17, 0x19, 0x00, 0x26, 0x24, 0x28, 0x25, 0x27, 0x2B, 0x33, 0x35, 0x31, 0x32, 0x34, // U [ I P Ret L J ' K ; \ , / N M .
+        0x00, 0x00, 0x29                                                                                // Tab Space `
+    };
+    auto* source = api.copyLayout();
+    if (source == nullptr)
+        return 0;
+    int found = 0;
+    if (const auto data = (CFDataRef) api.getProperty (source, *api.layoutDataKey); data != nullptr)
+    {
+        const auto wanted = juce::CharacterFunctions::toLowerCase ((juce::juce_wchar) juceKeyCode);
+        for (std::uint16_t vk = 0; vk < (std::uint16_t) std::size (scanOfVirtualKey) && found == 0; ++vk)
+        {
+            std::uint32_t deadKeys = 0;
+            unsigned long length = 0;
+            std::uint16_t chars[4] = {};
+            if (scanOfVirtualKey[vk] != 0
+                && api.translate (CFDataGetBytePtr (data), vk, 0 /* kUCKeyActionDown */, 0, api.kbdType(), 1 /* kUCKeyTranslateNoDeadKeysMask */, &deadKeys,
+                                  4, &length, chars) == 0
+                && length == 1 && juce::CharacterFunctions::toLowerCase ((juce::juce_wchar) chars[0]) == wanted)
+                found = scanOfVirtualKey[vk];
+        }
+    }
+    CFRelease ((CFTypeRef) source);
+    return found;
+}
+#else
+int scanCodeOfKeyCode (int)
+{
+    return 0;
+}
+#endif
+
 void forceForegroundForTest (juce::Component& window)
 {
    #if JUCE_WINDOWS
@@ -397,6 +585,21 @@ namespace
 {
 bool closeOnEscape (juce::Component* window);
 
+std::function<bool (juce::Component&)> plainKeysAllowed;
+std::function<bool (const juce::KeyPress&)> plainKeyHandler, plainKeyLeftHandler;
+
+// The keys a hosted plugin's view leaves unused come back through JUCE's hosting components, which swallow them all
+// after their key listeners ran
+struct PluginLeftKeys final : juce::KeyListener
+{
+    bool keyPressed (const juce::KeyPress& key, juce::Component*) override
+    {
+        const auto mods = key.getModifiers();
+        return plainKeyLeftHandler != nullptr && key.getKeyCode() != juce::KeyPress::escapeKey && ! mods.isCtrlDown() && ! mods.isAltDown()
+               && plainKeyLeftHandler (key);
+    }
+};
+
 struct SecondaryKeyForwarder final : juce::KeyListener
 {
     std::function<bool (const juce::KeyPress&)> handler;
@@ -407,6 +610,12 @@ struct SecondaryKeyForwarder final : juce::KeyListener
             return false;
         if (key == juce::KeyPress::escapeKey)
             return closeOnEscape (window);
+        // a plain key a plugin's window got back: its view left it unused (issue #96). Plugins pass them up to their parent
+        // window, which is this one, so nothing inside the window saw them.
+        const auto mods = key.getModifiers();
+        if (window != nullptr && (bool) window->getProperties().getWithDefault ("lynxPluginWindow", false) && plainKeyLeftHandler != nullptr
+            && ! mods.isCtrlDown() && ! mods.isAltDown() && plainKeyLeftHandler (key))
+            return true;
         if (handler == nullptr)
             return false;
         return handler (key);
@@ -440,7 +649,9 @@ SecondaryKeyForwarder& keyForwarder()
 // keys never reach JUCE, and with the focus on JUCE's wrapper the wrapper swallows them all. FL still runs its
 // shortcuts there (Space plays), so a thread keyboard hook hands such a key to the main window's global actions when
 // it is one, before the plugin sees it (round 165q / issue #12: Space did nothing over Pro-Q 4). Plain letters and
-// digits stay the plugin's (its own keys and text fields), and so does everything typed into a native Edit control.
+// digits stay the plugin's (its own keys and text fields) unless its FL-style option lets the host process them
+// (round 181c, issue #96: the typing keyboard over a focused plugin), and everything typed into a native Edit control
+// stays the plugin's either way.
 namespace
 {
 int juceKeyCodeOf (WPARAM vk)
@@ -473,56 +684,147 @@ int juceKeyCodeOf (WPARAM vk)
     }
 }
 
-// The focus is in a hosted plugin's view inside one of LYNX's secondary windows (not the main window)
-bool focusIsInPluginView()
+// The window holding the focus when it is in a hosted plugin's view inside one of LYNX's secondary windows (not the
+// main window); nullptr otherwise
+juce::Component* windowOfFocusedPluginView()
 {
     const auto focus = GetFocus();
     if (focus == nullptr)
-        return false;
-    const auto root = GetAncestor (focus, GA_ROOT);
+        return nullptr;
+    // the nearest LYNX window up from the focus: a secondary top-level window, or a docked plugin frame (a native child
+    // of the main window, issue #116); the main window itself (its panels) is not a plugin view
     auto* main = mainWindow().getComponent();
-    if (root == nullptr || (main != nullptr && main->getWindowHandle() == (void*) root))
-        return false;
     juce::Component* window = nullptr;
-    for (int i = 0; i < juce::ComponentPeer::getNumPeers(); ++i)
-        if (auto* peer = juce::ComponentPeer::getPeer (i); peer != nullptr && peer->getNativeHandle() == (void*) root)
-            window = &peer->getComponent();
+    HWND root = nullptr;
+    for (auto h = focus; h != nullptr && h != GetDesktopWindow() && window == nullptr; h = GetAncestor (h, GA_PARENT))
+        for (int i = 0; i < juce::ComponentPeer::getNumPeers(); ++i)
+            if (auto* peer = juce::ComponentPeer::getPeer (i); peer != nullptr && peer->getNativeHandle() == (void*) h)
+            {
+                window = &peer->getComponent();
+                root = h;
+            }
     if (window == nullptr)
-        return false; // (not a LYNX window)
+        return nullptr; // (not a LYNX window)
+    if (window == main)
+        return nullptr;
+    // a native child panel (the Channel rack, issue #116) is LYNX's own, not a plugin's view
+    if (GetAncestor (root, GA_ROOT) != root && ! (bool) window->getProperties().getWithDefault ("lynxPluginWindow", false))
+        return nullptr;
     if (focus != root)
     {
         // a native child: the plugin's view, unless it is a native text field
         wchar_t cls[64] = {};
         GetClassNameW (focus, cls, 63);
         const juce::String name (cls);
-        return ! name.containsIgnoreCase ("edit");
+        return name.containsIgnoreCase ("edit") ? nullptr : window;
     }
     // JUCE's own focus: a hosted plugin's editor wrapper (it swallows every key)
     auto* focused = juce::Component::getCurrentlyFocusedComponent();
     auto* editor = focused != nullptr ? (dynamic_cast<juce::AudioProcessorEditor*> (focused) != nullptr ? dynamic_cast<juce::AudioProcessorEditor*> (focused)
                                                                                                       : focused->findParentComponentOfClass<juce::AudioProcessorEditor>())
                                       : nullptr;
-    return editor != nullptr && dynamic_cast<juce::AudioPluginInstance*> (editor->getAudioProcessor()) != nullptr;
+    return editor != nullptr && dynamic_cast<juce::AudioPluginInstance*> (editor->getAudioProcessor()) != nullptr ? window : nullptr;
+}
+
+bool focusIsInPluginView()
+{
+    return windowOfFocusedPluginView() != nullptr;
 }
 
 HHOOK pluginKeyHook = nullptr;
 
-LRESULT CALLBACK pluginKeyProc (int code, WPARAM vk, LPARAM info)
+// The key code JUCE gives a plain punctuation key (the typing keyboard's layouts use some); 0: not one
+int punctuationKeyCode (WPARAM vk)
 {
-    const auto down = (info & (1u << 31)) == 0, repeat = (info & (1 << 30)) != 0;
-    if (code == HC_ACTION && down && ! repeat && keyForwarder().handler != nullptr && vk != VK_ESCAPE)
-        if (const auto keyCode = juceKeyCodeOf (vk); keyCode != 0)
-        {
-            int mods = 0;
-            if (GetKeyState (VK_CONTROL) & 0x8000) mods |= juce::ModifierKeys::ctrlModifier;
-            if (GetKeyState (VK_SHIFT) & 0x8000) mods |= juce::ModifierKeys::shiftModifier;
-            if (GetKeyState (VK_MENU) & 0x8000) mods |= juce::ModifierKeys::altModifier;
-            const auto plainCharacter = ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
-                                        && (mods & (juce::ModifierKeys::ctrlModifier | juce::ModifierKeys::altModifier)) == 0;
-            if (! plainCharacter && focusIsInPluginView() && keyForwarder().handler (juce::KeyPress (keyCode, juce::ModifierKeys (mods), 0)))
-                return 1; // ran a LYNX action: the plugin doesn't get the key too
-        }
-    return CallNextHookEx (pluginKeyHook, code, vk, info);
+    if ((vk >= VK_OEM_1 && vk <= VK_OEM_3) || (vk >= VK_OEM_4 && vk <= VK_OEM_8))
+        return (int) (MapVirtualKeyW ((UINT) vk, MAPVK_VK_TO_CHAR) & 0x7fffu);
+    return 0;
+}
+
+int currentKeyMods()
+{
+    int mods = 0;
+    if (GetKeyState (VK_CONTROL) & 0x8000) mods |= juce::ModifierKeys::ctrlModifier;
+    if (GetKeyState (VK_SHIFT) & 0x8000) mods |= juce::ModifierKeys::shiftModifier;
+    if (GetKeyState (VK_MENU) & 0x8000) mods |= juce::ModifierKeys::altModifier;
+    return mods;
+}
+
+// A press of a plain key the plugin's option gives to the host
+bool hostTakesPlainKey (WPARAM vk, juce::Component& window)
+{
+    if (plainKeyHandler == nullptr || plainKeysAllowed == nullptr)
+        return false;
+    const auto letterOrDigit = (vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9');
+    const auto keyCode = letterOrDigit ? (int) vk : punctuationKeyCode (vk);
+    const auto mods = currentKeyMods();
+    if (keyCode == 0 || (mods & (juce::ModifierKeys::ctrlModifier | juce::ModifierKeys::altModifier)) != 0)
+        return false;
+    return plainKeysAllowed (window) && plainKeyHandler (juce::KeyPress (keyCode, juce::ModifierKeys (mods), 0));
+}
+
+// A press of a key that runs one of LYNX's global actions (Space plays, F-keys open the panels...); plain letters and
+// digits stay the plugin's
+bool hostTakesShortcut (WPARAM vk)
+{
+    if (keyForwarder().handler == nullptr || vk == VK_ESCAPE)
+        return false;
+    const auto keyCode = juceKeyCodeOf (vk);
+    if (keyCode == 0)
+        return false;
+    const auto mods = currentKeyMods();
+    const auto plainCharacter = ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+                                && (mods & (juce::ModifierKeys::ctrlModifier | juce::ModifierKeys::altModifier)) == 0;
+    return ! plainCharacter && keyForwarder().handler (juce::KeyPress (keyCode, juce::ModifierKeys (mods), 0));
+}
+
+// Which of the two took a press: its repeats go back to the same one
+std::bitset<256> takenAsPlainKey;
+
+bool hostTakesKey (WPARAM vk)
+{
+    auto* window = windowOfFocusedPluginView();
+    if (window == nullptr || vk >= 256)
+        return false;
+    takenAsPlainKey[vk] = hostTakesPlainKey (vk, *window);
+    return takenAsPlainKey[vk] || hostTakesShortcut (vk);
+}
+
+void hostKeyRepeats (WPARAM vk)
+{
+    // a held key repeats as over the main window (JUCE hands it keyPressed again; the typing piano's held notes
+    // ignore it, a shortcut runs again)
+    if (vk >= 256)
+        return;
+    if (takenAsPlainKey[vk])
+    {
+        const auto keyCode = (vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9') ? (int) vk : punctuationKeyCode (vk);
+        if (plainKeyHandler != nullptr && keyCode != 0)
+            plainKeyHandler (juce::KeyPress (keyCode, juce::ModifierKeys (currentKeyMods()), 0));
+    }
+    else if (const auto keyCode = juceKeyCodeOf (vk); keyCode != 0 && keyForwarder().handler != nullptr)
+        keyForwarder().handler (juce::KeyPress (keyCode, juce::ModifierKeys (currentKeyMods()), 0));
+}
+
+HostKeyGate keyGate;
+
+// A thread WH_GETMESSAGE hook (it was WH_KEYBOARD): it sees every keyboard message the thread takes from its queue,
+// real keys and posted ones alike, so --plugwintest checks the same path without injected input. Only a message for
+// the focused window counts: a key a plugin passes back up to its parent window is the plugin's answer, not a new press.
+LRESULT CALLBACK pluginKeyProc (int code, WPARAM removal, LPARAM data)
+{
+    auto* msg = reinterpret_cast<MSG*> (data);
+    if (code == HC_ACTION && removal == PM_REMOVE && msg != nullptr
+        && (msg->message == WM_KEYDOWN || msg->message == WM_KEYUP || msg->message == WM_SYSKEYDOWN || msg->message == WM_SYSKEYUP)
+        && msg->hwnd != nullptr && msg->hwnd == GetFocus())
+    {
+        const auto vk = msg->wParam;
+        const auto down = msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN;
+        const auto repeat = (msg->lParam & (1 << 30)) != 0;
+        if (keyGate.message ((std::size_t) vk, down, repeat, [vk] { return hostTakesKey (vk); }, [vk] { hostKeyRepeats (vk); }))
+            msg->message = WM_NULL; // the host's: the plugin gets none of this press (no WM_CHAR either)
+    }
+    return CallNextHookEx (pluginKeyHook, code, removal, data);
 }
 } // namespace
 #endif
@@ -532,13 +834,86 @@ void setSecondaryWindowKeyHandler (std::function<bool (const juce::KeyPress&)> h
     keyForwarder().handler = std::move (handler);
    #if JUCE_WINDOWS
     if (keyForwarder().handler != nullptr && pluginKeyHook == nullptr)
-        pluginKeyHook = SetWindowsHookExW (WH_KEYBOARD, pluginKeyProc, nullptr, GetCurrentThreadId());
+        pluginKeyHook = SetWindowsHookExW (WH_GETMESSAGE, pluginKeyProc, nullptr, GetCurrentThreadId());
     else if (keyForwarder().handler == nullptr && pluginKeyHook != nullptr)
     {
         UnhookWindowsHookEx (pluginKeyHook);
         pluginKeyHook = nullptr;
     }
    #endif
+}
+
+bool runSecondaryWindowKey (const juce::KeyPress& key)
+{
+    return keyForwarder().handler != nullptr && keyForwarder().handler (key);
+}
+
+void setPluginViewPlainKeyHandler (std::function<bool (juce::Component&)> allows, std::function<bool (const juce::KeyPress&)> first,
+                                   std::function<bool (const juce::KeyPress&)> left)
+{
+    plainKeysAllowed = std::move (allows);
+    plainKeyHandler = std::move (first);
+    plainKeyLeftHandler = std::move (left);
+}
+
+void listenForKeysPluginLeaves (juce::Component& pluginEditor)
+{
+    static PluginLeftKeys listener;
+    pluginEditor.addKeyListener (&listener); // (JUCE adds it once)
+    for (auto* child : pluginEditor.getChildren())
+        listenForKeysPluginLeaves (*child);
+}
+
+namespace
+{
+std::function<void (int, int)> linkedFocusHandler;
+
+struct LinkedFocusListener final : juce::FocusChangeListener
+{
+    juce::Component::SafePointer<juce::Component> last;
+    void globalFocusChanged (juce::Component* focused) override
+    {
+        if (auto* top = focused != nullptr ? focused->getTopLevelComponent() : nullptr)
+            linkedWindowFocused (*top);
+    }
+};
+
+LinkedFocusListener& linkedFocusListener()
+{
+    static LinkedFocusListener listener;
+    return listener;
+}
+} // namespace
+
+void markLinkedWindow (juce::Component& window, int channel, int insert)
+{
+    window.getProperties().set ("lynxLinkChannel", channel);
+    window.getProperties().set ("lynxLinkInsert", insert);
+}
+
+void setLinkedWindowFocusHandler (std::function<void (int, int)> handler)
+{
+    linkedFocusHandler = std::move (handler);
+    if (linkedFocusHandler != nullptr)
+        juce::Desktop::getInstance().addFocusChangeListener (&linkedFocusListener());
+    else
+        juce::Desktop::getInstance().removeFocusChangeListener (&linkedFocusListener());
+}
+
+void linkedWindowFocused (juce::Component& window)
+{
+    auto& listener = linkedFocusListener();
+    if (! window.getProperties().contains ("lynxLinkInsert"))
+    {
+        listener.last = nullptr; // (another window: coming back to this one is a new focus)
+        return;
+    }
+    if (linkedFocusHandler == nullptr)
+        return;
+    if (listener.last.getComponent() == &window) // (the same window again: a click inside it, not a new focus)
+        return;
+    listener.last = &window;
+    linkedFocusHandler ((int) window.getProperties()["lynxLinkChannel"], (int) window.getProperties()["lynxLinkInsert"]);
 }
 
 void keepAboveMainWindow (juce::Component& window)
@@ -718,7 +1093,8 @@ void matchWindowOrderToScreen()
     std::vector<juce::Component*> above;
     auto& desktop = juce::Desktop::getInstance();
     for (int i = 0; i < desktop.getNumComponents(); ++i)
-        if (auto* c = desktop.getComponent (i); c != owner && c->isVisible() && ! c->isAlwaysOnTop() && isAboveMainWindow (*c))
+        if (auto* c = desktop.getComponent (i); c != owner && c->isVisible() && ! c->isAlwaysOnTop() && ! nativechild::isAttached (*c)
+                                                 && isAboveMainWindow (*c))
             above.push_back (c);
 
    #if JUCE_WINDOWS
@@ -732,6 +1108,14 @@ void matchWindowOrderToScreen()
     };
     std::stable_sort (above.begin(), above.end(), [&] (juce::Component* a, juce::Component* b) { return depthOf (a) > depthOf (b); });
    #endif
+
+    // issue #116: the main window's native child windows (panels, docked plugin windows) first, in their stacking order,
+    // so a drop lands on the one in front (JUCE looks for the target through its list of desktop windows, from the end)
+    {
+        auto children = nativechild::attachedChildren (owner->getWindowHandle());
+        children.erase (std::remove_if (children.begin(), children.end(), [] (juce::Component* c) { return ! c->isVisible(); }), children.end());
+        above.insert (above.begin(), children.begin(), children.end());
+    }
 
     // JUCE's list already in that order after the main window: nothing to do (no window is touched)
     const auto indexOf = [&desktop] (juce::Component* c) {

@@ -49,6 +49,9 @@ public:
     // LYNX extra (on by default; Options › General "Steps use channel colour"): a lit step in its channel's colour
     // (themes::litStepColour); FL's steps stay white / pink ("Colorful channel controls" only colours the insert box)
     static inline std::atomic<bool> stepsChannelColour { true };
+    // FL's rack option "Show complete piano roll preview" (feedback 190bm): a row's miniature shows the whole pattern
+    // in the visible width when the pattern is longer than the rack shows; off: step-aligned, it scrolls with the steps
+    static inline std::atomic<bool> completePreview { true };
     explicit ChannelRackComponent (AudioEngine& engine);
     ~ChannelRackComponent() override;
     void visibilityChanged() override;
@@ -60,6 +63,9 @@ public:
     static bool keepEditorsOpen;
     // FL's "Select first channel with notes when the pattern changes" (Settings › General; REA round 167j §5)
     static bool selectFirstChannelWithNotes;
+    // FL's Settings › General › "Auto select linked modules" (AutoSelectBox, on; round 187a): a focused channel or
+    // plugin window selects its channel and mixer track, and selecting one channel selects its mixer track
+    static bool autoSelectLinked;
     // FL's Channel Rack option "Mute removed steps": turning a step off mutes its note instead of deleting it
     static bool muteRemovedSteps;
 
@@ -104,6 +110,7 @@ public:
     bool isPianoRollView() const noexcept { return pianoRollView; }
     bool areGraphLanesShown() const noexcept { return graphLanes; }
     juce::PopupMenu getChannelMenuForSnapshot (int channel) { return buildChannelMenu (channel); }
+    ui::Hint getChannelHintForSnapshot (int channel); // the hint of the channel's name button (--freezetest)
     void setGraphLevelForSnapshot (int level) { graphLevel = level; graphLanes = true; updateSize(); repaint(); }
     void rotateSelected (int steps);
     void fillSelected (int every);
@@ -187,7 +194,7 @@ private:
     void setLoopPoint (int row, int setting);
     int loopDragRow = -1, loopDragStart = 0;
     float loopDragY = 0.0f;
-    void parentSizeChanged() override { updateSize(); }
+    void parentSizeChanged() override { updateSize(); repaint(); } // (the fitted miniatures follow the visible width)
     int nameLeft() const noexcept { return muteWidth + 2 * knobWidth + routeWidth + 2; }
     int selectLeft() const noexcept { return nameLeft() + nameWidth + 4; }
     int gridLeft() const noexcept { return selectLeft() + selectWidth + 8; }
@@ -203,6 +210,7 @@ private:
     juce::Rectangle<int> levelButtonBounds (int level) const;
     void paintLane (juce::Graphics& g);
     void paintNotePreview (juce::Graphics& g, int row, const Pattern& pattern, std::uint32_t channelColour);
+    PreviewSpan previewSpan() const; // where the miniatures are drawn (core/RackOps.h notePreviewSpan)
     void setLaneValue (int step, float value);
     void applyLane (const juce::MouseEvent& e);
     float laneValueAt (int y) const;
@@ -223,6 +231,12 @@ private:
     void assignSampleNow (int channel, const juce::File& file); // (no Speech properties step)
     void rename (int channel);
     void openPluginWindow (int channel);
+    // Freeze (round 190ay, ui/ExportDialog.h freezeChannel): the frozen channel's hint; "Unfreeze to edit" in the hint
+    // bar when an edit of a frozen channel is refused (true = refused); Freeze / Re-freeze of several channels, one
+    // render after the other (by uid: the rack may change between two renders)
+    juce::String frozenHint (int channel);
+    bool refuseFrozenEdit (int channel);
+    void freezeChannels (std::vector<std::uint64_t> uids);
     void sliceChannel (int channel);
     bool isEditorOpen (int channel);
     void closeEditor (int channel);

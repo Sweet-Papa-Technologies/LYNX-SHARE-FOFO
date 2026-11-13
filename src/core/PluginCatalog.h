@@ -69,6 +69,14 @@ struct Folders
     std::map<std::string, std::string> of; // plugin key → folder path
     std::set<std::string> effects, generators; // the folders (each parent of a folder is a folder too)
     int view = 0; // how the menus show them: MenuView (saved as "view<TAB>n")
+    // Built-in plugins the user took out of the Plugin database (round 190ba, issue #104: their entry file was deleted
+    // from the database folder, core/PluginDbFolder.h): they get no default folder, so the menus' folders and the
+    // picker leave them out, as FL does with a deleted entry. Not saved here: the database folder says it.
+    std::set<std::string> hidden;
+    // Plugins whose entry sits at the top of Effects / Generators, in no folder (round 190bf: FL's menus list such root
+    // entries before the folders in Categories, after them in Tree, FL 2026 seen live). They get no default folder.
+    // Not saved here either: the database folder says it.
+    std::set<std::string> top;
 
     std::set<std::string>& kind (bool instruments) noexcept { return instruments ? generators : effects; }
     const std::set<std::string>& kind (bool instruments) const noexcept { return instruments ? generators : effects; }
@@ -103,6 +111,9 @@ std::vector<MenuFolder> menuTree (const Folders& folders, bool instruments, cons
 enum class MenuView { categories, simple, tree };
 // every plugin index of a folder tree, depth first (the Simple view's list before sorting)
 std::vector<int> allItems (const std::vector<MenuFolder>& tree);
+// The indexes into `keys` of the plugins at the top of the database (Folders::top) and in no folder of this kind: FL's
+// root entries (Categories: first, without a heading; Tree: after the folders' submenus; Simple: A-Z with the rest)
+std::vector<int> rootItems (const Folders& folders, bool instruments, const std::vector<std::string>& keys);
 std::string groupHeading (const std::string& path); // "Stock › EQ" (a path shown in one line)
 
 // Folders from FL Studio's own Plugin database: `files` = the .fst presets under its Effects (or Generators) folder as

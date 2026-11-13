@@ -17,6 +17,8 @@ struct FlPathRoots
     std::string factoryData; // %FLStudioFactoryData%  e.g. C:\Program Files\Image-Line\FL Studio 2026
     std::string data;        // %FLStudioData%         e.g. ...\FL Studio 2026\Data
     std::string userData;    // %FLStudioUserData%     e.g. Documents\Image-Line\FL Studio
+    std::string sharedData;  // %ILSharedData%         e.g. Documents\Image-Line (FL's "Shared data" folder)
+    std::string downloadsData; // %FLStudioDownloadsData% e.g. Documents\Image-Line\Downloads (FL Cloud sounds...)
     std::string home;        // this user's profile (C:\Users\name): re-roots paths saved on another account/PC
 };
 
@@ -59,6 +61,9 @@ struct FlpImportOptions
     std::map<std::string, std::string> relocations;
 
     bool threeOscAsSynth = false; // 3x Osc → the built-in synth conversion instead of FL's engine (the synth's preset menu)
+    bool fpcAsPads = false;       // FPC → one sampler channel per pad (the import before round 190q) instead of one FPC channel
+    bool fpcAsChannel = false;    // FPC → always one FPC channel, also a kit with pads on other inserts or without a sample
+                                  // (a kit preset loaded onto a channel: natives::channelFromPresetFile)
 };
 
 // Converts an FL Studio project to our model. Sampler channels whose
@@ -100,7 +105,13 @@ struct DrumPad
     float pan = 0.0f, tune = 0.0f;  // pan −1..1; tuning in semitones
     int cutGroup = 0, cutBy = 0;    // playing this pad cuts pads with cutBy == cutGroup (0 = none)
     int mixerOffset = 0;            // mixer track relative to the channel's
+    int sourcePad = -1;             // FPC: the pad's index in the kit, and each layer's index in that pad (round 190z)
+    std::vector<int> sourceLayers;
 };
+
+// The sampler channel that plays `pad` of the drum channel `original` (its volume, mixer insert and the rest stay the
+// channel's; the pad's gain rides on the zones). `channel` numbers the kit's cut groups apart from other channels'.
+ChannelDef drumPadChannel (const ChannelDef& original, const DrumPad& pad, int channel);
 
 // Replaces channel `channel` with one sampler channel per pad (right after it, on the same mixer insert)
 // and moves notes by key: a pad's note goes to its channel, at key 60. Notes on keys without a
@@ -120,6 +131,8 @@ bool isFlSynthPresetPlugin (const std::string& pluginName);
 
 // Internal effect similar to a native FL effect (by the plugin's internal name).
 std::optional<EffectKind> effectForFlPlugin (const std::string& name);
+// FL's own spelling of a native effect's name (old presets and Patcher nodes keep other casings: "Fruity fast dist")
+std::string canonicalFlEffectName (const std::string& name);
 // FL's own Fruity effect saved as a VST2 inside Fruity Wrapper (FL 11): the native state FL 2026 opens it with, rebuilt
 // from the VST2 parameter floats (empty when the effect or its state is not known; REA_rodada170i §1)
 std::vector<std::uint8_t> wrappedFruityState (const ForeignPlugin& plugin);

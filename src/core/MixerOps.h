@@ -4,6 +4,7 @@
 // sidechain gestures, linking channels, effect slot reordering). Pure functions over the Song model:
 // no JUCE, unit-tested in tests/WorkflowP2Tests.inc.
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,31 @@ bool insertTrack (Song& song, int at);
 // removed. False for the Master or out of range.
 bool deleteTrack (Song& song, int t);
 
+// FL's "Delete" on the selected mixer tracks (round 186c; REA FUN_012a5b60 / FUN_012a5280, checked in FL 2026):
+// every insert of `tracks` (the Master is skipped) goes. A track that sent into a deleted insert now sends to that
+// insert's own destinations (FL 21's fix 19603), so the signal still reaches where it went. Playlist audio /
+// instrument tracks linked to a deleted insert follow `linked`: `unlink` keeps the Playlist track (and its name) as
+// an unassigned track, `deleteToo` resets it (FL's "Delete tracks and channels": default name, unassigned) and
+// deletes the channel of an instrument track. Returns how many inserts were deleted.
+enum class LinkedPlaylistTracks
+{
+    unlink,
+    deleteToo
+};
+// `keepLostLinks` (LYNX's option, pain point 1; off = FL): every send into a deleted insert also stays as a
+// MixerTrack::lostSends entry, drawn greyed, until reconnectLostSend or removeLostSends.
+int deleteTracks (Song& song, std::vector<int> tracks, LinkedPlaylistTracks linked = LinkedPlaylistTracks::unlink, bool keepLostLinks = false);
+// Turns lost send `index` of `track` into a send to insert `to` at its level. False when that route isn't possible
+// (out of range, itself, or a cycle).
+bool reconnectLostSend (Song& song, int track, int index, int to);
+// Removes lost send `index` of `track` (all of them for −1).
+void removeLostSends (Song& song, int track, int index = -1);
+
+// The Playlist audio / instrument tracks linked to one of `tracks` (FL asks "Delete tracks and channels" or
+// "Unlink tracks and channels" when there is one; FUN_012a5b00): an audio track by its mixer track, an instrument
+// track by its channel's mixer track.
+std::vector<int> playlistTracksLinkedTo (const Song& song, const std::vector<int>& tracks);
+
 // Routes `channels` to insert `track` (all of them), or, with `startingHere`, to consecutive inserts from
 // `track` on (adding inserts as needed, up to maxMixerTracks). Returns the insert of each channel.
 std::vector<int> linkChannels (Song& song, const std::vector<int>& channels, int track, bool startingHere);
@@ -36,6 +62,17 @@ std::vector<int> linkChannels (Song& song, const std::vector<int>& channels, int
 // Removes the unused inserts (Song::insertInUse) at the end of the mixer, keeping at least `keep` inserts (round 163,
 // Mixer › "Remove unused inserts at the end"). Returns how many were removed.
 int removeUnusedTrailingInserts (Song& song, int keep = 0);
+
+// Mixer menu › "Show only used inserts" (round 163; the rule made exact in round 190am): which strips take no room.
+// An insert is hidden only when ALL of these hold:
+//  - it is not the Master;
+//  - it is not in `keep` (the selected inserts, those brought back with "+", and those whose meter moved: an insert
+//    that receives audio always shows);
+//  - nothing uses it (Song::insertInUse): no channel plays into it, no insert sends to it and it sends nowhere but
+//    the Master, no effect slot, no audio input, no Playlist track link, no effect's sidechain or extra output points
+//    at it, its name, fader, pan, separation, mute, solo, colour, EQ and output are the defaults, nothing automates it.
+// Returns one flag per insert plus one for the "+" button (never hidden). Nothing in the song changes.
+std::vector<bool> hiddenUnusedInserts (const Song& song, const std::set<int>& keep);
 
 // Channels whose output goes to `track`.
 std::vector<int> channelsOn (const Song& song, int track);
@@ -54,9 +91,24 @@ int routeTo (Song& song, const std::vector<int>& sources, int to, bool only);
 // or vocoder on `to` without a side input listens to `from`. Returns how many effects now listen.
 int sidechainTo (Song& song, int from, int to);
 
+// FL's inputs list of an insert (REA_rodada22 §1, round 188d [EXEC]): [the insert itself, then every insert routed
+// to it — at any level, level 0 = sidechain only — in ascending order]. A plugin's "sidechain index" k in the
+// wrapper's Processing › Connections picks entry k (0 = the insert's own audio).
+std::vector<int> insertInputs (const Song& song, int track);
+// The source insert of sidechain index k on `track`, or −1 (k ≤ 0, or past the list)
+int sidechainIndexSource (const Song& song, int track, int k);
+// The index of `source` in `track`'s inputs list, or 0 when it is not there
+int sidechainIndexOf (const Song& song, int track, int source);
+
 // The effects a sidechain link feeds (round 170h): LYNX's Compressor, FL's Fruity Limiter / Fruity Compressor
 // (FL users sidechain with these) and the vocoder.
 bool listensToSidechain (EffectKind kind) noexcept;
+// Round 177d (the user's decision on an FL wishlist item): LYNX's own dynamics whose live meter 0 is their gain
+// reduction, 0..1 over 0..30 dB (Effect::controlOutput; published for every slot in ProcessTimes::effectMeters): the
+// Compressor, Apex Limiter, Crest Compressor, Sentry Gate, Quell Denoiser, Ridge Strip, Glow Leveler and Hush De-esser.
+// The mixer strip shows a gain-reduction meter only when it holds one of them.
+bool reportsGainReduction (EffectKind kind) noexcept;
+constexpr float gainReductionRangeDb = 30.0f;
 // The one insert whose send into `to` is a sidechain link (a level-0 send, as "Sidechain to this track" makes
 // it), or -1 when there is none or more than one.
 int soleSidechainSender (const Song& song, int to);
@@ -145,8 +197,8 @@ std::uint32_t gradientColourStep (std::uint32_t from, std::uint32_t to, int k, i
 int gradientColour (Song& song, std::vector<int> tracks, std::uint32_t from, std::uint32_t to);
 // "Assign to new Audio track(s)" (FL's AssignAudiotrackMenuClick, Tag 0; REA_rodada177a §6): each selected insert
 // takes the first untouched Playlist track (no name, colour, mode or clip; FL scans tracks 1–500) as its audio track,
-// named and coloured as the insert. An insert that is already linked to an audio track is skipped. Returns how many
-// tracks were assigned.
+// named and coloured as the insert. FL skips an insert that a Playlist track already points at (any mode), or whose
+// only channel already has an instrument track. Returns how many tracks were assigned.
 int assignNewAudioTracks (Song& song, std::vector<int> inserts);
 // "Unassign from Audio track(s)" (the same handler, Tag 1): the first audio track linked to each selected insert goes
 // back to unassigned. Its name, colour and clips stay. Returns how many tracks changed.
@@ -170,6 +222,28 @@ bool toggleFold (Song& song, int track);
 bool isFolded (const Song& song, int track);
 // Folds (or unfolds) every group that can fold. Returns how many changed.
 int foldAll (Song& song, bool fold);
+
+// --- Mixer groups that follow the Playlist (round 186c, pain point 4; LYNX's addition, FL has no link) -------------------
+// The inserts of each Playlist track group (a header and its grouped tracks), in Playlist order: an audio track's mixer
+// track, an instrument track's channel's mixer track (each insert once, in the first group that names it).
+struct PlaylistGroupInserts
+{
+    std::vector<int> inserts;
+    bool collapsed = false; // the header is collapsed
+};
+std::vector<PlaylistGroupInserts> playlistGroupInserts (const Song& song);
+// The inserts linked to any Playlist track, in Playlist order (each once).
+std::vector<int> playlistOrderInserts (const Song& song);
+// "Mixer groups follow the Playlist": the separators and folds of the inserts linked to Playlist tracks mirror the
+// Playlist's groups (a group of 2+ inserts that sit next to each other in one dock becomes a mixer group, folded when its
+// header is collapsed); a closing separator may land on the insert after a group. Separators of the other inserts stay.
+// Returns true when something changed.
+bool followPlaylistGroups (Song& song);
+bool followsPlaylistGroups (const Song& song); // nothing for followPlaylistGroups to change
+// "Arrange inserts like the Playlist": the inserts linked to Playlist tracks move to the front (insert 1 on) in Playlist
+// order, the others keep their order after them (everything that refers to an insert follows it), then
+// followPlaylistGroups. Returns how many inserts changed place.
+int arrangeLikePlaylist (Song& song);
 
 // --- VCA faders (round 177a slice 3, LYNX's addition; REA_rodada177a §3) ---------------------------------------------
 // The VCAs that act on `track`: those it is a member of and their parents, each once (indices into Song::vcas).

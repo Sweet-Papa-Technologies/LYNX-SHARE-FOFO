@@ -468,6 +468,10 @@ enum Param
     // Auto (its editor moves Output −1.6 dB per Drive unit, as the reference's; no audio effect) and the Classic law
     // (1 = Punish's measured law; projects saved before round 165 keep round 136's +9.75 dB)
     classicAuto, classicLaw,
+    // round 190ar (appended; on for new instances): the Classic voicing's high-drive tables with the coupling ahead of
+    // the curve (core/EmberClassic.h: styles driven hard hold the reference's uneven square wave). Off = round
+    // trial187b's tables: what a project saved before loads with (upgradeLoadedEffectParams). Drives up to 5 ignore it.
+    classicHot,
     count
 };
 // round 165: an editor edit of `param` with the Classic voicing's Auto on also moves Output (the reference's link);
@@ -603,12 +607,16 @@ const EffectInfo& emberInfo();
 const EffectInfo& kilnInfo();
 const EffectInfo& fretInfo();
 const EffectInfo& shellInfo();
+const EffectInfo& strikeInfo(); // round trans189d: Strike Shaper (core/StrikeShaper.h)
 
 std::string paramText (EffectKind kind, int param, float v);
 std::unique_ptr<Effect> make (EffectKind kind);
 // Hush with its look-ahead (= latency) known before the first block (round 128)
 std::unique_ptr<Effect> makeHush (const EffectParams* params);
 std::unique_ptr<Effect> makeEmber (const EffectParams* params); // round 152: the processing mode known at once
+// issue #113: the latency known before the first block (Ridge: the Vocal voicing / DRIVE; Aether: the model)
+std::unique_ptr<Effect> makeRidge (const EffectParams* params);
+std::unique_ptr<Effect> makeAether (const EffectParams* params);
 bool isSuiteKind (EffectKind kind) noexcept;
 
 // Meters the editor shows (written by the audio thread, read by the UI): see Effect::controlOutput.

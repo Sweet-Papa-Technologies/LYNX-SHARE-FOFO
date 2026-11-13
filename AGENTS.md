@@ -14,7 +14,7 @@ Contributor and agent guide for **LYNX-SHARE-FOFO** (`Sweet-Papa-Technologies/LY
 ## 2. Building
 
 ### JUCE-Free Core & Unit Tests (macOS / Linux / Git Bash / WSL)
-Compiles `src/core/`, `src/flp/`, `tools/flpdump`, `tools/renderwav`, `tools/comparewav`, and the 1.95M+ check test suite without JUCE:
+Compiles `src/core/`, `src/flp/`, `tools/flpdump`, `tools/renderwav`, `tools/comparewav`, and the 2.3M+ check test suite without JUCE:
 ```bash
 TMPDIR=/tmp PATH=/usr/bin:$PATH ./scripts/build-local.sh
 # Run a single test by substring:

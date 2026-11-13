@@ -5071,4 +5071,7 @@ inline constexpr unsigned char png256[] = {
 159, 59, 159, 59, 159, 59, 159, 59, 159, 59, 159, 59, 159, 59, 159, 255, 138, 207, 255, 3, 119, 219, 56, 170,
 115, 9, 85, 106, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130
 };
+// Upstream's header (tools/make_logo_data.py, 512 px) names the array png512 and ui/WindowOwner.cpp reads it under that
+// name; the SPT badge above is still the fork's 256 px image, so this is an alias until the header is regenerated.
+inline constexpr auto& png512 = png256;
 } // namespace lynx::logo

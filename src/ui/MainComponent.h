@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/ProjectKey.h"
+#include "core/Preferences.h"
 #include "core/ChordReadout.h"
 
 #include <atomic>
@@ -9,6 +11,8 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "core/KeyMap.h"
+#include "core/UndoKeys.h"
+#include "core/LayoutStyle.h"
 #include "core/Performance.h"
 #include "ui/UiTrace.h"
 #include "core/ToolbarLayout.h"
@@ -20,12 +24,15 @@
 #include "ui/ChannelRackComponent.h"
 #include "ui/PianoRollComponent.h"
 #include "ui/MixerComponent.h"
+#include "ui/DetailView.h"
 #include "ui/PlaylistComponent.h"
 #include "ui/SessionDialogs.h"
+#include "ui/SimpleWorkflow.h"
 #include "ui/LiveSessionUi.h"
 #include "ui/HintBar.h"
 #include "ui/Splash.h"
 #include "ui/FrameTicker.h"
+#include "ui/Motion.h"
 #include "ui/Toolbar.h"
 #include "ui/Updater.h"
 #include "ui/ValueControl.h"
@@ -33,6 +40,17 @@
 
 namespace lynx
 {
+class GamepadInput;
+namespace folderwatch
+{
+class Watcher;
+}
+namespace gamepad
+{
+struct Changes;
+struct State;
+} // namespace gamepad
+
 class MainComponent final : public juce::Component,
                             public juce::DragAndDropContainer,
                             public ui::HintSource,
@@ -41,6 +59,7 @@ class MainComponent final : public juce::Component,
                             private juce::ChangeListener
 {
 public:
+    void backupNowForTest() { autosave(); } // --rtstress --backuptest (round 177d)
     // `restoreUserSettings`: load/save the workspace layout, key map and UI options from the user
     // settings (off for --snapshot, which must look the same on every machine).
     explicit MainComponent (AudioEngine& engine, bool restoreUserSettings = true);
@@ -52,6 +71,7 @@ public:
     bool keyPressed (const juce::KeyPress& key) override;
     void dragOperationStarted (const juce::DragAndDropTarget::SourceDetails&) override; // (issue #12: drops on windows)
     bool keyFromSecondaryWindow (const juce::KeyPress& key); // a key a tool / plugin window left unused
+    bool keyFromPluginView (const juce::KeyPress& key, bool optionOn); // a plain key over a focused plugin (issue #96)
     bool keyStateChanged (bool isKeyDown) override;
     ui::Hint hintAt (juce::Point<int> position) override; // the toolbar's background: how to edit it
 
@@ -68,6 +88,9 @@ public:
     void confirmDiscard (std::function<void()> then);
     // The main window came up (issue #62): the detached panels restored with the layout go to their saved place, above it.
     void restoreDetachedWindows() { workspace.restoreDetachedWindows(); }
+    // Issue #123: at start-up without a file to open, FL's "Startup project" (Settings › General › Startup): the default
+    // template as a new untitled project (nothing changes while it is LYNX's default), an empty project or the last one.
+    void openStartupProject();
 
     // For --snapshot mode: 0 = Channel Rack, 1 = Piano Roll (on the channel with the most notes), 2 = Playlist, 3 = Mixer,
     // each maximized on the workspace; showDesktopForSnapshot shows the default layout (with `extraPanels`, the
@@ -79,16 +102,29 @@ public:
     void showDesktopForSnapshot (bool extraPanels);
     // The Clip-launch workflow's layout (round 181a): the clip grid beside the Playlist, or flipped. Nothing exists until
     // it is first turned on. Moves panels only; the project does not change, except that it gets an (empty) grid.
-    void setClipLaunchWorkflow (bool on, bool swapLayout = true);
+    void setClipLaunchWorkflow (bool on, bool swapLayout = true) { setLayoutStyle (on ? layoutstyle::Style::clipLaunch : layoutstyle::Style::pattern, swapLayout); }
     void setClipGridView (PlaylistArea::GridView view);
-    bool isClipLaunchWorkflow() const noexcept { return clipLaunchWorkflow; }
+    bool isClipLaunchWorkflow() const noexcept { return layoutStyle == layoutstyle::Style::clipLaunch; }
+    // View › Layout style (round 184a: Pattern, Clip-launch or Simple workflow; core/LayoutStyle.h). Moves panels only;
+    // each style keeps its own workspace layout. The Simple workflow's parts are made when it is first chosen.
+    void setLayoutStyle (layoutstyle::Style style, bool swapLayout = true);
+    layoutstyle::Style getLayoutStyle() const noexcept { return layoutStyle; }
+    SimpleWorkflow* getSimpleWorkflowForSnapshot() noexcept { return simpleWorkflow.get(); } // --simpleshot
+    // The Clip-launch workflow's detail view (round 183a), made with the grid; nullptr until then.
+    DetailView* getDetailViewForSnapshot() const noexcept { return detailView.get(); }
+    juce::PopupMenu getKeyMenuForSnapshot() { return makeKeyMenu(); } // --simpleshot (round 184a S11)
     // --uiperf (round 173f): the default layout with these panels shown too (the reporter's Channel Rack + Mixer)
     void showPanelsForSnapshot (std::initializer_list<workspace::Panel> panels);
     void openQuickAddForTest() { showQuickAdd(); } // --windowtest
+    Workspace& workspaceForTest() { return workspace; } // --plugwintest dock mode (issue #116)
+    juce::Component* setupOverlayForTest() const { return setupOverlay.get(); }
+    juce::Component* danceStageForTest() const { return danceStage.get(); } // (a DanceStage, ui/DanceView.h)
     // --savetest: File › Save to `file` without the dialog, and whether its file is still being written
     void saveForTest (const juce::File& file, std::function<void()> saved) { saveProjectTo (file, true, std::move (saved)); }
     bool isSavingForTest() const noexcept { return saving; }
     void waitForBrowserForSnapshot() { browser.waitForListing (5000); }
+    // --no-plugins project.lynx (round 190ap): the next .lynx project opens with its third-party plugins off
+    void openNextWithoutPlugins (bool on) { nextOpenWithoutPlugins = on; }
     juce::StringArray getMenuNamesForSnapshot() { return getMenuBarNames(); }
     juce::PopupMenu getMenuForSnapshot (int index) { return getMenuForIndex (index, {}); }
     juce::PopupMenu getPanelMenuForSnapshot (workspace::Panel panel)
@@ -97,6 +133,7 @@ public:
         addPanelMenuItems (panel, menu);
         return menu;
     }
+    juce::PopupMenu getFullRecordMenuForSnapshot() { return buildRecordMenu(); } // the record button's whole menu
     juce::PopupMenu getRecordMenuForSnapshot()
     {
         juce::PopupMenu menu;
@@ -146,7 +183,11 @@ private:
     void showImportReport();
     void importFlp (const juce::File& file);
     void flpImported (const juce::File& file); // after the import: title, recent files, missing files
-    void openLynxProject (const juce::File& file);
+    void openLynxProject (const juce::File& file, bool withoutPlugins = false);
+    // round 190ap: "Open without third-party plugins" (File menu; --no-plugins on the command line): the project opens
+    // with every hosted plugin switched off, its settings kept; the panel switches them back on
+    void chooseFileToOpenWithoutPlugins();
+    void showPluginsOff();
     // The "Missing files" window (ui/MissingFilesDialog.h) for the current project; `afterOpening`: shown by opening a
     // project (only when something is missing; the FL import report follows it), else from the menu (always).
     void showMissingFiles (bool afterOpening);
@@ -159,6 +200,7 @@ private:
     int sandboxDeathsSeen = 0; // separate-process plugins that died (engine/PluginSandbox.h, round 176a) already announced
     void announceEditorCrash (const juce::String& plugin);
     void announceSeparateProcessCrash (const juce::String& plugin, bool crashed, bool bits32);
+    void reloadCrashedPlugins (const juce::String& plugin); // round 190ao: a crash prompt's "Reload"
     void showHelp();
     void closeUnfocusedWindows();
     void closeHelp();
@@ -187,9 +229,12 @@ private:
     perf::MidiMapping typingPerformance;
     std::map<int, std::vector<int>> typingLaunches;
     static bool isPlainKey (const keys::Chord& chord) noexcept; // no Ctrl / Alt / Shift
-    keys::TypingKey typingKey (const keys::Chord& chord) const; // what the typing keyboard does with it (nothing when off)
+    // what the typing keyboard does with a key (nothing when off): by the key's place on the keyboard, not its letter
+    // (QWERTZ, AZERTY, Dvorak... play as a US keyboard does, as FL)
+    keys::TypingKey typingKey (const juce::KeyPress& key) const;
     void releaseTypingLaunches (bool all); // the released keys' launches (all: every one)
     int lastCurrentPattern = -1; // ("Select first channel with notes when the pattern changes")
+    int lastLinkedChannel = -1;  // (Auto select linked modules, round 187a)
     void setTypingPiano (bool on);
     void toggleTypingPiano(); // the user's toggle (button, menus, Ctrl+T): also says so in the hint bar
     juce::String shortcutText (const char* actionId) const; // "\tF5" for menus ("" when unbound)
@@ -228,6 +273,8 @@ private:
     void loadUiSettings();
     void saveUiSettings();
     bool persistent = true;
+    bool nextOpenWithoutPlugins = false; // --no-plugins (round 190ap)
+    bool shownPluginsOff = false;        // what the title says now
     StartupOptions startup; // splash screen and start-up sound (read by Main.cpp before this window exists)
 
     // menu bar
@@ -272,11 +319,23 @@ private:
     // FL's Edit › Undo (Ctrl+Z, round 167k): undoes the last step, or redoes one when something is undone (FL's
     // FUN_010173a0: history position 0 → 1, else position − 1); with "Alternate undo mode" a plain multi-level undo
     void flUndo();
+    // FL's Edit › Undo backwards (Ctrl+Alt+Z): one more step back; with "Alternate undo mode" the two shortcuts swap, so
+    // it undoes, or redoes when something is undone (round 190b, issue #140; core/UndoKeys.h)
+    void flUndoBackwards();
+    void runUndoStep (undokeys::Step step);
     bool alternateUndo = false; // Settings › General › "Alternate undo mode" (FL's default: off)
     std::unique_ptr<toolbar::EditOverlay> toolbarEditor;
     std::unique_ptr<juce::Component> pluginPickerView; // FL's Plugin picker (F8), its own window over the screen (rounds 169k, 175b)
+    // round 184a, S16: the game controller, made only while Settings › MIDI › "Use a game controller" is on (no timer
+    // otherwise); the hints overlay while Back is held
+    std::unique_ptr<GamepadInput> gamepadInput;
+    std::unique_ptr<juce::Component> gamepadHints;
+    void updateGamepad();
+    void gamepadChanges (const gamepad::Changes& changes, const gamepad::State& state, double seconds);
+    int gamepadInsert() const; // the selected track's insert (its track mode's link, else the selected channel's)
     void togglePluginPicker();
     std::unique_ptr<juce::Component> setupOverlay; // the first-start / Options > Setup wizard, over everything
+    void hostSetupOverlayNatively(); // issue #116: in front of the native panels (ui/NativeChild.h)
     toolbar::EditOverlay::Bounds panelBounds {}; // each shown toolbar panel (for the edit mode)
     juce::Rectangle<int> fixedToolbarArea;       // the menu and the hint bar
     void newProject (bool askAlways = false); // File › New: the New project window unless turned off
@@ -306,9 +365,13 @@ private:
     std::vector<std::function<void()>> waitingForSave;
     std::shared_ptr<juce::WaitableEvent> saveWritten;       // the writing thread is done with the file (closing waits for it)
     void exportAudio (int format = -1); // −1: the last export's format(s); 0 WAV, 1 MP3, 2 OGG, 3 FLAC alone
+    void exportForOtherApps();          // File › Export › For other apps... (round 184a S9; also the Finish dock's row)
     void exportMidiFile();
     void switchSmartDisableForAll();
     void confirmPrepareForMidiExport();
+    void saveClipboardToBrowser (bool midi);
+    juce::PopupMenu makeSwitchAudioClipsMenu (bool selectedOnly);
+    void switchAudioClips (bool selectedOnly, bool keepPitch, StretchMethod method, const juce::String& modeName);
     void changeDeclickOfSelectedClips (int mode);
     void prepareForPerformance(); // Tools › Macros (round 165m)
     void refreshToolbar();
@@ -318,6 +381,9 @@ private:
     // project safety (REA round 118, FL's backup folder / save new version / project data files interpreted)
     void saveNewVersion();
     void revertToLastBackup();
+    // round 190ap: the Versions panel (saved versions and backups of this project) and its "Open as a copy"
+    void showVersions();
+    void openProjectAsCopy (const juce::File& file, const juce::String& name);
     void exportPackage();
     sessionui::Context sessionContext(); // the File › Online session commands (round 168a)
     liveui::Context liveContext();       // the live session's (round 169b)
@@ -340,6 +406,21 @@ private:
     int autosaveTicks = 0;
     std::shared_ptr<std::atomic<bool>> autosaveRunning = std::make_shared<std::atomic<bool>> (false); // the backup file is being written
     int autosaveMinutes = 2, autosaveKeep = 10; // Settings › General › Backup
+    juce::int64 lastBackupMs = 0;  // when the last timed backup was written, and for which project (Song::projectId)
+    std::string lastBackupProject;
+    juce::String simpleSaveStatus() const;
+public:
+    // --simpleshot: the status texts as drawn (saved, not saved yet, backed up now / minutes ago)
+    static juce::String simpleSaveStatusText (bool modified, bool hasFile, juce::int64 backupMs, juce::int64 nowMs);
+private:
+    bool backupWaitsForQuiet = true;              // (round 177d) also while playing / right after MIDI input
+    int backupLongestWaitMinutes = prefs::defaultBackupLongestWaitMinutes; // ...but a backup is written after this long
+    bool hoverValues = false;                     // (round 177d) the hovered control's value next to the mouse
+    bool hoverTipShown = false;                   // ...and it is showing now
+    juce::String hoverTipText;
+    juce::Point<int> hoverTipAt;
+    std::uint32_t backupMidiSeen = 0;
+    double backupMidiMs = -1.0e9;
     bool lastModified = false;
     void openPianoRoll();
     void toggleMode();
@@ -347,6 +428,7 @@ private:
     void showPatternMenu();
 
     AudioEngine& engine;
+    std::unique_ptr<class ControllerBridge> controllerBridge; // (round 190aw)
 
     IconButton newButton { "new", Icon::newFile }, openButton { "open", Icon::open }, saveButton { "save", Icon::save },
         exportButton { "export", Icon::exportAudio }, undoButton { "undo", Icon::undo }, redoButton { "redo", Icon::redo };
@@ -356,6 +438,7 @@ private:
     IconButton recordMenuButton { "recordMenu", Icon::mic };
     IconButton patternModeButton { "patternMode", Icon::pattern }, songModeButton { "songMode", Icon::song };
     IconButton metronomeButton { "metronome", Icon::metronome };
+    IconButton multilinkButton { "multilink", Icon::link }; // FL's MultiLinkBtn (round 177b-4)
     IconButton typingPianoButton { "typingPiano", Icon::keyboard };
     IconButton countInButton { "countIn", Icon::countIn };
     IconButton waitInputButton { "waitInput", Icon::waitInput };
@@ -371,6 +454,7 @@ private:
     void applyStepEdit();
     void refreshRecordOptionButtons();
     void showRecordMenu();
+    juce::PopupMenu buildRecordMenu(); // (what showRecordMenu shows)
     // right-click on the metronome: on/off, its volume, count-in (FL keeps the metronome's options there)
     void showMetronomeMenu();
     void showTypingPianoMenu();
@@ -541,6 +625,14 @@ private:
     std::uint32_t chordNearHintUntil = 0;
     void updateChordPanel();
     void showChordPanelMenu();
+    // The project key (round 184a S11): the toolbar's Key panel and its menu. The Simple and Clip-launch workflows show the
+    // panel until the user shows or hides it by hand (then the toolbar layout decides, in every workflow).
+    toolbar::KeyPanel keyPanel;
+    bool keyPanelFollowsStyle = true;
+    void showKeyMenu();
+    juce::PopupMenu makeKeyMenu();
+    void refreshKeyPanel();
+    void setProjectKey (std::optional<projectkey::Key> key);
     void showChordText();
     void addAudioLoggerMenu (juce::PopupMenu& menu);
     void dumpAudioLog();
@@ -563,6 +655,7 @@ private:
     ui::HintBar hintBar;
     ui::TweakReadout tweakReadout; // FL's Tools › Last tweaked, at the hint bar's right end (round 162d)
     void refreshTweakReadout();
+    void updateHoverValue (juce::Component* hovered, const ui::Hint& hint, bool live);
     int tweakTicks = 0;
     void placeHintBar (juce::Rectangle<int> row); // the hint bar and, at its right end, the last-tweaked read-out
     bool hintsFrozen = false; // --snapshot: keep the hint that was set
@@ -574,10 +667,32 @@ private:
     PlaylistComponent playlist;
     PatternPicker picker { engine, playlist };
     PlaylistArea playlistArea { picker, playlist };
-    bool clipLaunchWorkflow = false, startInClipLaunchWorkflow = false;
+    layoutstyle::Style layoutStyle = layoutstyle::Style::pattern;
+    layoutstyle::SettingsReader startStyle; // the style saved in the UI settings (applied when the window is ready)
     bool lanesBeforeClipLaunch = false; // the Automation lanes setting to go back to
     void addLayoutStyleItems (juce::PopupMenu& menu);
     std::unique_ptr<juce::Component> clipGridView, clipGridSwitch; // made when Clip-launch workflow is first chosen (round 181a)
+    std::unique_ptr<SimpleWorkflow> simpleWorkflow; // made when Simple workflow is first chosen (round 184a)
+    std::unique_ptr<DetailView> detailView; // made with the grid (round 183a); never in Pattern workflow
+    void makeDetailView();
+    // Slice 2: the Piano roll docked in the detail view's Clip page (its panel lets go of it meanwhile)
+    bool pianoRollDocked = false;
+    juce::Component* dockPianoRoll (int pattern);
+    void undockPianoRoll();
+    bool pianoRollKeysHere() const; // the docked Piano roll was clicked last: the keys are its own
+    struct DockClickWatcher final : juce::MouseListener
+    {
+        std::function<void (const juce::MouseEvent&)> down;
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            if (down != nullptr)
+                down (e);
+        }
+    };
+    DockClickWatcher dockClickWatcher; // a global listener only while the Piano roll is docked
+    bool pianoRollDockActive = false;
+    bool runDetailAction (const std::string& id);
+    void openGridClip (int track, int scene);
     MixerComponent mixer;
     BrowserComponent browser;
     Workspace workspace; // after the panels' contents: it is destroyed first
@@ -590,6 +705,10 @@ private:
     juce::String importedSuffix; // " (imported from FL Studio)" in the title until saved as .lynx
     juce::String projectName; // suggested name for export (also from an imported .flp)
     HeldNotes heldKeys; // notes the typing piano is playing (tag: the key code)
+    bool wasForeground = true; // (the Plugin database folder is read again when LYNX comes back to the front: issue #104)
+    // round 190bf: the Plugin database folder's watcher (core/FolderWatcher.h); its thread only posts to this one
+    std::unique_ptr<folderwatch::Watcher> pluginDatabaseWatcher;
+    void readPluginDatabaseAgain();
     // Online Sessions P2 (round 169b): the live session (last: it ends, and tells the others, before anything goes)
     std::unique_ptr<LiveSessionManager> live;
 

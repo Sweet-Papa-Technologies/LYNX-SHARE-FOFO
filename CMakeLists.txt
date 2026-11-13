@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 # macOS: Big Sur or newer (universal builds pass -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"); set before project()
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 
-project(LYNX VERSION 0.1.26 LANGUAGES C CXX)
+project(LYNX VERSION 0.1.27 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,39 +51,55 @@ add_library(lynx_core STATIC
     src/core/XmlLite.cpp
     src/core/Gzip.cpp
     src/core/AlsImport.cpp
+    src/core/FlmFormat.cpp
+    src/core/FlmImport.cpp
+    src/core/FlmEffects.cpp
     src/core/AlsExport.cpp
     src/flp/FlpWrite.cpp
     src/core/Effects.cpp
     src/core/NoteEdit.cpp
     src/core/Recorder.cpp
     src/core/TakeRecording.cpp
+    src/core/Comping.cpp
     src/core/Pdc.cpp
     src/core/WorkerPool.cpp
     src/core/TimeStretch.cpp
     src/core/Arpeggiator.cpp
     src/core/SynthPresets.cpp
     src/core/Slicer.cpp
+    src/core/AudioToMidi.cpp
     src/core/Templates.cpp
     src/core/FlWrapper.cpp
     src/core/FlPluginDb.cpp
     src/core/MissingFiles.cpp
     src/core/PluginCatalog.cpp
+    src/core/PluginDbFolder.cpp
+    src/core/FolderWatcher.cpp
     src/core/ProjectSafety.cpp
     src/core/SessionIds.cpp
     src/core/SessionParts.cpp
     src/core/StandIns.cpp
     src/core/LiveSession.cpp
     src/core/LiveCrypto.cpp
+    src/core/RemotePlugins.cpp
     src/core/PluginSubstitutes.cpp
     src/core/Preferences.cpp
     src/core/MidiSync.cpp
     src/core/ThemePalette.cpp
     src/core/LoopStarter.cpp
+    src/core/SimpleTracks.cpp
+    src/core/GamepadMap.cpp
+    src/core/ControllerProfile.cpp
+    src/core/ControllerSession.cpp
+    src/core/ExportBundle.cpp
     src/core/PluginLayout.cpp
     src/core/StateParams.cpp
     src/core/FlEffects.cpp
     src/core/Effector.cpp
     src/core/FlSamplers.cpp
+    src/core/Fpc.cpp
+    src/core/FpcInstrument.cpp
+    src/core/FpcEnvelope.cpp
     src/core/FlSynths.cpp
     src/core/FlSytrus.cpp
     src/core/FlGenerators.cpp
@@ -92,6 +108,7 @@ add_library(lynx_core STATIC
     src/core/Harmless.cpp
     src/core/Harmor.cpp
     src/core/Gms.cpp
+    src/core/GmsMobile.cpp
     src/core/Morphine.cpp
     src/core/FruitKick.cpp
     src/core/BassDrum.cpp
@@ -101,6 +118,10 @@ add_library(lynx_core STATIC
     src/core/Wasp.cpp
     src/core/Granulizer.cpp
     src/core/WaveTraveller.cpp
+    src/core/FruitySlicer.cpp
+    src/core/Slicex.cpp
+    src/core/SlicexEngine.cpp
+    src/core/SlicexInstrument.cpp
     src/core/Drumaxx.cpp
     src/core/Slayer.cpp
     src/core/Dx10.cpp
@@ -119,6 +140,9 @@ add_library(lynx_core STATIC
     src/core/LowLifterFl.cpp
     src/core/TransporterFl.cpp
     src/core/FlLegacyFx.cpp
+    src/core/PocketFx.cpp
+    src/core/PocketMultiFx.cpp
+    src/core/PocketFxA.cpp src/core/PocketFxB.cpp src/core/PocketFxC.cpp
     src/core/VisualFx.cpp
     src/core/FlExtraFx.cpp
     src/core/Scratcher.cpp
@@ -170,6 +194,7 @@ add_library(lynx_core STATIC
     src/core/LynxVerbs.cpp
     src/core/FlPatcher.cpp
     src/core/Patcher.cpp
+    src/core/Rack.cpp
     src/core/Vfx.cpp
     src/core/VfxSequencer.cpp
     src/core/ThreeOsc.cpp
@@ -181,6 +206,7 @@ add_library(lynx_core STATIC
     src/core/FacetEq.cpp
     src/core/ApexLimiter.cpp
     src/core/Mastering.cpp
+    src/core/MasterLooks.cpp
     src/core/DynamicsSuite.cpp
     src/core/VoiceTools.cpp
     src/core/MidiControls.cpp
@@ -236,6 +262,7 @@ target_sources(lynx_core PRIVATE
 # workflow P2 (note tools, mixer operations, history labels, browser search)
 target_sources(lynx_core PRIVATE
     src/core/NoteTools.cpp
+    src/core/MidiTools.cpp
     src/core/PianoRollTools.cpp
     src/core/EventEdit.cpp
     src/core/AudioEdit.cpp
@@ -262,6 +289,7 @@ target_sources(lynx_core PRIVATE
     src/core/PlaylistOps.cpp
     src/core/QuickRender.cpp
     src/core/TempoDetect.cpp
+    src/core/AutoWarp.cpp
     src/core/ScoreLog.cpp
     src/core/ChannelLoops.cpp
     src/core/PatternBlocks.cpp
@@ -275,12 +303,17 @@ target_sources(lynx_core PRIVATE
 # in-app update check: versions, release list, build flavours, checksums, release notes (round 166b)
 target_sources(lynx_core PRIVATE
     src/core/UpdateCheck.cpp)
+# the Browser's "Find similar samples" (round 190as)
+target_sources(lynx_core PRIVATE
+    src/core/SampleSimilarity.cpp)
 
 # the embedded Python (pocketpy) and FL's VFX Script (round 165d)
 target_sources(lynx_core PRIVATE
     src/core/Python.cpp
     src/core/VfxScript.cpp
-    src/core/EdisonScript.cpp)
+    src/core/EdisonScript.cpp
+    src/core/ScriptDialog.cpp
+    src/core/PianoRollScript.cpp)
 
 # pocketpy 2.2 (MIT; third_party/pocketpy, LYNX's changes marked "LYNX"): a small embeddable Python 3 interpreter,
 # sandboxed (no os module / files) and interruptible (the watchdog)
@@ -393,13 +426,18 @@ if(LYNX_BUILD_APP)
         src/engine/LiveSessions.cpp
         src/engine/MediaPack.cpp
         src/engine/LiveTest.cpp
+        src/engine/DeviceChangeTest.cpp
+        src/engine/ShortExportTest.cpp
         src/ui/LiveSessionUi.cpp
         src/ui/LiveChat.cpp
+        src/engine/LiveRemotePlugins.cpp
+        src/ui/LiveRemoteUi.cpp
         src/engine/PluginHost.cpp
         src/engine/FlStudio.cpp
         src/engine/PluginSandbox.cpp
         src/engine/SandboxWorker.cpp
         src/engine/Bridge32Test.cpp
+        src/engine/ClapTeardownTest.cpp
         src/engine/Exporter.cpp
         src/engine/FlStudioExport.cpp
         src/engine/StreamPrefetcher.cpp
@@ -411,6 +449,7 @@ if(LYNX_BUILD_APP)
         src/engine/MidiFileIo.cpp
         src/engine/AudioLogger.cpp
         src/engine/MidiSyncIo.cpp
+        src/engine/ControllerIo.cpp
         src/engine/PreviewPlayer.cpp
         src/ui/MainComponent.cpp
         src/ui/ChannelRackComponent.cpp
@@ -423,6 +462,7 @@ if(LYNX_BUILD_APP)
         src/ui/PluginPresetMenu.cpp
         src/ui/ProjectLoading.cpp
         src/ui/WindowOwner.cpp
+        src/ui/PluginKeysTest.cpp
         src/ui/ParametricEqEditor.cpp
         src/ui/FacetEqEditor.cpp
         src/ui/ProEditors.cpp
@@ -430,10 +470,14 @@ if(LYNX_BUILD_APP)
         src/ui/PluginSkin.cpp
         src/ui/PluginEditors.cpp
         src/ui/PatcherEditor.cpp
+        src/ui/RackEditor.cpp
         src/ui/DynamicsDisplays.cpp
         src/ui/ExportDialog.cpp
         src/ui/FlStudioExportDialog.cpp
         src/ui/AlsExportDialog.cpp
+        src/ui/GamepadInput.cpp
+        src/ui/ControllerBridge.cpp
+        src/ui/OtherAppsExport.cpp
         src/ui/AutoSamplerDialog.cpp
         src/ui/AutomationUi.cpp
         src/ui/ControllerEditors.cpp
@@ -448,6 +492,10 @@ if(LYNX_BUILD_APP)
         src/ui/VideoTracks.cpp
         src/ui/AdrWindow.cpp
         src/ui/WaveTravellerEditor.cpp
+        src/ui/FpcEditor.cpp
+        src/ui/FruitySlicerEditor.cpp
+        src/ui/FlVoicePanel.cpp
+        src/ui/SlicexEditor.cpp
         src/ui/NewtoneEditor.cpp
         src/ui/ChannelSettings.cpp
         src/ui/LayerEditor.cpp
@@ -467,6 +515,7 @@ if(LYNX_BUILD_APP)
     # workflow shell: workspace desktop, control contract, dialogs
     list(APPEND LYNX_APP_SOURCES
         src/ui/Workspace.cpp
+        src/ui/NativeChild.cpp
         src/ui/ValueControl.cpp
         src/ui/Dialogs.cpp
         src/ui/SetupWizard.cpp
@@ -484,7 +533,9 @@ if(LYNX_BUILD_APP)
     # workflow P2: note tool dialogs, tool windows, undo history, quick-add palette
     list(APPEND LYNX_APP_SOURCES
         src/ui/NoteToolDialogs.cpp
+        src/ui/PianoRollScripts.cpp
         src/ui/MidiClipboard.cpp
+        src/ui/AudioClipboard.cpp
         src/ui/EventEditor.cpp
         src/ui/AudioEditor.cpp
         src/ui/AudioEditorTools.cpp
@@ -492,7 +543,11 @@ if(LYNX_BUILD_APP)
         src/ui/SpeechDialog.cpp
         src/ui/TempoTapper.cpp
         src/ui/LoopStarterWindow.cpp
+        src/ui/SimpleWorkflow.cpp
+        src/ui/FinishDock.cpp
         src/ui/HistoryPanel.cpp
+        src/ui/VersionsPanel.cpp
+        src/ui/PluginsOffPanel.cpp
         src/ui/MissingFilesDialog.cpp
         src/ui/SettingsDialog.cpp
         src/ui/SettingsPages.cpp
@@ -502,6 +557,8 @@ if(LYNX_BUILD_APP)
         src/ui/ClipProperties.cpp
         src/ui/PluginMonitorWindow.cpp
         src/ui/ClipGridComponent.cpp
+        src/ui/DetailView.cpp
+        src/ui/MidiToolsPanel.cpp
         src/ui/TouchKeyboard.cpp
         src/ui/QuickAddPalette.cpp
         src/ui/PluginPickerView.cpp
@@ -509,7 +566,8 @@ if(LYNX_BUILD_APP)
         src/ui/PluginPicker.cpp
         src/ui/CrashReporter.cpp
         src/ui/Updater.cpp
-        src/ui/StemExtract.cpp)
+        src/ui/StemExtract.cpp
+        src/ui/AudioToMidi.cpp)
     target_sources(LYNX PRIVATE src/Main.cpp ${LYNX_APP_SOURCES})
     target_include_directories(LYNX PRIVATE third_party/onnxruntime) # loaded at run time, never linked
 
@@ -550,6 +608,16 @@ if(LYNX_BUILD_APP)
         target_link_libraries(LYNX PRIVATE ${CMAKE_DL_LIBS})
     endif()
 
+    # the UI font on Linux and the BSDs (src/ui/Theme.cpp); Windows and macOS use their own and don't carry the files
+    if(UNIX AND NOT APPLE)
+        juce_add_binary_data(LynxFontData
+            HEADER_NAME LynxFontData.h
+            NAMESPACE lynxfontdata
+            SOURCES resources/fonts/OpenSans-Regular.ttf resources/fonts/OpenSans-Bold.ttf)
+        target_link_libraries(LYNX PRIVATE LynxFontData)
+        target_compile_definitions(LYNX PRIVATE LYNX_BUNDLED_FONT=1)
+    endif()
+
     target_link_libraries(LYNX
         PRIVATE
             lynx_core
@@ -558,8 +626,13 @@ if(LYNX_BUILD_APP)
             juce::juce_dsp
             juce::juce_opengl
         PUBLIC
-            juce::juce_recommended_config_flags
-            juce::juce_recommended_lto_flags)
+            juce::juce_recommended_config_flags)
+    # LTO for the shipped app; the Tests workflow builds without it (round speed185a: the LTO link was 7 of the 8.5
+    # minutes of a cached CI App build). -DLYNX_LTO=OFF
+    option(LYNX_LTO "Link the app with link-time optimisation" ON)
+    if(LYNX_LTO)
+        target_link_libraries(LYNX PUBLIC juce::juce_recommended_lto_flags)
+    endif()
 endif()
 
 # LYNX's own effects and instruments as VST3 / CLAP plugins for other hosts (round 180b, docs/PLUGIN_EXPORT.md). Off by

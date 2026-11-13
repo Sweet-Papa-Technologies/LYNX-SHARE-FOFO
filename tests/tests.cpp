@@ -1,5 +1,6 @@
-// Core tests (no JUCE). Usage: lynx_tests [folder-with-flp-files]
+// Core tests (no JUCE). Usage: lynx_tests [folder-with-flp-files] [--list] [--filter a,b] [--exclude a,b] [--shard i/n] [--weights f] [--times f] [--no-times]
 
+#include <algorithm>
 #include <optional>
 #include <atomic>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #if defined(__SSE__) || defined(_M_X64) || defined(__x86_64__) || defined(__aarch64__) || defined(_M_ARM64) // x86 SSE, or ARM64 through core/Simd.h (sse2neon)
+#include "core/Multilink.h"
 #include "core/Simd.h"
 #endif
 
@@ -31,6 +33,7 @@
 #include "core/DrumSynthLive.h"
 #include "core/Effects.h"
 #include "core/MixSuite.h"
+#include "core/StrikeShaper.h"
 #include "core/EmberClassic.h"
 #include "core/Effector.h"
 #include "core/FruityDelayBank.h"
@@ -45,11 +48,15 @@
 #include "core/ProjectContents.h"
 #include "core/FlPatcher.h"
 #include "core/Patcher.h"
+#include "core/Rack.h"
 #include "core/Layer.h"
 #include "core/XyController.h"
 #include "core/ControlSurface.h"
 #include "core/VoltageController.h"
 #include "core/FlSamplers.h"
+#include "core/Fpc.h"
+#include "core/FpcInstrument.h"
+#include "core/FpcEnvelope.h"
 #include "core/FlSynths.h"
 #include "core/Inflate.h"
 #include "core/WavPack.h"
@@ -57,12 +64,15 @@
 #include "core/FlWrapper.h"
 #include "core/FlPluginDb.h"
 #include "core/MissingFiles.h"
+#include "core/PianoKeys.h"
 #include "core/PianoRollTools.h"
 #include "core/EventEdit.h"
 #include "core/Preferences.h"
 #include "core/MidiSync.h"
+#include "core/ControllerSession.h"
 #include "core/History.h"
 #include "core/Gms.h"
+#include "core/GmsMobile.h"
 #include "core/PoiZone.h"
 #include "core/MiniSynth.h"
 #include "core/SimSynth.h"
@@ -125,6 +135,7 @@
 #include "core/DelphiMath.h"
 #include "core/LiveEventQueue.h"
 #include "core/RackRenderer.h"
+#include "core/PinOnTop.h"
 #include "core/MetronomeVoice.h"
 #include "engine/Transport.h"
 #include "core/Patcherize.h"
@@ -143,10 +154,13 @@
 #include "core/FixedBlock.h"
 #include "core/ParametricEqLinear.h"
 #include "core/Song.h"
+#include "core/Slicex.h"
 #include "core/NoteEdit.h"
+#include "core/ScaleSnap.h"
 #include "core/LiveRecordView.h"
 #include "core/Recorder.h"
 #include "core/KeyMap.h"
+#include "core/UndoKeys.h"
 #include "core/SortOnce.h"
 #include "core/RackOps.h"
 #include "core/PlaylistTrackOps.h"
@@ -425,6 +439,7 @@ TEST (flp_native_88_byte_playlist_items_with_clip_gain_and_fades)
         std::memcpy (&r[0x24], &fadeIn, 4);
         std::memcpy (&r[0x2C], &fadeOut, 4);
         std::memcpy (&r[0x34], &gain, 4);
+        r[0x38] = (std::uint8_t) ((fadeIn > 0.0f ? 1 : 0) | (fadeOut > 0.0f ? 2 : 0)); // manual fades (round 180d)
         const double stretch = 1.0;
         const std::int32_t minusOne = -1;
         std::memcpy (&r[0x40], &stretch, 8);
@@ -1456,19 +1471,29 @@ TEST (flp_real_files)
                         harmlessCompLoaded += c.modelParams.size() > (std::size_t) lynx::harmlessCompIndex + 1000 ? 1 : 0;
                     }
                     flKeysChannels += c.zones.size() == 30 && c.zones.front().path.find ("CHANGPIANO") != std::string::npos ? 1 : 0;
+                    // a Slicex channel is its own instrument since round 190l (no sampler slices): its regions are the
+                    // region records of its decks, counted here so the bar below still means "sliced channels import"
+                    std::size_t slicexRegions = 0;
+                    if (c.instrument == lynx::InstrumentKind::slicex)
+                        if (const auto state = lynx::slicex::parse (c.pluginState))
+                            for (const auto& deck : state->decks)
+                                slicexRegions += deck.empty() ? 0 : deck.regions.size();
+                    if (c.sampler.slices.size() >= 4 || slicexRegions >= 4)
+                        ++slicedChannels;
                     if (c.sampler.slices.size() >= 4)
                     {
-                        ++slicedChannels;
                         CHECK (std::is_sorted (c.sampler.slices.begin(), c.sampler.slices.end()));
                         CHECK (c.sampler.slices.back() < 1.0f);
                     }
                     dwExact += c.instrument == lynx::InstrumentKind::directwave ? 1 : 0;
-                    if (! c.zones.empty() && c.name.find (" - ") == std::string::npos)
+                    if (! c.zones.empty() && c.name.find (" - ") == std::string::npos && c.instrument != lynx::InstrumentKind::fpc)
                     {
                         ++dwChannels;
                         dwZones += (int) c.zones.size();
                     }
                     padChannels += c.name.find (" - ") != std::string::npos && c.instrument == lynx::InstrumentKind::sampler ? 1 : 0;
+                    if (c.instrument == lynx::InstrumentKind::fpc) // (round 190q: a kit on one channel; its pads that play)
+                        padChannels += (int) lynx::fpcChannelPads (c).size();
                 }
                 fpcKits += hasFpc;
                 // Maximus / Soundgoodizer become the exact engine (REA_rodada40); Vocodex carries SG.dat (and its
@@ -1551,7 +1576,8 @@ TEST (flp_real_files)
                     for (const auto& n : pat.notes)
                     {
                         CHECK (n.channel >= 0 && n.channel < (int) full.channels.size());
-                        padNotes += full.channels[(std::size_t) n.channel].name.find (" - ") != std::string::npos ? 1 : 0;
+                        padNotes += full.channels[(std::size_t) n.channel].name.find (" - ") != std::string::npos
+                                    || full.channels[(std::size_t) n.channel].instrument == lynx::InstrumentKind::fpc ? 1 : 0;
                     }
             }
 
@@ -2929,7 +2955,7 @@ TEST (fl_fpc_cycle_layers_and_slicex_master_volume)
     state.push_back (5);
     for (char ch : std::string ("x.wav"))
         state.push_back ((std::uint8_t) ch);
-    const auto sliced = lynx::slicex (state);
+    const auto sliced = lynx::slicexSample (state);
     CHECK (sliced.has_value() && sliced->path == "x.wav");
     CHECK (sliced && std::abs (sliced->gain - (float) ((std::pow (11.0, 1.25) - 1.0) / 10.0)) < 1e-5f);
 }
@@ -6685,6 +6711,26 @@ TEST (translations_embedded_table_is_up_to_date)
     CHECK (files == (int) std::size (lynx::i18n::data::tables));
 }
 
+TEST (translations_no_value_is_a_python_dict)
+{
+    // a value written as a Python dict ("{'de': '...', 'es': ...}", 177a's menu slice) reaches the users verbatim:
+    // each table holds its own language's text only
+    using namespace i18ntest;
+    int bad = 0;
+    for (const auto& entry : std::filesystem::directory_iterator ("resources/i18n"))
+        if (entry.path().extension() == ".txt")
+        {
+            std::vector<std::string> unused;
+            for (const auto& [key, value] : parseTable (readFile (entry.path()), unused))
+                if (value.rfind ("{'", 0) == 0 || value.find ("': '") != std::string::npos)
+                {
+                    ++bad;
+                    std::printf ("  %s: \"%s\" holds a dict\n", entry.path().filename().string().c_str(), key.c_str());
+                }
+        }
+    CHECK (bad == 0);
+}
+
 TEST (translations_every_language_covers_the_reference_table)
 {
     // every key of pt-BR.txt (the reference table) exists, translated, in every other language; keys just added to
@@ -7204,18 +7250,204 @@ TEST (three_osc_host_hq_render_box_filters_aliasing_shapes)
     CHECK (sineEnergy > 1.0 && sineDiff == 0.0); // a sine does not
 }
 
+namespace
+{
+// The runner's options (round speed185a). They choose WHICH tests run and how the output looks, never what a test checks.
+//   [folder]           the FL Data folder (realFlpDir), as before
+//   --list             print the selected test names, one per line, and run nothing
+//   --filter a,b       run only the tests whose name contains one of these; several --filter options must all match
+//                      (the LYNX_TEST variable works as before, as one more --filter)
+//   --exclude a,b      skip the tests whose name contains one of these
+//   --shard i/n        run only shard i of n (1-based): the selected tests split into n disjoint sets that together
+//                      cover them all. With --weights the sets are balanced by time, otherwise test k goes to k mod n.
+//   --weights file     "<name> <ms>" lines (--times output) used to balance the shards; unknown tests weigh 50 ms
+//   --times file       write "<name> <ms>" per test that ran
+//   --no-times         no per-test time lines
+// Output: each test's name on its own line (as before), its FAILED lines, then "  time <ms> ms"; at the end the slowest
+// tests and the unchanged "N checks, M failures" line. stdout is line-buffered so a long test never looks hung.
+struct RunnerOptions
+{
+    bool list = false, times = true;
+    std::vector<std::vector<std::string>> filters; // (each must match: one of its names)
+    std::vector<std::string> excludes;
+    int shard = 0, shards = 1;
+    std::string weightsFile, timesFile;
+};
+
+std::vector<std::string> splitCommas (const std::string& s)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s + ",")
+        if (c == ',')
+        {
+            if (! cur.empty())
+                out.push_back (cur);
+            cur.clear();
+        }
+        else
+            cur += c;
+    return out;
+}
+
+bool parseRunnerOptions (int argc, char** argv, RunnerOptions& o)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string a = argv[i];
+        auto value = [&] () -> std::optional<std::string> {
+            if (i + 1 >= argc)
+                return std::nullopt;
+            return std::string (argv[++i]);
+        };
+        if (a == "--list")
+            o.list = true;
+        else if (a == "--no-times")
+            o.times = false;
+        else if (a == "--filter" || a == "--exclude" || a == "--shard" || a == "--weights" || a == "--times")
+        {
+            const auto v = value();
+            if (! v)
+            {
+                std::fprintf (stderr, "lynx_tests: %s needs a value\n", a.c_str());
+                return false;
+            }
+            if (a == "--filter")
+                o.filters.push_back (splitCommas (*v));
+            else if (a == "--exclude")
+                for (auto& f : splitCommas (*v)) o.excludes.push_back (f);
+            else if (a == "--weights")
+                o.weightsFile = *v;
+            else if (a == "--times")
+                o.timesFile = *v;
+            else
+            {
+                int k = 0, n = 0;
+                char tail = 0;
+                if (std::sscanf (v->c_str(), "%d/%d%c", &k, &n, &tail) != 2 || n < 1 || k < 1 || k > n)
+                {
+                    std::fprintf (stderr, "lynx_tests: --shard wants i/n with 1 <= i <= n, not %s\n", v->c_str());
+                    return false;
+                }
+                o.shard = k - 1;
+                o.shards = n;
+            }
+        }
+        else if (a.size() > 2 && a.compare (0, 2, "--") == 0)
+        {
+            std::fprintf (stderr, "lynx_tests: unknown option %s\n", a.c_str());
+            return false;
+        }
+        else
+            realFlpDir = a;
+    }
+    if (const char* only = std::getenv ("LYNX_TEST")) // run only the tests whose name contains this
+        o.filters.push_back ({ only });
+    return true;
+}
+
+// which of the selected tests (indices into `names`) belong to shard o.shard: a partition of all of them over o.shards
+std::vector<std::size_t> shardOf (const std::vector<const char*>& names, const RunnerOptions& o)
+{
+    std::vector<std::size_t> all (names.size());
+    for (std::size_t k = 0; k < all.size(); ++k)
+        all[k] = k;
+    if (o.shards <= 1)
+        return all;
+    std::map<std::string, double> weight;
+    if (! o.weightsFile.empty())
+    {
+        std::ifstream in (o.weightsFile);
+        std::string name;
+        double ms = 0.0;
+        while (in >> name >> ms)
+            weight[name] = ms;
+    }
+    std::vector<int> owner (names.size(), 0);
+    if (weight.empty())
+        for (std::size_t k = 0; k < names.size(); ++k)
+            owner[k] = (int) (k % (std::size_t) o.shards);
+    else
+    {
+        // longest first onto the least loaded shard (ties: lower index), deterministic for a given list and file
+        auto order = all;
+        auto w = [&] (std::size_t k) { const auto it = weight.find (names[k]); return it == weight.end() ? 50.0 : it->second; };
+        std::stable_sort (order.begin(), order.end(), [&] (std::size_t a, std::size_t b) { return w (a) > w (b); });
+        std::vector<double> load ((std::size_t) o.shards, 0.0);
+        for (auto k : order)
+        {
+            const auto s = (std::size_t) (std::min_element (load.begin(), load.end()) - load.begin());
+            owner[k] = (int) s;
+            load[s] += w (k);
+        }
+    }
+    std::vector<std::size_t> mine;
+    for (auto k : all)
+        if (owner[k] == o.shard)
+            mine.push_back (k); // (in registry order: a shard runs its tests in the usual order)
+    return mine;
+}
+} // namespace
+
 int main (int argc, char** argv)
 {
-    if (argc > 1)
-        realFlpDir = argv[1];
+    std::setvbuf (stdout, nullptr, _IOLBF, 0);
+    RunnerOptions opt;
+    if (! parseRunnerOptions (argc, argv, opt))
+        return 2;
 
-    const char* only = std::getenv ("LYNX_TEST"); // run only the tests whose name contains this
-    for (auto& [name, fn] : registry())
+    auto& tests = registry();
+    std::vector<const char*> names;
+    std::vector<std::size_t> selected;
+    for (std::size_t k = 0; k < tests.size(); ++k)
     {
-        if (only != nullptr && std::strstr (name, only) == nullptr)
+        const char* name = tests[k].first;
+        auto has = [name] (const std::string& part) { return std::strstr (name, part.c_str()) != nullptr; };
+        if (! std::all_of (opt.filters.begin(), opt.filters.end(), [&] (const auto& any) { return std::any_of (any.begin(), any.end(), has); }))
             continue;
+        if (std::any_of (opt.excludes.begin(), opt.excludes.end(), has))
+            continue;
+        names.push_back (name);
+        selected.push_back (k);
+    }
+    const auto mine = shardOf (names, opt);
+    if (opt.list)
+    {
+        for (auto k : mine)
+            std::printf ("%s\n", names[k]);
+        return 0;
+    }
+
+    std::vector<std::pair<double, const char*>> took;
+    for (auto k : mine)
+    {
+        auto& [name, fn] = tests[selected[k]];
         std::printf ("%s\n", name);
+        const auto start = std::chrono::steady_clock::now();
         fn();
+        const auto ms = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - start).count();
+        took.emplace_back (ms, name);
+        if (opt.times)
+            std::printf ("  time %.0f ms\n", ms);
+    }
+    if (! opt.timesFile.empty())
+    {
+        std::ofstream out (opt.timesFile);
+        for (auto& [ms, name] : took)
+            out << name << ' ' << (long long) std::llround (ms) << '\n';
+    }
+    if (opt.times && took.size() > 1)
+    {
+        double total = 0.0;
+        for (auto& t : took)
+            total += t.first;
+        auto slow = took;
+        std::sort (slow.begin(), slow.end(), [] (const auto& a, const auto& b) { return a.first > b.first; });
+        slow.resize (std::min<std::size_t> (slow.size(), 15));
+        std::printf ("\n  %zu tests in %.1f s%s; slowest:\n", took.size(), total / 1000.0,
+                     opt.shards > 1 ? (" (shard " + std::to_string (opt.shard + 1) + "/" + std::to_string (opt.shards) + ")").c_str() : "");
+        for (auto& [ms, name] : slow)
+            std::printf ("  %8.1f s  %s\n", ms / 1000.0, name);
     }
 
     std::printf ("\n%d checks, %d failures\n", checks, failures);
@@ -16183,6 +16415,7 @@ TEST (level_audit_demo_imports_round89)
 #include "UiLook90Tests.inc"
 #include "UiFl104Tests.inc"
 #include "DialogsTests84.inc"
+#include "DockTests188.inc"
 #include "SubstituteTests.inc"
 #include "MixSuiteTests96.inc"
 #include "PanelsTests105.inc"
@@ -16404,6 +16637,13 @@ TEST (plugin_layout_options_match_the_engine_values)
 #include "Parity150bTests.inc"
 #include "Parity152Tests.inc"
 #include "Tp172dTests.inc"
+#include "Verb183bEchoformTests.inc"
+#include "Verb183bEpochTests.inc"
+#include "Verb183bAtriumTests.inc"
+#include "Verb183bPlateTests.inc"
+#include "Verb183bHaloTests.inc"
+#include "Verb183bNebulaTests.inc"
+#include "Verb183bTests.inc"
 #include "Parity152aTests.inc"
 #include "Parity152bTests.inc"
 #include "Parity152cTests.inc"
@@ -16982,6 +17222,7 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Rack165Tests.inc"  // (round 165f-rack; likewise)
 #include "Visual164Tests.inc"
 #include "Visual165Tests.inc"
+#include "Dance190baTests.inc"
 #include "Patcher164fTests.inc"
 #include "Markers165Tests.inc"
 #include "PerfMode165Tests.inc"
@@ -17024,14 +17265,17 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Round166eTests.inc"
 #include "Issue15Tests.inc"
 #include "Issue14bugsTests.inc"
+#include "Mute190yTests.inc"
 #include "Left167Tests.inc"
 #include "Wheel173dTests.inc"
 #include "PoiZoneWheels173dTests.inc"
 #include "Tune166cTests.inc"
+#include "TuneBreath190bbTests.inc"
 #include "Update166bTests.inc"
 #include "Emphasis167fTests.inc"
 #include "Dvs167Tests.inc"
 #include "EdisonScript167Tests.inc"
+#include "PianoRollScript190Tests.inc"
 #include "Deverb167Tests.inc"
 #include "Score167Tests.inc"
 #include "Ntt167Tests.inc"
@@ -17042,8 +17286,12 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Session168aTests.inc"
 #include "Live169bTests.inc"
 #include "Live169jTests.inc"
+#include "Live190ahTests.inc"
+#include "Remote190aiTests.inc"
 #include "StemSplitTests.inc"
+#include "AudioToMidi189bTests.inc"
 #include "Zoom167tTests.inc"
+#include "PianoKeys190jTests.inc"
 #include "Proll168gTests.inc"
 #include "Rea168eTests.inc"
 #include "Design168nTests.inc"
@@ -17051,15 +17299,25 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "FirstRun167vTests.inc"
 #include "LoopStarter168bTests.inc"
 #include "Rec168kTests.inc"
+#include "FlPaths124Tests.inc"
+#include "Auto125Tests.inc"
 #include "Rec170dTests.inc"
 #include "Rec177dTests.inc"
+#include "Pain177dTests.inc"
+#include "Mixer177dTests.inc"
+#include "Edit177dTests.inc"
+#include "Patterns177dTests.inc"
 #include "Issue32Tests.inc"
+#include "Keys117Tests.inc"
+#include "Pedal187aTests.inc"
+#include "Sc109Tests.inc"
 #include "WrapperMidi181cTests.inc"
+#include "Keys96Tests.inc"
 #include "Mono168lTests.inc"
 #include "MixPre167qTests.inc"
 #include "Design168rTests.inc"
 #include "Playlist168fTests.inc"
-#include "RecFold167qTests.inc"
+#include "RecNoFold126Tests.inc"
 #include "LoopWrap167qTests.inc"
 #include "Sel168tTests.inc"
 #include "Gap169kTests.inc"
@@ -17071,6 +17329,7 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Speech168bTests.inc"
 #include "Design168pTests.inc"
 #include "Typing168tTests.inc"
+#include "TypingPlace190bmTests.inc"
 #include "GrossBeat168mTests.inc"
 #include "Maximus168xTests.inc"
 #include "Rec168xTests.inc"
@@ -17112,18 +17371,132 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Audit173d3Tests.inc"
 #include "Vocodex173d3Tests.inc"
 #include "Fluid174eTests.inc"
+#include "Comp177Tests.inc"
 #include "AlsImport175aTests.inc"
+#include "FlmImport182cTests.inc"
+#include "FlmEngines190uTests.inc"
+#include "FlmNotes190abTests.inc"
+#include "FlmGmsynth190abTests.inc"
+#include "FlmImport187dTests.inc"
+#include "FlmImport188fTests.inc"
+#include "FlmImport188hTests.inc"
+#include "FlmImport189hTests.inc"
+#include "FlmImport189hATests.inc"
+#include "FlmImport189hBTests.inc"
+#include "FlmImport189hCTests.inc"
 #include "Bridge176aTests.inc"
 #include "Issues178aTests.inc"
 #include "Mixer177aTests.inc"
 #include "ClipLauncher181aTests.inc"
+#include "DetailView183aTests.inc"
+#include "Als181cTests.inc"
+#include "Merge180cTests.inc"
+#include "Slicer180cTests.inc"
+#include "Slicer190fTests.inc"
+#include "Fpc190mTests.inc"
+#include "Fpc190qTests.inc"
+#include "Fpc190zTests.inc"
 #include "PluginExport180bTests.inc"
 #include "FlExport180dTests.inc"
+#include "FlpMute182eTests.inc"
+#include "FlpPeak182eTests.inc"
+#include "FlpPatcherSc182eTests.inc"
+#include "FlFades180dTests.inc"
+#include "Stretch180dTests.inc"
+#include "Timing180dTests.inc"
+#include "FlpPdc182eTests.inc"
+#include "Pdc188eTests.inc"
 #include "Mixer177a2Tests.inc"
 #include "Mixer177a3Tests.inc"
+#include "Mixer186cTests.inc"
 #include "Mixer177a4Tests.inc"
 #include "Sc177bTests.inc"
+#include "Auto177bTests.inc"
+#include "Lanes177bTests.inc"
+#include "Lfo177bTests.inc"
+#include "Mod177bTests.inc"
+#include "UiFont179aTests.inc"
+#include "Multilink177bTests.inc"
 #include "Issue97Tests.inc"
+#include "SimpleTracks184aTests.inc"
+#include "SimpleChooser184aTests.inc"
+#include "FlStateWrite184aTests.inc"
+#include "MasterLooks189kTests.inc"
+#include "LayoutStyle184aTests.inc"
+#include "Rack116Tests.inc"
+#include "Issue116DetachedTests.inc"
+#include "Trial187bTests.inc"
+#include "ProjectKey184aTests.inc"
+#include "KeyGuess184aTests.inc"
+#include "Render186bTests.inc"
+#include "Playlist189eTests.inc"
+#include "Playlist189gTests.inc"
+#include "Playlist189iTests.inc"
+#include "Playlist189lTests.inc"
+#include "Playlist189nTests.inc"
+#include "PlaylistKeys190agTests.inc"
+#include "Rack183cTests.inc"
+#include "Gamepad184aTests.inc"
+#include "ExportBundle184aTests.inc"
+#include "MultiOut188dTests.inc"
+#include "FxConn189jTests.inc"
+#include "Strike189dTests.inc"
+#include "NoteChance187cTests.inc"
+#include "MidiTools190oTests.inc"
+#include "MidiTools190sTests.inc"
+#include "MidiTools190aaTests.inc"
+#include "MidiTools190aa2Tests.inc"
+#include "Notes188gTests.inc"
+#include "Layer190bTests.inc"
+#include "PlugLevel190adTests.inc"
+#include "Undo190bTests.inc"
+#include "TrackMeters190wTests.inc"
+#include "Locator190wTests.inc"
+#include "Bugs190cTests.inc"
+#include "Parity190vTests.inc"
+#include "Parity190arFetTests.inc"
+#include "Parity190arApexTests.inc"
+#include "Slicex190lTests.inc"
+#include "Parity190alTests.inc"
+#include "Slicex190hTests.inc"
+#include "AudioX190aqTests.inc"
+#include "Parity190arTranslateTests.inc"
+#include "Surge190xTests.inc"
+#include "Issue114Tests.inc"
+#include "Slicex190rTests.inc"
+#include "Slicex190acTests.inc"
+#include "Slicex190ajTests.inc"
+#include "ScaleSnap190anTests.inc"
+#include "TruePeak190amTests.inc"
+#include "Loudness190amTests.inc"
+#include "UsedOnly190amTests.inc"
+#include "Extras190amTests.inc"
+#include "Reload190aoTests.inc"
+#include "Pin190aoTests.inc"
+#include "Velocity190aoTests.inc"
+#include "Audition190aoTests.inc"
+#include "Versions190apTests.inc"
+#include "core/PluginHold.h"
+#include "PluginsOff190apTests.inc"
+#include "ExportSections190apTests.inc"
+#include "DirectWave190ajTests.inc"
+#include "Similar190asTests.inc"
+#include "Controller190awTests.inc"
+#include "ControllerProfiles190awTests.inc"
+#include "Bugs190axInsert6Tests.inc"
+#include "Snap190axTests.inc"
+#include "PluginState190azTests.inc"
+#include "Parity190arTests.inc"
+#include "Mpe190bbTests.inc"
+#include "Mpe190bbLiveTests.inc"
+#include "PluginDb190baTests.inc"
+#include "Freeze190ayTests.inc"
+#include "QaFix190bjTests.inc"
+#include "Fl190bfTests.inc"
+#include "ShotScale190biTests.inc"
+#include "QaFix190bjATests.inc"
+#include "Demo190bmTests.inc"
+#include "DanceFix190cjTests.inc"
 
 TEST (live_playback_reactivity)
 {

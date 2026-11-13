@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/Arpeggiator.h"
@@ -20,8 +21,10 @@
 #include "core/Effects.h"
 #include "core/HardwareOutput.h"
 #include "core/Instruments.h"
+#include "core/TimeStretch.h"
 #include "core/LiveEventQueue.h"
 #include "core/LiveInput.h"
+#include "core/LowLatency.h"
 #include "core/Meters.h"
 #include "core/Pdc.h"
 #include "core/ClipLauncher.h"
@@ -68,6 +71,25 @@ struct RackState
     static constexpr int maxAutomations = 1024;
     std::vector<std::vector<int>> automationClips; // per automation: clips in the Playlist
     std::vector<char> zoneAutomations;             // per automation: it has clips in the performance zone
+    // round 177b: automation lanes (PlaylistTrack::lanes): the lane automations that play, and per lane the automations
+    // of the same target that have clips (where one of their clips plays, it wins over the lane)
+    struct LanePlay
+    {
+        int automation = -1;
+        std::vector<int> clipPeers;
+        std::vector<std::pair<int, int>> clipSlots; // peer -> the slot holding its value, for peers that share one (issue #97)
+    };
+    std::vector<LanePlay> laneAutomations;
+    // round 177b: modulator routings — each drives its own slot (bound last: it wins) from the target's value, or the
+    // value of the automation that drives it, plus depth × the modulator
+    struct ModPlay
+    {
+        int slot = -1, source = -1; // its slot; the slot that drove the target before (-1: none)
+        float base = 0.5f;          // the target's own value
+        int modulator = 0;
+        float depth = 0.0f;
+    };
+    std::vector<ModPlay> modRoutes;
     // Several automations with clips on one target play as one (issue #97, FL's rule: docs/analise/REA_rodada177b.md):
     // the last of them holds the slot and lists them all here (ascending; empty = it plays alone); the others are
     // marked as followers: they bind nothing and compute nothing.
@@ -134,7 +156,17 @@ struct RackState
     std::vector<char> bypassWhenIdle; // [track]
     bool anyBypassWhenIdle = false;
 
-    // Current latencies of instruments and effects, in the same layout as `latencies`.
+    // "Low latency while recording" (LYNX extra, round 190aq, core/LowLatency.h): the inserts whose latency-adding
+    // slots are bypassed in this snapshot (the engine's choice; empty = none, as in every export) and, made with the PDC
+    // plan, those slots: active slots of these inserts whose latency is above 0. They are skipped by the renderer and
+    // count as 0 in the plan. The song itself is not changed.
+    std::vector<char> lowLatencyTracks;                 // [track]
+    std::vector<lowlatency::SlotMask> lowLatencySlots;  // [track] bit s = slot s is bypassed
+    // The latency of each bypassed slot when the plan was made ([track][slot], 0 elsewhere), for the UI.
+    std::vector<std::vector<int>> lowLatencySaved;
+
+    // Current latencies of instruments and effects, in the same layout as `latencies` (0 for the slots bypassed for
+    // low latency).
     std::vector<int> currentLatencies() const;
     void buildPdc (const RackState* previous);
 
@@ -165,6 +197,7 @@ struct RackState
         float level = 1.0f;
         int tap = -1;  // ≥ 0: a Fruity Send slot's signal (sendTaps[tap]) instead of the source's output
         int automation = -1; // the route's level automation (mixerSend, issue #12): its slot; -1 = none
+        bool pre = false;    // a pre-fader send (MixerSend::pre): `tap` is the source's pre-fader signal (preTap)
     };
     std::vector<std::vector<MixerInput>> mixerInputs; // [track]; [0] = Master
 
@@ -177,6 +210,12 @@ struct RackState
     };
     std::vector<SendTap> sendTaps;
     std::vector<std::vector<int>> slotTap; // [track][slot · maxSlotSends + output]: index into sendTaps, or −1
+    // the hosted effects' Connections (round 189j): [track][slot], only for tracks with a routed one (else empty)
+    std::vector<std::vector<SlotConnections>> slotConnections;
+    // Pre-fader sends (LYNX extra, round 190aq): [track] the tap holding the insert's signal before its fader (after
+    // its effects and EQ, silenced by its mute), or −1 — one per insert with a pre-fader send, in sendTaps with slot −1.
+    // No tap left (maxSendTaps): that insert's pre-fader sends play post-fader.
+    std::vector<int> preTap;
     std::vector<std::vector<int>> mixerLayers;        // inserts with no dependencies among them, in order
     // "Allow threaded processing" off (PluginRef::threaded, REA round 134): those channels / inserts always run on the
     // calling (audio) thread, the others may go to the workers. Same layers as mixerLayers.
@@ -251,15 +290,31 @@ struct RackState
     using PluginEffectFactory = std::function<std::shared_ptr<Effect> (const PluginRef&, double sampleRate)>;
 
     // Sample stretched without changing pitch (ratio = new / original duration); cached in the app.
-    using StretchedSampleProvider = std::function<std::shared_ptr<const SampleData> (const std::string& path, double ratio, StretchMethod method, double semitones)>;
+    // `map`: the channel's warp map (core/TimeStretch warpStretchMap; empty = one ratio)
+    using StretchedSampleProvider = std::function<std::shared_ptr<const SampleData> (const std::string& path, double ratio, StretchMethod method,
+                                                                                     double semitones, const StretchMap& map)>;
+
+    // A channel's precomputed span (its region after its precomputed effects and Trim) stretched by `ratio`, cached in the
+    // app by (path, variantKey, ratio, method): FL stretches that span, not the whole file (round 180d). Unset: stretched
+    // here, uncached (tests).
+    using StretchedSpanProvider = std::function<std::shared_ptr<const SampleData> (const std::string& path, const std::string& variantKey,
+                                                                                  const std::shared_ptr<const SampleData>& span, double ratio,
+                                                                                  StretchMethod method, double semitones)>;
 
     struct Factories
     {
         SampleProvider samples;
         StretchedSampleProvider stretchedSamples;
+        StretchedSpanProvider stretchedSpans;
         PluginInstrumentFactory pluginInstruments;
         PluginEffectFactory pluginEffects;
+        // Round 190ap ("Open without third-party plugins"): true for a plugin whose slots must be created anew in this
+        // build although the slot did not change (a plugin switched back on: its slot holds the silent placeholder of
+        // when it was off). A Patcher that holds such a plugin is built anew as a whole. Unset: nothing is forced.
+        std::function<bool (const PluginRef&)> rebuildPlugin;
         launcher::Runtime* clipLauncher = nullptr; // (round 181a) only the engine's own state, and only with a grid
+        // round 190aq: the inserts whose latency-adding slots are bypassed (lowlatency::bypassTracks); empty = none
+        std::vector<char> lowLatencyTracks;
     };
 
     // Builds the next state reusing the instruments from `previous` when the
@@ -275,7 +330,25 @@ struct RackState
                                                    const Factories& factories);
 };
 
+// An audio clip's own audio as its channel's instrument plays it (round 189l, FL's Make unique as sample): the clip's
+// pitch, stretch and direction are rendered in, at unity (no clip or channel volume, pan, fades or declick), for the
+// clip's length. The channel's own processing (precomputed effects, its pitch and time stretch, envelopes) is in it
+// too, and the channel copy that plays the result applies it again. Empty when the clip isn't an audio clip or its
+// channel's instrument can't be built. UI thread (allocates).
+struct ClipAudio
+{
+    double sampleRate = 44100.0;
+    std::vector<float> left, right;
+};
+ClipAudio renderClipAudio (const Song& song, std::size_t clipIndex, double sampleRate, const RackState::Factories& factories);
+
 class WorkerPool;
+
+// Round 190ao (reload a crashed plugin): the next RackState::build from `shape` makes this channel's / mixer slot's
+// hosted plugin again instead of keeping its running instance; nothing else in the shape changes and the song is not
+// touched. False when that channel / slot is not a hosted plugin of the shape.
+bool forgetHostedPlugin (RackState& shape, int channel);
+bool forgetHostedPlugin (RackState& shape, int track, int slot);
 
 // Whether a parallel container slot (FL's Patcher) can keep its built effect: same branches, children and links.
 bool sameContainer (const EffectSlot& a, const EffectSlot& b);
@@ -384,6 +457,14 @@ public:
         clickRight = right != nullptr ? right : left;
         clickTrack = track;
     }
+    // Round 188b (the plugins' side-chain bus): this audio goes into `track`'s input, as the metronome input does into its
+    // own track. nullptr = none. Same thread as process(); the pointers cover the block.
+    void setSideInput (const float* left, const float* right, int track) noexcept
+    {
+        sideLeft = left;
+        sideRight = right != nullptr ? right : left;
+        sideTrack = track;
+    }
 
     // Allocates the mixer buffers: call off the audio thread.
     // Blocks larger than maxBlockSize are processed in pieces.
@@ -432,10 +513,16 @@ public:
     // (RackState::slotsOfTarget) are not driven by automation clips / pattern events; the control's own value
     // plays. UI thread writes, audio thread reads (relaxed: a block late at worst).
     void setOverriddenSlots (const std::vector<int>& slots) noexcept;
+    // FL (issue #125, [EXEC] round 185b): a control the user moves (its knob, a linked controller) is no longer driven by
+    // its automation until playback starts again, stopped or playing. The slots set here are released that way; the
+    // renderer forgets them itself when the transport starts (and the engine its list of moved targets).
+    void setReleasedSlots (const std::vector<int>& slots) noexcept;
     bool isSlotOverridden (int slot) const noexcept
     {
-        return slot >= 0 && slot < RackState::maxAutomations
-            && (overridden[(std::size_t) slot / 32].load (std::memory_order_relaxed) & (1u << ((unsigned) slot % 32))) != 0;
+        if (slot < 0 || slot >= RackState::maxAutomations)
+            return false;
+        const auto bit = 1u << ((unsigned) slot % 32);
+        return ((overridden[(std::size_t) slot / 32].load (std::memory_order_relaxed) | released[(std::size_t) slot / 32].load (std::memory_order_relaxed)) & bit) != 0;
     }
 
     // Tempo used in the last block (changes with tempo automation). The transport advances with it.
@@ -457,6 +544,7 @@ private:
                        float* left, float* right, MeterBank* meters) noexcept;
     void renderChannel (const RackState& state, int channel, int n) noexcept;
     void processTrack (const RackState& state, int track, int n, MeterBank* meters) noexcept;
+    void runSilencedTrack (const RackState& state, int track, int n, const MixerMatrix& level, MeterBank* meters, bool cutEffectSends) noexcept;
     void pullInputs (const RackState& state, int track, int n) noexcept;
     void updatePdcBypass (const RackState& state, bool playing) noexcept;
     void deliverToEffects (const RackState& state, const NoteEvent& e) noexcept; // (round 162)
@@ -464,7 +552,10 @@ private:
     float* trackScratch (int track, int side) noexcept;
     void runEffects (const RackState& state, int track, int n) noexcept;
     void setSidechain (const RackState& state, const EffectSlot& slot, Effect& effect, int track) noexcept;
+    void connect (const RackState& state, const SlotConnections& c, Effect& effect, int track, const float* l, const float* r) noexcept;
     void updateAutomation (const RackState& state, double startTick) noexcept;
+    void updateModulators (const RackState& state, double tick, int numSamples) noexcept; // round 177b
+    double modSeconds = 0.0; // the free-running modulators' clock
     // ticks from `tick` to the next pattern event (or pattern clip edge) that changes a lane's value; +inf if none
     static double ticksToNextEvent (const RackState& state, double tick) noexcept;
     // bindings from this automation slot on (andLive: and those of live controllers, the links)
@@ -510,13 +601,23 @@ private:
     bool automatedBendReset = false;
     std::array<std::atomic<std::uint32_t>, RackState::maxAutomations / 32> overridden {}; // touched while recording
     std::atomic<bool> anyOverridden { false };
+    std::array<std::atomic<std::uint32_t>, RackState::maxAutomations / 32> released {}; // moved by the user (issue #125)
+    std::atomic<bool> anyReleased { false };
+    bool releaseWasPlaying = false; // (audio thread) the last chunk played: a start clears `released`
     void clearOverriddenValues() noexcept;
     std::array<MixerMatrix, maxMixerTracks> lastTrackGain {}; // the level matrix of the previous block, for the ramp
     // round 168x: the "Post level and panning" recording tap's own ramp (the insert's level matrix without the mute)
     std::array<MixerMatrix, maxMixerTracks> lastTapGain {};
+    // issue #144: the fader ramp of a silenced insert's meter (NaN: none yet)
+    std::array<MixerMatrix, maxMixerTracks> lastMeterGain {};
     std::array<char, maxMixerTracks> trackActive {};        // the track output has sound in this block
     std::vector<float> tapBuffers;                          // RackState::maxSendTaps * 2 * chunkCapacity
     std::array<char, RackState::maxSendTaps> tapActive {};  // the Fruity Send slot sent something this block
+    // round 190aq: the mute ramp of each insert's pre-fader send signal (1 = heard, 0 = muted; NaN: none yet)
+    std::array<float, maxMixerTracks> lastPreGain {};
+    // round 190aq: slots skipped for low latency last block; back in the chain they start from a reset state
+    // (their look-ahead buffers hold what played before the bypass)
+    std::vector<char> lowLatencySkipped; // maxMixerTracks * maxEffectSlots
     float* tapBuffer (int tap, int side) noexcept;
     std::array<char, maxChannels> channelSilent {};          // channel skipped in this chunk (idle, no notes)
     std::array<NoteMask, maxChannels> heldNotes {};          // keys held on each channel (effects that follow notes: LYNX Tune)
@@ -568,10 +669,14 @@ private:
     const float* clickLeft = nullptr;
     const float* clickRight = nullptr;
     int clickTrack = 0;
+    const float* sideLeft = nullptr;
+    const float* sideRight = nullptr;
+    int sideTrack = -1;
     const EffectParams* overrideParams = nullptr;
     int overrideTrack = -1, overrideSlot = -1;
     int metronomeTarget (const RackState& state) const noexcept;
     void mixMetronome (const RackState& state, int track, int n) noexcept;
+    void mixSideInput (const RackState& state, int track, int n) noexcept;
     void mixLiveInput (const RackState& state, bool playing, int n, MeterBank* meters = nullptr) noexcept;
     void mixLiveInputTrack (const RackState& state, int track, bool recording, bool playing, int n, MeterBank* meters = nullptr) noexcept;
     // the task graph run (RackState::graphOk): per chunk, each task's unfinished predecessors and the ready queue

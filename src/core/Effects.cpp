@@ -1,5 +1,6 @@
 #include "core/Patcher.h"
 #include "core/Effects.h"
+#include "core/Rack.h"
 #include "core/FormulaController.h"
 #include "core/RhythmPan.h"
 #include "core/MixSuite.h"
@@ -17,6 +18,7 @@
 #include "core/EmphasisFx.h"
 #include "core/EmphasizerFx.h"
 #include "core/FlLegacyFx.h"
+#include "core/PocketFx.h"
 #include "core/FreqShifterFl.h"
 #include "core/LowLifterFl.h"
 #include "core/Vocodex.h"
@@ -203,7 +205,18 @@ private:
 class Compressor final : public Effect
 {
 public:
-    void prepare (double sr) noexcept override { sampleRate = sr; vintage.prepare (sr); reset(); }
+    // `initial` (may be null): the slot's parameters, so the voicing's latency is known after prepare(), before the
+    // first block (issue #113: a Patcher plans its delay compensation right after building its nodes)
+    explicit Compressor (const EffectParams* initial = nullptr) : vintageAtStart (initial != nullptr && (*initial)[8] >= 0.5f) {}
+
+    void prepare (double sr) noexcept override
+    {
+        sampleRate = sr;
+        vintage.prepare (sr);
+        reset();
+        if (vintageAtStart)
+            latency.store (vintage.latency(), std::memory_order_relaxed);
+    }
     void reset() noexcept override
     {
         envelopeDb = 0.0f;
@@ -294,6 +307,17 @@ public:
         const bool expand = ratio < 1.0f;
         const auto slope = expand ? 1.0f / ratio - 1.0f : 1.0f - 1.0f / ratio; // dB of change per dB over the threshold
         const auto thresholdGain = dbToGain (threshold);
+        // round 190ar: the classic voicing's FET law (off by default: nothing changes for existing projects). Measured
+        // black-box on FET-style compressors' tone-burst probes: a 5 dB knee, and a recovery that is not one time
+        // constant — deep reduction comes back fast, the last decibels slowly. Per second the reduction G (dB) falls by
+        // G / tail + G² / (10 dB · release), tail = the release time (at most 2.7 s): the classic exponential for
+        // small reductions, 2 × as fast at 10 dB, 3 × at 20 dB.
+        const bool fet = params[19] >= 0.5f && ! expand;
+        const auto fetReleaseS = (rc ? rcReleaseMs (params[17]) : compReleaseMs (params[3])) * 0.001;
+        const auto fetTail = (float) (1.0 / (std::min (fetReleaseS, 2.7) * sampleRate));
+        const auto fetDeep = (float) (1.0 / (10.0 * fetReleaseS * sampleRate));
+        constexpr float fetKnee = 5.0f;
+        const auto fetKneeGain = dbToGain (threshold - 0.5f * fetKnee);
         const auto sidechain = useSidechain;
         useSidechain = false;
         float peakIn = 0.0f, peakOut = 0.0f, maxGr = 0.0f;
@@ -309,11 +333,28 @@ public:
             // With sidechain, the detector listens to the other track (kick ducking)
             const auto peak = sidechain ? (sideL != nullptr ? std::max (std::abs (sideL[i]), std::abs (sideR[i])) : 0.0f)
                                         : std::max (std::abs (l[i]), std::abs (r[i]));
-            const auto reductionDb = peak > thresholdGain ? (gainToDb (peak) - threshold) * slope : 0.0f; // the change (≥ 0)
+            float reductionDb;
+            if (fet)
+            {
+                reductionDb = 0.0f;
+                if (peak > fetKneeGain)
+                {
+                    const auto over = gainToDb (peak) - threshold;
+                    reductionDb = slope * (over >= 0.5f * fetKnee ? over : (over + 0.5f * fetKnee) * (over + 0.5f * fetKnee) / (2.0f * fetKnee));
+                }
+                if (reductionDb > envelopeDb)
+                    envelopeDb = reductionDb + attack * (envelopeDb - reductionDb);
+                else
+                    envelopeDb = std::max (reductionDb, envelopeDb - envelopeDb * (fetTail + envelopeDb * fetDeep));
+            }
+            else
+            {
+                reductionDb = peak > thresholdGain ? (gainToDb (peak) - threshold) * slope : 0.0f; // the change (≥ 0)
 
-            // the envelope rises with the attack and falls with the release
-            const auto coeff = reductionDb > envelopeDb ? attack : release;
-            envelopeDb = reductionDb + coeff * (envelopeDb - reductionDb);
+                // the envelope rises with the attack and falls with the release
+                const auto coeff = reductionDb > envelopeDb ? attack : release;
+                envelopeDb = reductionDb + coeff * (envelopeDb - reductionDb);
+            }
 
             if (envelopeDb < 1.0e-4f)
                 envelopeDb = 0.0f; // no audible reduction: skip the pow
@@ -360,6 +401,7 @@ private:
     float limitGain = 1.0f;
     std::atomic<int> latency { 0 };
     vmatch::progcomp::Compressor vintage;
+    bool vintageAtStart = false;
     double sampleRate = 44100.0;
     float envelopeDb = 0.0f;
     float inPower = 0.0f, outPower = 0.0f, autoGain = 1.0f;
@@ -692,7 +734,9 @@ public:
     void prepare (double sr) noexcept override
     {
         sampleRate = sr;
-        lookahead = std::max (1, (int) std::lround (lookaheadSeconds * sr));
+        // (never past the delay line: it holds 1.5 ms at 192 kHz, and a device above that rate wrote past its end —
+        // issue #134: the default project has this limiter on its Master)
+        lookahead = std::clamp ((int) std::lround (lookaheadSeconds * sr), 1, (int) delay[0].size());
         attack = (float) (1.0 - std::exp (-1.0 / (lookahead * 0.3)));
         reset();
     }
@@ -1964,7 +2008,13 @@ double noteA (float v) { return 55.0 * std::pow (2.0, (2.0 * v - 1.0) / 12.0); }
 class PitchCorrect final : public Effect
 {
 public:
-    PitchCorrect() { dsp.reserve (maxSampleRate); }
+    // `initial` (may be null): the slot's parameters, so the formant path's latency is known before the first block
+    explicit PitchCorrect (const EffectParams* initial = nullptr)
+    {
+        dsp.reserve (maxSampleRate);
+        if (initial != nullptr)
+            latency.store ((*initial)[29] > 0.5f ? 257 : 9, std::memory_order_relaxed); // (pitcher::Pitcher::latency())
+    }
 
     void prepare (double sr) noexcept override { dsp.prepare (sr); }
     void reset() noexcept override
@@ -2607,7 +2657,10 @@ const EffectInfo& effectInfo (EffectKind kind)
                                                   { "Ranges", 0.0f }, { "RC ratio", 0.625f }, { "RC gain", 0.5f }, { "RC attack", 0.5f }, { "RC release", 0.5f },
                                                   // round 152: the vintage voicing's static curve measured at every ratio (on for new
                                                   // instances; projects saved before keep the round-150 curve: upgradeLoadedEffectParams)
-                                                  { "Vintage curve", 1.0f } } };
+                                                  { "Vintage curve", 1.0f },
+                                                  // round 190ar: the classic voicing's law — clean (as before) or FET
+                                                  // (5 dB knee, program-dependent release); off: every project unchanged
+                                                  { "Classic law", 0.0f } } };
     static const EffectInfo delay { "Delay", { { "Time", 0.3f }, { "Feedback", 0.42f }, { "Mix", 0.3f }, { "Ping-pong", 0.0f }, { "Damping", 0.3f } } };
     static const EffectInfo reverb { "Reverb", { { "Room", 0.6f }, { "Damping", 0.5f }, { "Width", 1.0f }, { "Mix", 0.25f }, { "Dry", 1.0f },
                                                  { "Low cut", 0.0f }, { "High cut", 1.0f }, { "Predelay", 0.0f } } };
@@ -2986,6 +3039,140 @@ const EffectInfo& effectInfo (EffectKind kind)
         case EffectKind::kilnChannel: return mixsuite::kilnInfo();
         case EffectKind::fretChannel: return mixsuite::fretInfo();
         case EffectKind::shellChannel: return mixsuite::shellInfo();
+        case EffectKind::pocketDistortion:
+        {
+            // FL Studio Mobile's own values and defaults (round 188h)
+            static const EffectInfo info { "Pocket Distortion", { { "Drive", 0.25f }, { "BitCrush", 0.0f }, { "Gain", 1.0f },
+                                                                  { "Stereo", 0.5f }, { "Kind", 0.0f }, { "Bias", 0.5f } } };
+            return info;
+        }
+        case EffectKind::pocketLimiterClassic:
+        {
+            static const EffectInfo info { "Pocket Limiter Classic", { { "Threshold", 1.0f }, { "Release", 0.7f },
+                                                                       { "Output gain", 2.0f / 3.0f } } };
+            return info;
+        }
+        case EffectKind::pocketLimiter:
+        {
+            static const EffectInfo info { "Pocket Limiter", { { "In gain", 0.5f }, { "Out gain", 0.5f }, { "Release", 0.2f },
+                                                               { "Threshold", 1.0f } } };
+            return info;
+        }
+        case EffectKind::pocketLeveller:
+        {
+            static const EffectInfo info { "Pocket Leveller", { { "Gain", 0.7379573f }, { "Pan", 0.5f } } };
+            return info;
+        }
+        case EffectKind::pocketGate:
+        {
+            static const EffectInfo info { "Pocket Gate", { { "Threshold", 0.0f }, { "Asymmetry", 0.0f }, { "Attack", 0.01f },
+                                                            { "Attack curve", 0.0f }, { "Release", 0.25f }, { "Release curve", 1.0f },
+                                                            { "Mix", 1.0f }, { "Hold", 0.25f } } };
+            return info;
+        }
+        case EffectKind::pocketTranceDelay:
+        {
+            static const EffectInfo info { "Pocket Trance Delay", { { "Time", 0.775f }, { "Feedback", 0.4f }, { "Mix", 1.0f },
+                                                                    { "Filter", 0.5f }, { "Mode", 0.0f }, { "Input pan", 0.5f },
+                                                                    { "Dry pan", 0.0f } } };
+            return info;
+        }
+        case EffectKind::pocketTapeDelay:
+        {
+            static const EffectInfo info { "Pocket Tape Delay", { { "Time", 0.6f }, { "Feedback", 0.6f }, { "Async", 0.5f },
+                                                                  { "Mix", 0.4f } } };
+            return info;
+        }
+        case EffectKind::pocketMultiFx:
+        {
+            static const EffectInfo info { "Pocket MultiFX", { { "FX kind", 0.0f }, { "X", 0.5f }, { "Y", 0.5f }, { "LFO rate", 0.61f },
+                                                               { "LFO amount", 0.0f }, { "LFO shape", 0.0f } } };
+            return info;
+        }
+        case EffectKind::strikeShaper: return mixsuite::strikeInfo();
+        case EffectKind::pocketAutoduck:
+        {
+            static const EffectInfo info { "Pocket Autoduck", { { "Ducking", 0.501f }, { "Attack", 0.1f }, { "Curve", 0.501f }, { "Time", 1.0f },
+                                                                { "Shift", 0.5f }, { "Hold", 0.0f }, { "Shape", 0.0f } } };
+            return info;
+        }
+        case EffectKind::pocketChorus:
+        {
+            static const EffectInfo info { "Pocket Chorus", { { "Rate", 0.4f }, { "Depth", 0.6f }, { "Stereo", 1.0f }, { "Mix", 0.6f } } };
+            return info;
+        }
+        case EffectKind::pocketSpacer:
+        {
+            static const EffectInfo info { "Pocket Spacer", { { "L/R delay", 0.5f }, { "Pan", 0.5f }, { "Separation", 0.5f },
+                                                              { "L/R inversion", 0.0f }, { "M/S delay", 0.5f }, { "M/S inversion", 0.0f },
+                                                              { "Stereo mode", 0.0f } } };
+            return info;
+        }
+        case EffectKind::pocketStereoizer:
+        {
+            static const EffectInfo info { "Pocket Stereoizer", { { "Strength", 0.7f }, { "Timbre", 0.52f }, { "Focus", 0.75f },
+                                                                  { "L/R delay", 0.5f }, { "Pan", 0.5f } } };
+            return info;
+        }
+        case EffectKind::pocketWowFlutter:
+        {
+            // FL Studio Mobile's own values and defaults (round 189h); FLM names each rate knob and its sync menu alike
+            static const EffectInfo info { "Pocket Wow & Flutter", { { "Wow rate", 0.184564f }, { "Wow sync", 0.2f }, { "Wow amount", 0.25f },
+                                                                     { "Flutter rate", 0.066818f }, { "Flutter sync", 0.1f },
+                                                                     { "Flutter amount", 0.25f }, { "Sync", 0.0f }, { "Random rate", 0.08952f },
+                                                                     { "Random sync", 0.8f }, { "Random amount", 0.25f } } };
+            return info;
+        }
+        case EffectKind::pocketPhaser:
+        {
+            static const EffectInfo info { "Pocket Phaser", { { "LFO rate", 0.112222f }, { "LFO amount", 0.25f }, { "Feedback", 0.1f },
+                                                              { "Frequency", 0.25f }, { "Mix", 1.0f }, { "Sync", 1.0f }, { "LFO speed", 0.0f },
+                                                              { "LFO shape", 0.0f }, { "Stereo", 1.0f } } };
+            return info;
+        }
+        case EffectKind::pocketFlanger:
+        {
+            static const EffectInfo info { "Pocket Flanger", { { "LFO rate", 0.4f }, { "Sync", 0.0f }, { "LFO speed", 0.55f }, { "LFO shape", 0.0f },
+                                                               { "LFO amount", 1.0f }, { "Delay", 0.25f }, { "Feedback", 0.75f },
+                                                               { "Invert feedback", 1.0f }, { "Stereo", 0.0f }, { "Mix", 1.0f }, { "Invert mix", 1.0f } } };
+            return info;
+        }
+        case EffectKind::pocketTremolo:
+        {
+            static const EffectInfo info { "Pocket Tremolo", { { "Rate", 0.045467f }, { "Rate sync", 0.0f }, { "Amount max", 1.0f },
+                                                               { "Amount min", 0.0f }, { "Phase offset", 0.0f }, { "Stereo offset", 0.0f },
+                                                               { "Sync", 0.0f }, { "Shape", 0.5f }, { "Smooth", 1.0f }, { "Skew", 0.5f }, { "Width", 0.5f } } };
+            return info;
+        }
+        case EffectKind::pocketWaveshaper:
+        {
+            // FL Studio Mobile's own values and defaults (round 189h)
+            static const EffectInfo info { "Pocket Waveshaper", { { "Shape", 0.0f }, { "Auto-gain", 0.0f }, { "X", 0.5f }, { "Y", 0.5f },
+                                                                  { "Drive", 0.0f }, { "Post gain", 0.5f }, { "Stereo spread", 0.0f },
+                                                                  { "Mix", 1.0f }, { "High cut", 1.0f }, { "Low cut", 0.0f }, { "Bass", 0.5f },
+                                                                  { "Mid freq", 0.5f }, { "Mid gain", 0.5f }, { "Treble", 0.5f },
+                                                                  { "LFO shape", 0.0f }, { "LFO sync", 0.0f }, { "LFO rate", 0.5f },
+                                                                  { "LFO rate free", 0.0f }, { "LFO to X", 0.0f }, { "LFO to Y", 0.0f } } };
+            return info;
+        }
+        case EffectKind::pocketCompressor:
+        {
+            static const EffectInfo info { "Pocket Compressor", { { "Thresh", 0.499f }, { "Ratio", 0.0f }, { "Attack", 0.6f }, { "Release", 0.6f },
+                                                                  { "Level", 0.5001f }, { "Hold", 0.0f }, { "Auto gain", 1.0f },
+                                                                  { "Input gain", 0.5f }, { "RMS", 0.0f } } };
+            return info;
+        }
+        case EffectKind::pocketSpreader:
+        {
+            static const EffectInfo info { "Pocket Spreader", { { "Width", 0.0f }, { "Low bypass", 0.0f }, { "Mono bass", 0.0f },
+                                                                { "Separation", 0.5f } } };
+            return info;
+        }
+        case EffectKind::rackMixer:
+        {
+            static const EffectInfo rackMixerInfo { "Chain mixer", { { "Volume", rack::unityVolume }, { "Pan", 0.5f }, { "Chain select", 1.0f } } };
+            return rackMixerInfo;
+        }
         case EffectKind::lynxTune: return lynxtune::info();
         case EffectKind::fruityPhaser: return fruityPhaserInfo;
         case EffectKind::epochVerb:
@@ -3250,6 +3437,8 @@ const EffectInfo& effectInfo (EffectKind kind)
 
 std::string formatEffectParam (EffectKind kind, int param, float v, double bpm, const EffectParams& context)
 {
+    if (kind == EffectKind::pocketCompressor && param == 4) // round 189h: FLM's Level reads 20 dB less with Auto gain on
+        return pocket::compressorLevelText (v, context[6] >= 0.5f);
     if (kind == EffectKind::ridgeStrip && param == mixsuite::ridge::driveAmount) // round tp172c6: the model's own dial
     {
         const auto model = mixsuite::ridge::driveModelIndex (context[(std::size_t) mixsuite::ridge::driveModel]);
@@ -3288,6 +3477,8 @@ std::string formatEffectParam (EffectKind kind, int param, float v, double bpm, 
         return mixsuite::hush::classicParamText (param, v);
     if (kind == EffectKind::hushDeEsser && ! mixsuite::hush::extended (context)) // round 165x: the old ranges
         return mixsuite::hush::oldLawText (param, v);
+    if (kind == EffectKind::pocketAutoduck && param == 5) // Hold is a share of Time
+        return pocket::autoduckHoldText (v, context[3]);
     if (kind == EffectKind::fruityPhaser && param == 0) // the sweep rate follows the frequency range switch
         return phaserfx::sweepText (v, context[3] > 0.5f);
     if (kind == EffectKind::parametricEq && peq::flLaw (context) && param >= 0 && param < peq::slopeParam + peq::bands)
@@ -3336,6 +3527,7 @@ std::string formatEffectParam (EffectKind kind, int param, float v, double bpm)
                 case 16: std::snprintf (text, sizeof (text), rcAttackMs (v) < 10.0f ? "%.2f ms" : "%.1f ms", rcAttackMs (v)); break;
                 case 17: std::snprintf (text, sizeof (text), rcReleaseMs (v) < 100.0f ? "%.1f ms" : "%.0f ms", rcReleaseMs (v)); break;
                 case 18: return v >= 0.5f ? "measured" : "round 150";
+                case 19: return v >= 0.5f ? "FET" : "clean";
                 default: std::snprintf (text, sizeof (text), "+%.1f dB", compMakeupDb (v)); break;
             }
             return text;
@@ -3427,6 +3619,24 @@ std::string formatEffectParam (EffectKind kind, int param, float v, double bpm)
             return text;
         }
 
+        case EffectKind::rackMixer: // (round 183c: Live's chain units)
+            if (param == rack::mixerVolume)
+            {
+                const auto g = rack::volumeGain (v);
+                if (g <= 0.0f)
+                    return "-inf dB";
+                std::snprintf (text, sizeof (text), "%.1f dB", 20.0f * std::log10 (g));
+            }
+            else if (param == rack::mixerPan)
+            {
+                const auto pan = (int) std::lround ((v * 2.0f - 1.0f) * 50.0f);
+                if (pan == 0)
+                    return "C";
+                std::snprintf (text, sizeof (text), "%d%s", std::abs (pan), pan < 0 ? "L" : "R");
+            }
+            else
+                std::snprintf (text, sizeof (text), "%.0f%%", v * 100.0f);
+            return text;
         case EffectKind::utility:
             if (param == 0)
             {
@@ -3731,6 +3941,7 @@ std::string formatEffectParam (EffectKind kind, int param, float v, double bpm)
         case EffectKind::kilnChannel:
         case EffectKind::fretChannel:
         case EffectKind::shellChannel:
+        case EffectKind::strikeShaper:
             return mixsuite::paramText (kind, param, v);
         case EffectKind::lynxTune:
             return lynxtune::paramText (param, v);
@@ -3775,6 +3986,44 @@ std::string formatEffectParam (EffectKind kind, int param, float v, double bpm)
             return fllegacy::eq7ParamText (param, v);
         case EffectKind::flDelay1:
             return fllegacy::delay1ParamText (param, v);
+        case EffectKind::pocketDistortion:
+            return pocket::distortionParamText (param, v);
+        case EffectKind::pocketLimiterClassic:
+            return pocket::limiterClassicParamText (param, v);
+        case EffectKind::pocketLimiter:
+            return pocket::limiterParamText (param, v);
+        case EffectKind::pocketLeveller:
+            return pocket::levellerParamText (param, v);
+        case EffectKind::pocketGate:
+            return pocket::gateParamText (param, v);
+        case EffectKind::pocketTranceDelay:
+            return pocket::tranceDelayParamText (param, v);
+        case EffectKind::pocketTapeDelay:
+            return pocket::tapeDelayParamText (param, v);
+        case EffectKind::pocketMultiFx:
+            return pocket::multiFxParamText (param, v);
+        case EffectKind::pocketAutoduck:
+            return pocket::autoduckParamText (param, v, bpm);
+        case EffectKind::pocketChorus:
+            return pocket::chorusParamText (param, v);
+        case EffectKind::pocketSpacer:
+            return pocket::spacerParamText (param, v);
+        case EffectKind::pocketStereoizer:
+            return pocket::stereoizerParamText (param, v);
+        case EffectKind::pocketWowFlutter:
+            return pocket::wowFlutterParamText (param, v);
+        case EffectKind::pocketPhaser:
+            return pocket::phaserParamText (param, v);
+        case EffectKind::pocketFlanger:
+            return pocket::flangerParamText (param, v);
+        case EffectKind::pocketTremolo:
+            return pocket::tremoloParamText (param, v);
+        case EffectKind::pocketWaveshaper:
+            return pocket::waveshaperParamText (param, v);
+        case EffectKind::pocketCompressor:
+            return pocket::compressorParamText (param, v);
+        case EffectKind::pocketSpreader:
+            return pocket::spreaderParamText (param, v);
         case EffectKind::hardwareInsert:
             return hwinsert::paramText (param, v);
         case EffectKind::fruityMute2:
@@ -3902,6 +4151,12 @@ void upgradeLoadedEffectParams (EffectSlot& slot, std::size_t savedCount) noexce
     // round 152: … and before the gain-stage attack keeps round 150's level-follower attack
     if (slot.kind == EffectKind::prismMultiband && savedCount <= (std::size_t) dyn::prism::rev152)
         slot.params[(std::size_t) dyn::prism::rev152] = 0.0f;
+    // round 190v: Crest saved before its two-way / vari-mu refit keeps round 108's laws, Sentry saved before its Vocal
+    // noise reduction has none
+    if (slot.kind == EffectKind::crestCompressor && savedCount <= (std::size_t) dyn::crest::law)
+        slot.params[(std::size_t) dyn::crest::law] = 0.0f;
+    if (slot.kind == EffectKind::sentryGate && savedCount <= (std::size_t) dyn::sentry::law)
+        slot.params[(std::size_t) dyn::sentry::law] = 0.0f;
     // round 150: Auto-pan saved before the Tweak block keeps the Rhythm voicing's clipped angle
     if (slot.kind == EffectKind::autoPan && savedCount <= (std::size_t) autopan::count + 19)
         slot.params[(std::size_t) autopan::count + 19] = 0.0f;
@@ -3912,6 +4167,9 @@ void upgradeLoadedEffectParams (EffectSlot& slot, std::size_t savedCount) noexce
     // round 165: … and before Punish's measured law keeps round 136's Classic Punish
     if (slot.kind == EffectKind::ember && savedCount <= (std::size_t) mixsuite::ember::classicLaw)
         slot.params[(std::size_t) mixsuite::ember::classicLaw] = 0.0f;
+    // round 190ar: … and before the Classic voicing's high-drive coupling keeps round trial187b's high-drive tables
+    if (slot.kind == EffectKind::ember && savedCount <= (std::size_t) mixsuite::ember::classicHot)
+        slot.params[(std::size_t) mixsuite::ember::classicHot] = 0.0f;
     if (slot.kind == EffectKind::echoform && savedCount <= (std::size_t) echosuite::echoform::voicingStereo
         && slot.params.size() > (std::size_t) echosuite::echoform::voicingStereo)
         slot.params[(std::size_t) echosuite::echoform::voicingStereo] = 0.0f;
@@ -3956,7 +4214,7 @@ std::unique_ptr<Effect> makeEffect (const EffectSlot& slot)
     if (slot.kind == EffectKind::maximus)
         return maximusfx::make (slot.state);
     if (slot.kind == EffectKind::multibandDelay)
-        return mbdelay::make (slot.state);
+        return mbdelay::make (slot.state, &slot.params); // (#113: the mode's latency known at once)
     if (slot.kind == EffectKind::vocoder)
         return std::make_unique<Vocoder> (slot.state);
     if (slot.kind == EffectKind::equo)
@@ -3987,6 +4245,24 @@ std::unique_ptr<Effect> makeEffect (const EffectSlot& slot)
         return dyn::make (slot.kind, &slot.params);
     if (slot.kind == EffectKind::apexLimiter) // round 135: the oversampling latency known before the first block
         return apex::make (&slot.params);
+    if (slot.kind == EffectKind::ridgeStrip) // issue #113: its Vocal voicing / DRIVE latency known before the first block
+        return mixsuite::makeRidge (&slot.params);
+    if (slot.kind == EffectKind::aether) // issue #113: its model (the exciter's oversampling latency) known before the first block
+        return mixsuite::makeAether (&slot.params);
+    if (slot.kind == EffectKind::lynxTune) // issue #113: its range / low-latency path known before the first block
+        return lynxtune::make (&slot.params);
+    if (slot.kind == EffectKind::transmitter) // issue #113: its look-ahead (latency) known before the first block
+        return transmitter::make (&slot.params);
+    if (slot.kind == EffectKind::flPitchShifter) // issue #113: its engine (latency) known before the first block
+        return psfl::make (&slot.params);
+    if (slot.kind == EffectKind::compressor) // issue #113: its voicing's latency known before the first block
+        return std::make_unique<Compressor> (&slot.params);
+    if (slot.kind == EffectKind::pitchCorrect) // issue #113: its formant path's latency known before the first block
+        return std::make_unique<PitchCorrect> (&slot.params);
+    if (slot.kind == EffectKind::fruityLimiter) // issue #113: its look-ahead (latency) known before the first block
+        return fldyn::makeLimiter (&slot.params);
+    if (slot.kind == EffectKind::fruityCompressor) // its reported look-ahead known before the first block
+        return fldyn::makeCompressor (&slot.params);
     if (slot.kind == EffectKind::hyperChorus)
         return hyperchorusfx::make (hyperchorusfx::instanceOf (slot.state));
     if (slot.kind == EffectKind::vintageChorus)
@@ -4000,7 +4276,7 @@ std::unique_ptr<Effect> makeEffect (const EffectSlot& slot)
     if (slot.kind == EffectKind::fruityDelayBank)
         return fldbank::make (slot.state);
     if (slot.kind == EffectKind::fruityMultiband)
-        return slot.state.empty() ? flmb::make() : flmb::make (slot.state);
+        return slot.state.empty() ? flmb::make (&slot.params) : flmb::make (slot.state, &slot.params); // (#113: latency known at once)
     return makeEffect (slot.kind);
 }
 
@@ -4083,7 +4359,9 @@ std::unique_ptr<Effect> makeEffect (EffectKind kind)
         case EffectKind::ember:
         case EffectKind::kilnChannel:
         case EffectKind::fretChannel:
-        case EffectKind::shellChannel: return mixsuite::make (kind); // LYNX's own mixing suite (REA_rodada96)
+        case EffectKind::shellChannel:
+        case EffectKind::strikeShaper: return mixsuite::make (kind); // LYNX's own mixing suite (REA_rodada96)
+        case EffectKind::rackMixer: return rack::makeChainMixer(); // a rack chain's mixer (round 183c)
         case EffectKind::lynxTune: return lynxtune::make(); // LYNX's own pitch corrector (REA_rodada95)
         case EffectKind::fruityPhaser: return phaserfx::make(); // FL's Fruity Phaser, exact (REA_rodada105_phaser)
         case EffectKind::epochVerb:
@@ -4112,6 +4390,25 @@ std::unique_ptr<Effect> makeEffect (EffectKind kind)
         case EffectKind::flBassBoost: return fllegacy::makeBassBoost();
         case EffectKind::fl7BandEq: return fllegacy::makeEq7();
         case EffectKind::flDelay1: return fllegacy::makeDelay1();
+        case EffectKind::pocketDistortion: return pocket::makeDistortion(); // round 188h (FL Studio Mobile)
+        case EffectKind::pocketLimiterClassic: return pocket::makeLimiterClassic();
+        case EffectKind::pocketLimiter: return pocket::makeLimiter();
+        case EffectKind::pocketLeveller: return pocket::makeLeveller();
+        case EffectKind::pocketGate: return pocket::makeGate();
+        case EffectKind::pocketTranceDelay: return pocket::makeTranceDelay();
+        case EffectKind::pocketTapeDelay: return pocket::makeTapeDelay();
+        case EffectKind::pocketMultiFx: return pocket::makeMultiFx();
+        case EffectKind::pocketAutoduck: return pocket::makeAutoduck(); // round 189h (FL Studio Mobile)
+        case EffectKind::pocketChorus: return pocket::makeChorus();
+        case EffectKind::pocketSpacer: return pocket::makeSpacer();
+        case EffectKind::pocketStereoizer: return pocket::makeStereoizer();
+        case EffectKind::pocketWowFlutter: return pocket::makeWowFlutter(); // round 189h (FL Studio Mobile)
+        case EffectKind::pocketPhaser: return pocket::makePhaser();
+        case EffectKind::pocketFlanger: return pocket::makeFlanger();
+        case EffectKind::pocketTremolo: return pocket::makeTremolo();
+        case EffectKind::pocketWaveshaper: return pocket::makeWaveshaper(); // round 189h
+        case EffectKind::pocketCompressor: return pocket::makeCompressor();
+        case EffectKind::pocketSpreader: return pocket::makeSpreader();
         case EffectKind::hardwareInsert: return std::make_unique<hwinsert::HardwareInsertFx>(); // round 164d
         case EffectKind::fruityMute2: return flextra::mute2::make(); // round 165g
         case EffectKind::bigClock:

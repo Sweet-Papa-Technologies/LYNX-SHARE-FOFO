@@ -274,6 +274,7 @@ inline bool trefoilInside (float u, float v)
 inline const juce::Image& trefoilMask (int px)
 {
     static std::map<int, juce::Image> cache;
+    static const bool registered = lynx::ui::registerImageCache ([] { cache.clear(); }); (void) registered;
     if (cache.size() > 24) cache.clear();
     auto& img = cache[px];
     if (img.isNull())
@@ -1431,7 +1432,7 @@ void ArtLayer::paint (juce::Graphics& g)
 juce::String artSelfTest()
 {
     juce::StringArray errors;
-    auto expect = [&] (bool ok, const char* what) { if (! ok) errors.add (what); };
+    auto expect = [&] (bool ok, const juce::String& what) { if (! ok) errors.add (what); };
     const auto keptForced = forcedStyle();
     const auto keptMotion = artMotion();
     expect (styleFromName ("Themed") == Style::themed && juce::String (styleName (Style::themed)) == "Themed", "style name");
@@ -1443,7 +1444,7 @@ juce::String artSelfTest()
                           EffectKind::glowLeveler, EffectKind::hushDeEsser, EffectKind::epochVerb, EffectKind::atrium, EffectKind::foilPlate,
                           EffectKind::halo, EffectKind::horizon, EffectKind::reeverb2, EffectKind::luxeVerb, EffectKind::reeverb1,
                           EffectKind::echoform, EffectKind::spiralEcho, EffectKind::orbit, EffectKind::latticeMod, EffectKind::geminiDoubler,
-                          EffectKind::fruityDelay2, EffectKind::fruityDelay3, EffectKind::fruityDelayBank, EffectKind::ember, EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel, EffectKind::aether,
+                          EffectKind::fruityDelay2, EffectKind::fruityDelay3, EffectKind::fruityDelayBank, EffectKind::ember, EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel, EffectKind::strikeShaper, EffectKind::aether,
                           EffectKind::fruityBloodOverdrive, EffectKind::fruityFastDist, EffectKind::fruityWaveShaper, EffectKind::fruitySoftClipper,
                           EffectKind::hardcore, EffectKind::distructor, EffectKind::fruityChorus, EffectKind::hyperChorus, EffectKind::vintageChorus,
                           EffectKind::fruityFlanger, EffectKind::fruityFlangus, EffectKind::fruityPhaser, EffectKind::vintagePhaser,
@@ -1492,9 +1493,15 @@ juce::String artSelfTest()
     for (const auto a : allArts())
     {
         juce::Image img (juce::Image::ARGB, 320, 200, true);
+        juce::Image softwareCanvas (juce::Image::ARGB, 320, 200, true, juce::SoftwareImageType());
         {
             juce::Graphics g (img);
             const StyleScope scope (Style::themed, a);
+            if (const auto drawCanvas = artkit::themeOf (a).canvas; drawCanvas != nullptr)
+            {
+                juce::Graphics software (softwareCanvas);
+                drawCanvas (software, { 0.0f, 0.0f, 320.0f, 200.0f }, false);
+            }
             canvas (g, { 0.0f, 0.0f, 320.0f, 200.0f }, colour::crimson);
             section (g, { 10.0f, 10.0f, 140.0f, 120.0f }, 6.0f, true, colour::crimson);
             sectionTitle (g, { 10.0f, 10.0f, 140.0f, 16.0f }, "OSC 1", colour::crimson, 10.0f);
@@ -1506,8 +1513,12 @@ juce::String artSelfTest()
             expect (style() == Style::themed && art() == a, "scope");
         }
         expect (style() != Style::themed, "scope restored");
+        // Native 8-bit compositing can round an opaque canvas to alpha 254 after translucent overlays.
+        // Check exact opacity with the software renderer, then allow only that one-unit native rounding error.
+        const auto softwareAlpha = softwareCanvas.getPixelAt (160, 100).getAlpha();
+        expect (softwareAlpha == 255, juce::String (artName (a)) + " (software canvas alpha " + juce::String (softwareAlpha) + ")");
         const auto px = img.getPixelAt (160, 100);
-        expect (px.getAlpha() == 255, artName (a));
+        expect (px.getAlpha() >= 254, juce::String (artName (a)) + " (rendered alpha " + juce::String (px.getAlpha()) + ")");
         ArtLayer layer;
         layer.setSize (320, 200);
         layer.setArt (a, [] { return true; });

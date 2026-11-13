@@ -19,6 +19,10 @@ struct RecordedEvent
     int key = 60;
     float velocity = 0.8f;
     bool on = true;
+    // MPE (issue #108, core/Mpe.h): a note from an MPE controller carries its own expression into the piano roll —
+    // the "on" its fine pitch (cents) and Mod X, the "off" its Mod Y (the note's peak pressure)
+    bool expression = false;
+    float finePitch = 0.0f, modX = 0.5f, modY = 0.5f;
 };
 
 // Where an absolute transport position falls within the current pattern: in pattern mode,
@@ -26,12 +30,22 @@ struct RecordedEvent
 // playing there (or, without a clip, as if it were the pattern loop).
 std::int64_t patternPositionForTick (const Song& song, double tick, std::int64_t loopLength);
 
-// Song mode, a take inside pattern clip `c` at song `tick`: its place in the pattern. With stretchedClipsLoop() on and
-// `c` longer than its pattern, folded into the pattern (modulo its length, from the clip's offset; 0.1.23); else the
-// place along the clip (FL: the pattern grows, round 168k). clipLoopLength = the pattern's length when `c` loops it
-// that way, else 0.
+// Song mode, a take inside pattern clip `c` at song `tick`: its place in the pattern, along the clip (FL: the pattern
+// grows, round 168k), also when `c` loops its pattern with stretchedClipsLoop() on (issue #126: a take is not folded).
+// clipLoopLength = the pattern's length when `c` loops it that way, else 0.
 std::int64_t clipPatternTick (const Song& song, const Clip& c, std::int64_t tick);
 std::int64_t clipLoopLength (const Song& song, const Clip& c);
+
+// The hybrid rule (issue #126 follow-up, the user's choice): with stretchedClipsLoop() on, a take into a clip that loops
+// a pattern which already has notes folds into the loop (0.1.23) when the place in the loop falls inside that content;
+// an empty pattern, or a place past the content, keeps the note where it was played (FL's rule: the pattern grows).
+// `content` = the pattern's notes when the take began, to their end, in whole bars, at most the loop length.
+std::int64_t patternContentLength (const Song& song, int pattern);
+// pattern tick `t` (along the clip) folded by that rule: `loop` = clipLoopLength at the take's start (0: no loop)
+inline std::int64_t foldedTakeTick (std::int64_t t, std::int64_t loop, std::int64_t content) noexcept
+{
+    return loop > 0 && content > 0 && t >= loop && t % loop < content ? t % loop : t;
+}
 
 // --- recording options (docs/WORKFLOW_FL.md P2: recording set) ---------------------------------
 
@@ -44,6 +58,15 @@ enum class RecordMode : std::uint8_t
 // Commits finished notes of a take into `pattern`: starts quantised to the nearest multiple of `grid`
 // (grid <= 1: as played; lengths kept). In replace mode, `clearedChannels` remembers the channels already
 // cleared during this take, so later notes of the same take stay.
+// What "Blend recorded notes" starts as (round 177c). A new install starts off, as FL Studio's factory form does.
+// Before 0.1.25 the switch wasn't saved and every session started on, so a settings file that has no answer yet keeps it on.
+[[nodiscard]] constexpr RecordMode startingRecordMode (bool settingsFileExists, bool hasSavedBlend, bool savedBlend) noexcept
+{
+    if (hasSavedBlend)
+        return savedBlend ? RecordMode::overdub : RecordMode::replace;
+    return settingsFileExists ? RecordMode::overdub : RecordMode::replace;
+}
+
 void commitTake (Pattern& pattern, std::vector<Note> notes, RecordMode mode, std::int64_t grid, std::vector<int>& clearedChannels);
 
 // FL's record menu "Quantize" section (REA round 139, FLEngine FUN_012ca7b0; settings QuantizeNoteStartTime,
@@ -240,6 +263,10 @@ public:
     bool originFromClip() const noexcept { return fromClip; }
     // Song mode: the song position of the latest note start placed from the origin (outside every clip), -1: none.
     std::int64_t originReach() const noexcept { return reach; }
+    // Song mode, a take from a clip that loops its pattern (stretchedClipsLoop()): the loop length and the pattern's
+    // content at the take's first note (foldedTakeTick); 0 when there is no fold
+    std::int64_t foldLoop() const noexcept { return takeFoldLoop; }
+    std::int64_t foldContent() const noexcept { return takeFoldContent; }
 
     // Delivers an event; when it's the "off" of a held note, the finished note goes to finished().
     void add (const Song& song, const RecordedEvent& e);
@@ -268,6 +295,8 @@ private:
     {
         double tick;
         float velocity;
+        bool expression = false; // (issue #108: an MPE note's own fine pitch / Mod X / Mod Y)
+        float finePitch = 0.0f, modX = 0.5f, modY = 0.5f;
     };
 
     void finish (const Song& song, int channel, int key, const Held& held, double endTick);
@@ -283,6 +312,7 @@ private:
     std::int64_t origin = -1;
     std::int64_t reach = -1;
     bool fromClip = false;
+    std::int64_t takeFoldLoop = 0, takeFoldContent = 0;
     std::map<std::pair<int, int>, Held> held; // (channel, key)
     std::vector<Note> finished;
 };

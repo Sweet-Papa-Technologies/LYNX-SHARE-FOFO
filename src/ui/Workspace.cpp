@@ -1,13 +1,17 @@
 #include "ui/Workspace.h"
+#include "ui/Motion.h"
 #include "ui/ThemeSettings.h"
 
 #include "engine/PluginHost.h"
 #include "ui/EditorTools.h"
 #include "ui/HintBar.h"
 #include "ui/I18n.h"
+#include "ui/NativeChild.h"
 #include "ui/Theme.h"
 #include "ui/ValueControl.h"
 #include "ui/WindowOwner.h"
+
+#include <vector>
 
 namespace lynx
 {
@@ -73,6 +77,14 @@ public:
     {
         if (content != nullptr)
             content->removeMouseListener (this);
+    }
+
+    void releaseContent()
+    {
+        if (content != nullptr)
+            content->removeMouseListener (this);
+        content = nullptr;
+        sharer = nullptr;
     }
 
     void setContent (juce::Component& c, const juce::String& t, Icon i)
@@ -321,15 +333,16 @@ public:
 
         dragEdges = e.eventComponent == this ? edgesAt (e.getPosition()) : 0;
         dragging = dragEdges != 0 || (onTitle && ! owner.isDetached (panel) && ! owner.isMaximised (panel));
-        startBounds = getBounds();
+        startBounds = owner.frameBounds (*this); // (the desktop's coordinates: the frame may be a native child, issue #116)
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
-        if (! dragging || getParentComponent() == nullptr)
+        if (! dragging || (getParentComponent() == nullptr && ! nativechild::isAttached (*this)))
             return;
 
-        const auto delta = e.getEventRelativeTo (getParentComponent()).getOffsetFromDragStart();
+        // in JUCE's screen coordinates, which are the desktop's too (a native child frame has no parent component)
+        const auto delta = e.getScreenPosition() - e.getMouseDownScreenPosition();
         auto r = startBounds;
 
         if (dragEdges == 0)
@@ -347,7 +360,7 @@ public:
         }
 
         // keep the title strip reachable
-        const auto parent = getParentComponent()->getLocalBounds();
+        const auto parent = owner.getLocalBounds();
         r.setY (juce::jlimit (0, juce::jmax (0, parent.getHeight() - Workspace::titleHeight), r.getY()));
 
         if (! e.mods.isAltDown()) // Alt: no snapping
@@ -358,13 +371,13 @@ public:
             r = toJuce (workspace::snap (toRect (r), others, parent.getWidth(), parent.getHeight(), 8, dragEdges));
         }
 
-        setBounds (r);
+        owner.placeFrame (*this, r);
     }
 
     void mouseUp (const juce::MouseEvent&) override
     {
         if (dragging)
-            owner.frameMoved (panel, getBounds());
+            owner.frameMoved (panel, owner.frameBounds (*this));
 
         dragging = false;
     }
@@ -624,6 +637,48 @@ private:
 
 // --- the desktop -------------------------------------------------------------------------------
 
+// Issue #116: native child frames follow the main window's native window (made again) and the desktop's place in it
+// and the main window's scale (moved to a display with another scale: they are placed again and the docked editors told)
+struct Workspace::PeerWatch final : juce::ComponentMovementWatcher, juce::ComponentPeer::ScaleFactorListener
+{
+    explicit PeerWatch (Workspace& w) : juce::ComponentMovementWatcher (&w), owner (w) { watchScale(); }
+    ~PeerWatch() override
+    {
+        if (peer != nullptr && juce::ComponentPeer::isValidPeer (peer))
+            peer->removeScaleFactorListener (this);
+    }
+    void componentMovedOrResized (bool wasMoved, bool) override
+    {
+        if (wasMoved)
+            owner.rehostNativeFrames();
+    }
+    void componentPeerChanged() override
+    {
+        watchScale();
+        owner.rehostNativeFrames();
+        owner.applyLayout(); // (a panel left plain while there was no native window yet)
+    }
+    void componentVisibilityChanged() override { owner.applyLayout(); }
+    void nativeScaleFactorChanged (double) override
+    {
+        // (after JUCE has resized the main window for the new scale)
+        juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<Workspace> (&owner)] {
+            if (safe != nullptr)
+                nativechild::followParentScale (*safe);
+        });
+    }
+    void watchScale()
+    {
+        if (peer != nullptr && juce::ComponentPeer::isValidPeer (peer))
+            peer->removeScaleFactorListener (this);
+        peer = owner.getPeer();
+        if (peer != nullptr)
+            peer->addScaleFactorListener (this);
+    }
+    Workspace& owner;
+    juce::ComponentPeer* peer = nullptr;
+};
+
 Workspace::Workspace()
 {
     for (int i = 0; i < workspace::panelCount; ++i)
@@ -634,11 +689,21 @@ Workspace::Workspace()
 
     setWantsKeyboardFocus (false);
     setMouseClickGrabsKeyboardFocus (false);
+    if (nativechild::dockingEnabled())
+        peerWatch = std::make_unique<PeerWatch> (*this);
 }
 
 Workspace::~Workspace()
 {
     saveState();
+    nativeFader.reset();
+    peerWatch.reset();
+    // the native child frames go before the main window's native window does
+    for (auto& f : frames)
+        nativechild::detach (*f);
+    for (auto& f : dockedFrames)
+        if (f != nullptr)
+            nativechild::detach (*f);
 
     for (auto& w : windows)
         if (w != nullptr)
@@ -651,6 +716,11 @@ Workspace::~Workspace()
 void Workspace::setContent (Panel panel, juce::Component& content, const juce::String& title, Icon icon)
 {
     frames[(std::size_t) panel]->setContent (content, title, icon);
+}
+
+void Workspace::releaseContent (Panel panel)
+{
+    frames[(std::size_t) panel]->releaseContent();
 }
 
 void Workspace::setTitle (Panel panel, const juce::String& title)
@@ -678,26 +748,39 @@ bool Workspace::isDetached (Panel panel) const { return layout[panel].detached; 
 bool Workspace::toggle (Panel panel)
 {
     const auto visible = layout.toggle (panel);
-    applyLayout();
+    applyLayout (true);
+    if (visible)
+        nativeToFront (panel);
     return visible;
 }
 
 void Workspace::show (Panel panel)
 {
     layout.show (panel);
-    applyLayout();
+    applyLayout (true);
+    nativeToFront (panel);
+}
+
+void Workspace::nativeToFront (Panel panel)
+{
+    // issue #116: a panel called by its key (F5..F9) or maximised comes in front of the docked plugin windows too, as a
+    // click on it does (applyLayout keeps them where they were among the panels)
+    if (auto& frame = *frames[(std::size_t) panel]; isNativePanel (panel) && nativechild::isAttached (frame) && frame.isVisible())
+        frame.toFront (false);
+    nativechild::raiseOverlays();
 }
 
 void Workspace::hide (Panel panel)
 {
     layout.hide (panel);
-    applyLayout();
+    applyLayout (true);
 }
 
 void Workspace::toggleMaximised (Panel panel)
 {
     layout.toggleMaximised (panel);
     applyLayout();
+    nativeToFront (panel);
 }
 
 void Workspace::setDetached (Panel panel, bool detached)
@@ -712,7 +795,7 @@ void Workspace::setDetached (Panel panel, bool detached)
 
         if (layout[panel].windowBounds.w <= 0 && isShowing()) // first time: where the panel is, on screen
         {
-            const auto screen = localAreaToGlobal (frames[(std::size_t) panel]->getBounds());
+            const auto screen = localAreaToGlobal (frameBounds (*frames[(std::size_t) panel]));
             layout[panel].windowBounds = toRect (screen);
         }
     }
@@ -724,13 +807,15 @@ void Workspace::setDetached (Panel panel, bool detached)
 
 void Workspace::activate (Panel panel)
 {
-    if (layout.focused == panel && (layout[panel].detached || layout.isFrontmost (panel)))
+    // (a native panel comes in front of the docked plugin windows on every click, as FL's: they are not in `layout`)
+    if (layout.focused == panel && (layout[panel].detached || layout.isFrontmost (panel)) && ! isNativePanel (panel))
         return;
 
     layout.bringToFront (panel);
 
     if (! layout[panel].detached && ! isBackgroundPanel (panel))
         frames[(std::size_t) panel]->toFront (false);
+    nativechild::raiseOverlays();
 
     setFocusedPanel (panel);
 }
@@ -813,9 +898,69 @@ std::vector<juce::Rectangle<int>> Workspace::otherPanelBounds (Panel panel) cons
 
     for (int i = 0; i < workspace::panelCount; ++i)
         if ((Panel) i != panel && layout[(Panel) i].visible && ! layout[(Panel) i].detached && ! layout[(Panel) i].maximised)
-            out.push_back (frames[(std::size_t) i]->getBounds());
+            out.push_back (frameBounds (*frames[(std::size_t) i]));
 
     return out;
+}
+
+bool Workspace::isNativePanel (Panel panel) const
+{
+    // every floating panel (the Playlist, Channel rack, Piano roll and Mixer, slice 2); the Browser is a background
+    // panel, always below them and the docked plugin windows, so it stays a plain component (REA_rodada181c)
+    return nativechild::dockingEnabled() && ! isBackgroundPanel (panel) && ! layout[panel].detached;
+}
+
+juce::Component& Workspace::getFrame (Panel panel) const
+{
+    return *frames[(std::size_t) panel];
+}
+
+void Workspace::placeFrame (juce::Component& frame, juce::Rectangle<int> bounds)
+{
+    nativechild::place (frame, *this, bounds);
+}
+
+juce::Rectangle<int> Workspace::frameBounds (const juce::Component& frame) const
+{
+    return nativechild::boundsIn (frame, *this);
+}
+
+void Workspace::rehostNativeFrames()
+{
+    for (auto& f : frames)
+        nativechild::refresh (*f, *this);
+    for (auto& f : dockedFrames)
+        if (f != nullptr)
+            nativechild::refresh (*f, *this);
+}
+
+void Workspace::addDockedFrame (juce::Component& frame)
+{
+    removeDockedFrame (frame);
+    dockedFrames.emplace_back (&frame);
+    if (peerWatch == nullptr)
+        peerWatch = std::make_unique<PeerWatch> (*this);
+}
+
+void Workspace::removeDockedFrame (juce::Component& frame)
+{
+    dockedFrames.erase (std::remove_if (dockedFrames.begin(), dockedFrames.end(),
+                                        [&frame] (const auto& f) { return f == nullptr || f.getComponent() == &frame; }),
+                        dockedFrames.end());
+}
+
+juce::Rectangle<int> Workspace::placeForDockedFrame (int width, int height) const
+{
+    // FL opens a plugin window near the top-left of the workspace, the next one a step down and right
+    int open = 0;
+    for (const auto& f : dockedFrames)
+        if (f != nullptr && f->isVisible())
+            ++open;
+    const auto step = 24 * (open % 8);
+    auto r = juce::Rectangle<int> (60 + step, 40 + step, width, height);
+    r.setX (juce::jlimit (0, juce::jmax (0, getWidth() - width), r.getX()));
+    r.setY (juce::jlimit (0, juce::jmax (0, getHeight() - height), r.getY()));
+    return r;
 }
 
 void Workspace::restoreDetachedWindows()
@@ -838,10 +983,114 @@ bool Workspace::isDetachedWindowActive() const
     return false;
 }
 
-void Workspace::applyLayout()
+// Round 190i (issue #116): the open / close fade of round 179a for the panels that are native child windows. A child
+// window can't fade as a component does (the animator's picture of a closing panel would be a window of its own), so
+// the window's own alpha moves: the system blends it over whatever is behind it, a docked plugin editor included.
+// An opening panel is shown at alpha 0 and rises; a closing one stays shown while it falls and is hidden at the end.
+// The timer runs only during a fade.
+struct Workspace::NativeFader final : private juce::Timer
+{
+    // where `frame` is heading: shown or not (a frame that is fading out counts as hidden)
+    bool heading (const juce::Component& frame) const
+    {
+        for (const auto& f : fades)
+            if (f.frame == &frame)
+                return f.in;
+        return frame.isVisible();
+    }
+    int direction (const juce::Component& frame) const
+    {
+        for (const auto& f : fades)
+            if (f.frame == &frame)
+                return f.in ? 1 : -1;
+        return 0;
+    }
+    void start (juce::Component& frame, bool in)
+    {
+        const auto fading = direction (frame) != 0;
+        drop (frame);
+        if (in && ! fading)
+            frame.setAlpha (0.0f); // (turning round in the middle of a fade: from the alpha it has)
+        if (in)
+            frame.setVisible (true);
+        fades.push_back ({ &frame, in, juce::Time::getMillisecondCounterHiRes() });
+        if (! isTimerRunning())
+            startTimerHz (60);
+    }
+    // ends a fade at once: full alpha, shown or hidden as the caller sets it next
+    void stop (juce::Component& frame)
+    {
+        if (direction (frame) == 0)
+            return;
+        drop (frame);
+        frame.setAlpha (1.0f);
+    }
+    double scale = 1.0;
+
+private:
+    struct Fade
+    {
+        juce::Component::SafePointer<juce::Component> frame;
+        bool in;
+        double last; // ms, the clock at the previous step
+    };
+    std::vector<Fade> fades;
+
+    void drop (const juce::Component& frame)
+    {
+        std::erase_if (fades, [&frame] (const Fade& f) { return f.frame == &frame; });
+    }
+    void timerCallback() override
+    {
+        const auto now = juce::Time::getMillisecondCounterHiRes();
+        for (auto& f : fades)
+        {
+            if (f.frame == nullptr)
+                continue;
+            const auto step = (float) ((now - f.last) / (ui::motion::panelFadeMs * juce::jmax (0.01, scale)));
+            f.last = now;
+            const auto alpha = juce::jlimit (0.0f, 1.0f, f.frame->getAlpha() + (f.in ? step : -step));
+            const auto ended = f.in ? alpha >= 1.0f : alpha <= 0.0f;
+            if (! ended && f.frame->isVisible())
+            {
+                f.frame->setAlpha (alpha);
+                continue;
+            }
+            if (! f.in)
+                f.frame->setVisible (false);
+            f.frame->setAlpha (1.0f); // (opaque again: the window leaves the layered mode)
+            f.frame = nullptr;
+        }
+        std::erase_if (fades, [] (const Fade& f) { return f.frame == nullptr; });
+        if (fades.empty())
+            stopTimer();
+    }
+};
+
+int Workspace::nativeFadeDirection (Panel panel) const
+{
+    return nativeFader != nullptr ? nativeFader->direction (*frames[(std::size_t) panel]) : 0;
+}
+
+void Workspace::setNativeFadeScale (double scale)
+{
+    if (nativeFader == nullptr)
+        nativeFader = std::make_unique<NativeFader>();
+    nativeFader->scale = scale;
+}
+
+void Workspace::applyLayout (bool fadePanels)
 {
     if (! layoutReady)
         return;
+
+    struct Fade
+    {
+        PanelFrame* frame;
+        bool in;
+    };
+    std::vector<Fade> fades;
+    std::array<bool, workspace::panelCount> nativeShown {}; // (native panels that were hidden and show now)
 
     for (int i = 0; i < workspace::panelCount; ++i)
     {
@@ -850,10 +1099,16 @@ void Workspace::applyLayout()
         auto& frame = *frames[(std::size_t) i];
         auto& window = windows[(std::size_t) i];
 
+        if (state.visible && onWillShow != nullptr) // (round 183a: a docked content comes back first)
+            onWillShow (panel);
+
         if (state.detached)
         {
             if (window == nullptr)
             {
+                if (nativeFader != nullptr)
+                    nativeFader->stop (frame);
+                nativechild::detach (frame);
                 removeChildComponent (&frame);
                 frame.setVisible (true);
                 frame.setSize (state.bounds.w, state.bounds.h);
@@ -875,17 +1130,95 @@ void Workspace::applyLayout()
                 addChildComponent (frame);
             }
 
-            frame.setBounds (state.maximised ? getLocalBounds() : toJuce (state.bounds));
-            frame.setVisible (state.visible);
+            // issue #116: a native child window of the main window (developer switch), or a plain child component
+            if (isNativePanel (panel) && ! nativechild::isAttached (frame))
+            {
+                removeChildComponent (&frame);
+                if (nativechild::attach (frame, *this))
+                    nativechild::forwardUnusedKeys (frame);
+                else
+                    addChildComponent (frame); // (no native window yet: PeerWatch tries again when it comes)
+            }
+            else if (! isNativePanel (panel) && nativechild::isAttached (frame))
+            {
+                if (nativeFader != nullptr)
+                    nativeFader->stop (frame);
+                nativechild::detach (frame);
+                addChildComponent (frame);
+            }
+
+            placeFrame (frame, state.maximised ? getLocalBounds() : toJuce (state.bounds));
+            if (nativechild::isAttached (frame))
+            {
+                // a panel the user opens or closes fades as the plain ones below do, by its window's alpha (round 190i)
+                if (nativeFader == nullptr)
+                    nativeFader = std::make_unique<NativeFader>();
+                const auto show = state.visible && isVisible();
+                const auto shown = nativeFader->heading (frame);
+                nativeShown[(std::size_t) i] = show && ! shown;
+                if (show != shown && fadePanels && ui::motion::enabled() && isShowing())
+                    nativeFader->start (frame, show);
+                else if (show != shown)
+                {
+                    nativeFader->stop (frame);
+                    frame.setVisible (show);
+                }
+            }
+            // a panel the user opens or closes fades in or out (Settings › General › Animations, round 179a), after
+            // the stacking order below is set
+            else if (fadePanels && ui::motion::enabled() && isShowing() && frame.isVisible() != state.visible)
+                fades.push_back ({ &frame, state.visible });
+            else
+            {
+                if (state.visible && frame.getAlpha() < 1.0f && ! juce::Desktop::getInstance().getAnimator().isAnimating (&frame))
+                    frame.setAlpha (1.0f);
+                frame.setVisible (state.visible);
+            }
         }
 
         frame.refreshButtons();
     }
 
-    // stacking order (back to front): the background panels first, then the floating ones
+    // stacking order (back to front): the background panels first, then the floating ones. Issue #116: native panels
+    // are only moved when they are out of order, and then just above the panel before them, so a docked plugin window
+    // keeps its place among them (a layout change elsewhere doesn't hide it); a panel that shows now comes in front of
+    // everything (F7, F9: as a click on it, FL brings it in front of the docked plugin windows).
+    juce::Component* nativeBelow = nullptr;
     for (auto panel : layout.stacking())
-        frames[(std::size_t) panel]->toFront (false);
+    {
+        auto& frame = *frames[(std::size_t) panel];
+        if (! nativechild::isAttached (frame))
+        {
+            frame.toFront (false);
+            continue;
+        }
+        if (nativeShown[(std::size_t) panel])
+            frame.toFront (false);
+        else
+            nativechild::keepAbove (frame, nativeBelow);
+        nativeBelow = &frame;
+    }
 
+    // The animator's timer runs only during a fade. Closing fades a picture of the panel placed right behind it (so
+    // after the stacking above), and the panel itself is hidden at once. Opening: the frame is opaque (it hides what is
+    // under it, round 151), which would show black under a half-transparent frame, so it is not opaque until the fade ends.
+    auto& animator = juce::Desktop::getInstance().getAnimator();
+    for (const auto& fade : fades)
+    {
+        if (! fade.in)
+        {
+            animator.fadeOut (fade.frame, ui::motion::panelFadeMs);
+            continue;
+        }
+        fade.frame->setOpaque (false);
+        animator.fadeIn (fade.frame, ui::motion::panelFadeMs);
+        juce::Timer::callAfterDelay (ui::motion::panelFadeMs + 40, [frame = juce::Component::SafePointer<PanelFrame> (fade.frame)] {
+            if (frame != nullptr && ! juce::Desktop::getInstance().getAnimator().isAnimating (frame))
+                frame->setOpaque (true);
+        });
+    }
+
+    nativechild::raiseOverlays();
     setFocusedPanel (layout.focused);
     repaint();
 }

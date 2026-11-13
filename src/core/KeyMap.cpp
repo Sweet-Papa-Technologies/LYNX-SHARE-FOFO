@@ -58,10 +58,18 @@ std::vector<Action> makeActions()
         { "transport.nextMarker", TR_NOOP ("Jump to the next song marker (Quantize song jumps while playing)"), Context::global, { chord (numpadMultiply, alt) } },
         { "transport.previousMarker", TR_NOOP ("Jump to the previous song marker"), Context::global, { chord (numpadDivide, alt) } },
         { "view.typingPiano", TR_NOOP ("Typing keyboard to piano on/off"), Context::global, { chord ('T', ctrl) } },
+        // FL's Options › Switches › "Multilink to controllers" (OptionsToggleMultiLinkAction, Ctrl+J; round 177b-4)
+        { "options.multilink", TR_NOOP ("Multilink to controllers on/off"), Context::global, { chord ('J', ctrl) } },
         { "view.toolbar", TR_NOOP ("Show or hide the toolbar panels"), Context::global, { chord (f11, ctrl) } },
         { "view.audioEditor", TR_NOOP ("Open the audio editor"), Context::global, {} },
         { "view.tempoTapper", TR_NOOP ("Tempo tapper (tap the tempo)"), Context::global, { chord (f5, ctrl) } },
         { "view.sampleBrowser", TR_NOOP ("Sample browser (separate window)"), Context::global, {} },
+        // round 177d (an FL wishlist item): solo the selected channel from any window, no key by default (bind one in
+        // the shortcut editor); again = every channel plays (FL's channel solo)
+        { "channel.soloSelected", TR_NOOP ("Solo the selected channel (from any window)"), Context::global, {} },
+        // round 190an (CROSS-DAW F13): FL's Add › Automation for last tweaked parameter as a key action. FL gives it
+        // no key (DFM Add_AutoLastMenu has no ShortCut and ShortcutsModule has no action for it), so none by default
+        { "automation.lastTweaked", TR_NOOP ("Create automation clip for the last tweaked control"), Context::global, {} },
 
         // workspace panels
         { "panel.playlist", TR_NOOP ("Show, focus or hide the Playlist"), Context::global, { chord (f5) } },
@@ -80,6 +88,12 @@ std::vector<Action> makeActions()
         { "view.midiSettings", TR_NOOP ("MIDI settings (press again to close)"), Context::global, { chord (f10) } },
         { "view.projectInfo", TR_NOOP ("Project info (press again to close)"), Context::global, { chord (f11) } },
         { "view.closeWindows", TR_NOOP ("Close all windows (plugins, channel settings, tools)"), Context::global, { chord (f12) } },
+        // Round 183a: the Clip-launch workflow's detail view, with the reference DAW's keys (its View menu, Live 12.4
+        // [SHOT] detail183a/live/d05). They do nothing in Pattern workflow, where the keys keep their old meaning.
+        { "view.detailToggle", TR_NOOP ("Clip-launch workflow: show or hide the detail view"), Context::global, { chord ('L', ctrl | alt) } },
+        { "view.detailClip", TR_NOOP ("Clip-launch workflow: clip view"), Context::global, { chord ('3', ctrl | alt) } },
+        { "view.detailDevices", TR_NOOP ("Clip-launch workflow: device view"), Context::global, { chord ('4', ctrl | alt) } },
+        { "view.detailSwitch", TR_NOOP ("Clip-launch workflow: switch between clip view and device view"), Context::global, { chord (tab, shift) } },
         { "view.closePluginWindows", TR_NOOP ("Close all plugin windows"), Context::global, { chord (f12, alt) } },
         // FL's CloseAllUnfocusedWindowsAction (Ctrl+F12) and ShowTouchControllerAction (Alt+F7), round 167o
         { "view.closeUnfocusedWindows", TR_NOOP ("Close all windows except the focused one"), Context::global, { chord (f12, ctrl) } },
@@ -178,6 +192,8 @@ std::vector<Action> makeActions()
         { "pianoRoll.articulate", TR_NOOP ("Articulate..."), Context::pianoRoll, { chord ('L', alt) } },
         { "pianoRoll.riffMachine", TR_NOOP ("Riff machine..."), Context::pianoRoll, { chord ('E', alt) } },
         { "pianoRoll.chordProgression", TR_NOOP ("Generate chord progression..."), Context::pianoRoll, { chord ('P', alt) } },
+        // FL's "Run last script again" (Piano roll scripts, round 190as)
+        { "pianoRoll.runLastScript", TR_NOOP ("Run last script again"), Context::pianoRoll, { chord ('Y', ctrl | alt) } },
         // note colours and the Select menu (REA round 153: FL's keys from its piano roll manual)
         { "pianoRoll.colourSelected", TR_NOOP ("Colour the selected notes with the note colour"), Context::pianoRoll, { chord ('C', alt) } },
         { "pianoRoll.selectByColour", TR_NOOP ("Select the notes of the same colour"), Context::pianoRoll, { chord ('C', shift) } },
@@ -202,6 +218,7 @@ std::vector<Action> makeActions()
         { "pianoRoll.gridHighlights", TR_NOOP ("Note grid highlights on/off"), Context::pianoRoll, { chord ('B', alt) } },
         { "pianoRoll.backgroundWave", TR_NOOP ("Background waveform on/off"), Context::pianoRoll, { chord ('N', alt) } },
         { "pianoRoll.showChordName", TR_NOOP ("Show chord name for selection on/off"), Context::pianoRoll, {} },
+        { "pianoRoll.songBarsRuler", TR_NOOP ("Piano roll ruler: song bars on/off"), Context::pianoRoll, {} },
         { "pianoRoll.selectRandomOne", TR_NOOP ("Select one at random"), Context::pianoRoll, { chord ('R', shift) }, true },
         { "pianoRoll.selectRandomMore", TR_NOOP ("Select more at random"), Context::pianoRoll, { chord ('M', shift) }, true },
         { "pianoRoll.selectOddSteps", TR_NOOP ("Select odd (swung) notes"), Context::pianoRoll, { chord ('O', shift) }, true },
@@ -235,6 +252,8 @@ std::vector<Action> makeActions()
         { "pianoRoll.tool.zoom", TR_NOOP ("Tool: Zoom"), Context::pianoRoll, { chord ('Z') } },
         { "pianoRoll.tool.listen", TR_NOOP ("Tool: Listen"), Context::pianoRoll, { chord ('Y') } },
         { "pianoRoll.slide", TR_NOOP ("Slide notes on/off (new notes)"), Context::pianoRoll, { chord ('S') } },
+        // round 190an (LYNX's own option; FL has none, so no key by default): the Piano roll's Snap to scale switch
+        { "pianoRoll.scaleSnap", TR_NOOP ("Snap notes to the scale on/off"), Context::pianoRoll, {} },
         { "pianoRoll.previousChannel", TR_NOOP ("Previous channel"), Context::pianoRoll, { chord ('G') } },
         { "pianoRoll.nextChannel", TR_NOOP ("Next channel"), Context::pianoRoll, { chord ('K') } },
         { "pianoRoll.previousChannelWithNotes", TR_NOOP ("Previous channel with notes"), Context::pianoRoll, { chord ('H') } },
@@ -255,9 +274,12 @@ std::vector<Action> makeActions()
         { "playlist.autoCrossfades", TR_NOOP ("Automatic crossfades (current project) on/off"), Context::playlist, {} },
         // FL's legacy Pattern Blocks (round 170f, issue #60)
         { "playlist.patternBlocks", TR_NOOP ("Pattern blocks (current project) on/off"), Context::playlist, {} },
+        { "playlist.automationLanes", TR_NOOP ("Automation lanes on/off"), Context::playlist, {} },
         { "playlist.blocksToClips", TR_NOOP ("Turn pattern blocks into clips"), Context::playlist, {} },
         // FL's Select › time (round 167k: EESelAroundSelAction, EESelPrevAction / EESelNextAction, Playlist focused)
         { "playlist.selectTimeAround", TR_NOOP ("Select time around selection"), Context::playlist, { chord (enter, ctrl) } },
+        // comping (round 177c, Live's select + Enter; no key yet: Enter is FL's "Maximize or restore the Playlist")
+        { "playlist.swipeSelectionToComp", TR_NOOP ("Send the time selection of the take lane to its comp"), Context::playlist, {} },
         { "playlist.timePrevious", TR_NOOP ("Select previous time"), Context::playlist, { chord (left, ctrl) } },
         { "playlist.timeNext", TR_NOOP ("Select next time"), Context::playlist, { chord (right, ctrl) } },
         // FL 2026's Playlist › Time markers (round 167k: EEMarkerAdd2Menu 32852, EEMarkerAddAutoMenu 16468,
@@ -290,6 +312,9 @@ std::vector<Action> makeActions()
         // round 168f: FL's Playlist keys and menu items ([DFM ShortcutsModule] EEMergeAction Ctrl+G, EEClonePLTracksAction
         // Ctrl+Shift+B, EEMakeUniqueAction Ctrl+Shift+V; the STRETCH button's hint "Shift+M")
         { "playlist.mergePatternClips", TR_NOOP ("Merge pattern clips"), Context::playlist, { chord ('G', ctrl) } },
+        // round 180c: [DFM ShortcutsModule] EEMergeSimAction Ctrl+Shift+G, EEMergeAutoClipsAction Ctrl+Alt+G
+        { "playlist.mergeSimilarClips", TR_NOOP ("Merge similar pattern clips"), Context::playlist, { chord ('G', ctrl | shift) } },
+        { "playlist.mergeAutomationClips", TR_NOOP ("Merge automation clips"), Context::playlist, { chord ('G', ctrl | alt) } },
         { "playlist.cloneTracks", TR_NOOP ("Clone selected playlist track(s)"), Context::playlist, { chord ('B', ctrl | shift) } },
         { "playlist.makeUnique", TR_NOOP ("Make the selected clips unique"), Context::playlist, { chord ('V', ctrl | shift) } },
         // FL's Alt+M / Shift+Alt+M (EEMuteAction / EEUnmuteAction, issue #53): the selected clips, or all of them
@@ -303,6 +328,29 @@ std::vector<Action> makeActions()
         { "playlist.collapseAllGroups", TR_NOOP ("Collapse all grouped tracks"), Context::playlist, {} },
         { "playlist.expandAllGroups", TR_NOOP ("Expand all grouped tracks"), Context::playlist, {} },
         { "playlist.purgeUnusedAudio", TR_NOOP ("Purge unused audio clips"), Context::playlist, {} },
+        // round 189e: FL's Playlist Edit / Select items it lacked (EEMenu as the Playlist enables it, FL 2026 shots f04/f06)
+        { "playlist.shiftLeft", TR_NOOP ("Shift the selected clips left (one snap step)"), Context::playlist, { chord (left, shift) } },
+        { "playlist.shiftRight", TR_NOOP ("Shift the selected clips right (one snap step)"), Context::playlist, { chord (right, shift) } },
+        { "playlist.shiftUp", TR_NOOP ("Shift the selected clips up (one track)"), Context::playlist, { chord (up, shift) } },
+        { "playlist.shiftDown", TR_NOOP ("Shift the selected clips down (one track)"), Context::playlist, { chord (down, shift) } },
+        // round 190ag (issue #147): FL's editor KeyDown (FUN_00e52360) sends Left / Right with Alt held, with or without
+        // Shift, to the same shift as Shift+Left / Right (FUN_00e51730), which then steps by a pixel's worth of ticks
+        { "playlist.nudgeLeft", TR_NOOP ("Nudge the selected clips left (fine step, no snap)"), Context::playlist, { chord (left, alt), chord (left, alt | shift) } },
+        { "playlist.nudgeRight", TR_NOOP ("Nudge the selected clips right (fine step, no snap)"), Context::playlist, { chord (right, alt), chord (right, alt | shift) } },
+        { "playlist.sliceInsertSpace", TR_NOOP ("Slice & insert space"), Context::playlist, { chord (insert, ctrl | alt) } },
+        { "playlist.trimSpace", TR_NOOP ("Trim selection (keep only the time selection)"), Context::playlist, {} },
+        { "playlist.deselect", TR_NOOP ("Deselect (clips and time)"), Context::playlist, { chord ('D', ctrl) } },
+        { "playlist.selectBySource", TR_NOOP ("Select by selected source"), Context::playlist, { chord ('C', shift) } },
+        { "playlist.invertSelection", TR_NOOP ("Invert selection"), Context::playlist, { chord ('I', shift) } },
+        // round 189g: FL's Edit / Select options ([DFM ShortcutsModule] EEMakeUniqueAsSampleAction, EELeftResizingAction
+        // ShortCut 49188 = Ctrl+Alt+Home, EEShiftMouseWheelNudgeAction, EECreateNewClipsWithManualFadesAction,
+        // EESnapFadeHandlesAction, EESelMagicAction)
+        { "playlist.makeUniqueAsSample", TR_NOOP ("Make the selected audio clips unique as samples"), Context::playlist, {} },
+        { "playlist.leftResizing", TR_NOOP ("Allow resizing clips from the left on/off"), Context::playlist, { chord (home, ctrl | alt) } },
+        { "playlist.wheelNudging", TR_NOOP ("Nudge clips with Shift+mouse wheel on/off"), Context::playlist, {} },
+        { "playlist.manualFades", TR_NOOP ("Create new clips with manual fades on/off"), Context::playlist, {} },
+        { "playlist.snapFadeHandles", TR_NOOP ("Snap fade handles on/off"), Context::playlist, {} },
+        { "playlist.magicLasso", TR_NOOP ("Magic lasso (circle clips with the mouse to select them) on/off"), Context::playlist, {} },
 
         // Browser (focused)
         { "browser.previous", TR_NOOP ("Previous file (preview)"), Context::browser, { chord (up) } },
@@ -328,7 +376,10 @@ std::vector<Action> makeActions()
         { "mixer.altSoloSelected", TR_NOOP ("Alt solo the selected mixer track(s) (with the tracks that feed them)"), Context::mixer, { chord ('S', alt) } },
         { "mixer.renderArmed", TR_NOOP ("Disk recording: render the armed tracks to wave file(s)"), Context::mixer, { chord ('R', alt) } },
         { "mixer.renderSelected", TR_NOOP ("Disk recording: render the selected tracks to wave file(s)"), Context::mixer, { chord ('R', shift | alt) } },
-        { "mixer.deleteEffect", TR_NOOP ("Delete the selected effect slot's plugin"), Context::mixer, { chord (del) } },
+        // FL 2026 (round 186c, checked by hand): Del deletes the selected mixer tracks (with FL's question); it never removes
+        // an effect, except with the slot's menu open (issue #11, handled by that menu). The effect action stays, unbound.
+        { "mixer.deleteTracks", TR_NOOP ("Delete the selected mixer tracks"), Context::mixer, { chord (del) } },
+        { "mixer.deleteEffect", TR_NOOP ("Delete the selected effect slot's plugin"), Context::mixer, {} },
     };
 
     // numeric keypad 1-9: select patterns 1-9
@@ -657,6 +708,35 @@ TypingKey typingPianoKey (int key, int octave, int root, int layout)
 std::vector<int> typingPianoNotes (int key, int octave, int root, int layout)
 {
     return typingPianoKey (key, octave, root, layout).notes;
+}
+
+namespace
+{
+// layoutKeys by PC scan code (set 1): 0x02..0x0D the number row, 0x10..0x1B the Q row, 0x1E..0x28 the A row, 0x29 `,
+// 0x2B \, 0x2C..0x35 the Z row (the gaps are Backspace / Tab, Enter / Ctrl and the left Shift)
+constexpr int firstTypingScanCode = 0x02, lastTypingScanCode = 0x35;
+constexpr char usKeyByScanCode[] = "1234567890-=\0\0QWERTYUIOP[]\0\0ASDFGHJKL;'`\0\\ZXCVBNM,./";
+static_assert (sizeof (usKeyByScanCode) - 1 == lastTypingScanCode - firstTypingScanCode + 1);
+} // namespace
+
+int typingpiano::usKeyOfScanCode (int scanCode) noexcept
+{
+    return scanCode >= firstTypingScanCode && scanCode <= lastTypingScanCode ? (int) (unsigned char) usKeyByScanCode[scanCode - firstTypingScanCode] : 0;
+}
+
+int typingpiano::scanCodeOfUsKey (int key) noexcept
+{
+    const auto c = key >= 'a' && key <= 'z' ? key - 'a' + 'A' : key;
+    for (int scan = firstTypingScanCode; scan <= lastTypingScanCode; ++scan)
+        if (c > 0 && usKeyOfScanCode (scan) == c)
+            return scan;
+    return 0;
+}
+
+int typingpiano::physicalKey (int keyCode, const ScanCodeLookup& scanCodeOf)
+{
+    const auto scanCode = scanCodeOf != nullptr ? scanCodeOf (keyCode) : 0;
+    return scanCode > 0 ? usKeyOfScanCode (scanCode) : keyCode;
 }
 
 KeyMap::KeyMap()
