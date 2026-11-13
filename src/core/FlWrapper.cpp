@@ -126,7 +126,23 @@ bool parseFlWrapper (const std::vector<std::uint8_t>& blob, ForeignPlugin& out)
                     }
                 }
                 break;
-            default: break; // pins: LYNX does not need them
+            case 0x1F: // Processing › Connections, round 188d [DATA]: 12 bytes per input / output
+            case 0x20:
+            {
+                auto& list = id == 0x1F ? out.inputRoutes : out.outputRoutes;
+                list.clear();
+                for (std::size_t k = 0; k + 12 <= n && list.size() < 256; k += 12)
+                {
+                    std::int32_t offset = 0;
+                    std::uint32_t active = 1;
+                    std::memcpy (&offset, p + k, 4);
+                    std::memcpy (&active, p + k + 4, 4);
+                    list.push_back ({ std::clamp (offset, -999, 999), (std::int8_t) (active != 0 ? 1 : 0) });
+                }
+                out.hasRoutes = true;
+                break;
+            }
+            default: break; // 0x1E (the counts): the lists carry them
         }
     });
 
@@ -147,8 +163,20 @@ bool parseFlWrapper (const std::vector<std::uint8_t>& blob, ForeignPlugin& out)
 
 void applyFlWrapperOptions (const ForeignPlugin& w, PluginRef& ref)
 {
+    // Processing › Connections (round 188d): the inputs and outputs as FL routed them (a generator's outputs: mixer
+    // track offsets; an effect's: sidechain indexes)
+    if (w.hasRoutes)
+    {
+        ref.outputs = w.outputRoutes;
+        ref.inputs = w.inputRoutes;
+        trimOutputRoutes (ref.outputs);
+        trimOutputRoutes (ref.inputs);
+    }
     if (! w.hasWrapperOptions || (w.wrapperFlags & 0x400000u) != 0)
         return;
+    // "Process inactive inputs and outputs" (flag 0x8, round 188d [DATA: mo-a / mo-b saves])
+    if (w.wrapperVersion >= 10)
+        ref.processInactive = (w.wrapperFlags & 0x8u) != 0;
     ref.fixedBuffers = (w.wrapperFlags & 0x2u) != 0;
     ref.notifyRender = (w.wrapperFlags & 0x4u) != 0; // "Notify about rendering mode" (REA round 134)
     ref.maxSizeBuffers = ref.fixedBuffers && (w.fixedOptions & 0x1u) != 0;
@@ -171,8 +199,14 @@ void applyFlWrapperOptions (const ForeignPlugin& w, PluginRef& ref)
         ref.sendLoopPosition = (w.wrapperFlags & 0x800u) != 0;
         ref.modXAftertouch = (w.wrapperFlags & 0x20000u) != 0;
         ref.resetOnFlush = (w.wrapperFlags & 0x02000000u) == 0;
+        // the window's Typing keyboard priority button off [DATA round 187a: kb-on.flp / kb-off2.flp, 0xB4007D8C -> 0xB5007D8C]
+        ref.hostKeysFirst = (w.wrapperFlags & 0x01000000u) != 0;
         if (w.hasWrapperFlags2)
+        {
             ref.allNotesOffOnStop = (w.wrapperFlags2 & 0x1000u) == 0;
+            // "Allow FL Studio to process keyboard presses when the keyboard focus option is on" [DATA: the same project saved with it off and on, only this bit differs]
+            ref.allowHostKeys = (w.wrapperFlags2 & 0x800u) != 0;
+        }
     }
     if (w.bendRange >= 1 && w.bendRange <= 48)
         ref.bendRange = w.bendRange;
@@ -363,9 +397,13 @@ const std::vector<WrapperOption>& wrapperOptions()
         { "Processing", "Allow threaded processing", "Allow the plugin to be multi-threaded (off: always on the audio thread)", &PluginRef::threaded, false, false },
         { "Processing", "Make bridged", "Load the plugin in a separate process (bridged)", &PluginRef::separateProcess, true, false },
         { "Processing", "Allow smart disable", "Allow smart disable for the plugin (off: it is always processed)", &PluginRef::allowSmartDisable, false, false },
+        // round 188d [EXEC]: on, an output whose LED is off still plays on its insert
+        { "Processing", "Process inactive inputs and outputs", "Process inputs and outputs marked as inactive", &PluginRef::processInactive, false, false },
         { "MIDI", "Send note release velocity", "Send release velocity in note off messages", &PluginRef::releaseVelocity, true, false },
         { "MIDI", "Send pitch bend range (semitones)", "Send a pitch bend range MIDI RPN", &PluginRef::sendBendRange, true, false },
         { "MIDI", "Send MOD X as polyphonic aftertouch", "Send each note's Modulation X as polyphonic aftertouch", &PluginRef::modXAftertouch, true, false },
+        // issue #108 (a LYNX addition; FL's wrapper has no MPE switch): beside the other per-note MIDI options
+        { "MIDI", "MPE", "MIDI Polyphonic Expression: each note on its own MIDI channel with its fine pitch, Mod X (timbre) and Mod Y (pressure)", &PluginRef::mpe, true, false },
         { "MIDI", "Send All Notes Off when playback stops", "Off: only the notes still held get their note off", &PluginRef::allNotesOffOnStop, true, false },
         { "Compatibility", "Reset plugin when LYNX resets", "Reset the plugin before an export and on panic (clears its tails and held notes)", &PluginRef::resetOnFlush, true, false },
         { "Compatibility", "Send loop position", "Let the plugin know about loop start and end points", &PluginRef::sendLoopPosition, true, false },
@@ -374,5 +412,35 @@ const std::vector<WrapperOption>& wrapperOptions()
         { "Compatibility", "Use maximum buffer size from host", "With fixed size buffers: prepare the plugin for the host's largest block", &PluginRef::hostMaxBuffer, true, true },
     };
     return options;
+}
+
+void trimOutputRoutes (std::vector<PluginOutputRoute>& routes)
+{
+    while (! routes.empty() && routes.back() == PluginOutputRoute {})
+        routes.pop_back();
+}
+
+void autoMapOutputs (std::vector<PluginOutputRoute>& routes, int count)
+{
+    if (count <= 0)
+        return;
+    if ((int) routes.size() < count)
+        routes.resize ((std::size_t) count);
+    const auto first = routes.front().offset;
+    for (int k = 0; k < count; ++k)
+        routes[(std::size_t) k].offset = std::clamp (first + k, -999, 999);
+    trimOutputRoutes (routes);
+}
+
+void resetOutputOffsets (std::vector<PluginOutputRoute>& routes, int count)
+{
+    for (int k = 0; k < std::min (count, (int) routes.size()); ++k)
+        routes[(std::size_t) k].offset = 0;
+    trimOutputRoutes (routes);
+}
+
+int outputTargetTrack (int channelTrack, const PluginOutputRoute& route, bool pluginDefault) noexcept
+{
+    return route.isActive (pluginDefault) ? channelTrack + route.offset : -1;
 }
 } // namespace lynx

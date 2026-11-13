@@ -23,6 +23,38 @@ int clampAutosaveMinutes (int minutes); // the nearest choice
 constexpr int defaultAutosaveMinutes = 2;
 constexpr int defaultAutosaveKeep = 10;
 int clampAutosaveKeep (int keep); // 1..100
+// Round 177d (an FL wishlist item: a backup written while playing made the sound stutter; the user's decision): with
+// "waitForQuiet" on (the default) a due backup also waits while the song plays and until `quietMs` after the last
+// MIDI input, not only while recording (FL postpones it for recording only).
+constexpr double backupQuietMs = 5000.0;
+// The user's decision: after `longestWaitMs` without a backup one is written anyway, playing or not (Settings › General,
+// 10 minutes by default). Never during a recording.
+constexpr int defaultBackupLongestWaitMinutes = 10;
+constexpr int backupLongestWaitChoices[] = { 5, 10, 15, 20, 30, 60 };
+constexpr int clampBackupLongestWait (int minutes) noexcept
+{
+    auto best = defaultBackupLongestWaitMinutes;
+    auto bestGap = 1 << 30;
+    for (const auto c : backupLongestWaitChoices)
+        if (const auto gap = c > minutes ? c - minutes : minutes - c; gap < bestGap)
+        {
+            best = c;
+            bestGap = gap;
+        }
+    return best;
+}
+inline bool backupMayRun (bool recording, bool playing, double msSinceMidi, bool waitForQuiet, double msSinceBackup,
+                          double longestWaitMs) noexcept
+{
+    if (recording)
+        return false;
+    if (msSinceBackup >= longestWaitMs)
+        return true;
+    return ! waitForQuiet || (! playing && msSinceMidi >= backupQuietMs);
+}
+// A MIDI message that means someone is playing: channel messages only. Clock, active sensing and the rest of the
+// system messages (0xF0 and up) run by themselves whenever a device is plugged in.
+constexpr bool midiMeansPlaying (unsigned char status) noexcept { return status >= 0x80 && status < 0xF0; }
 
 // Backup file name (without extension) of project `stem` saved at a date/time: "Night Drive (2026-10-16 19.50.03)".
 // Sorting these names sorts them by time.
@@ -108,12 +140,33 @@ enum class VelocityCurve
 };
 float mapVelocity (float velocity, VelocityCurve curve) noexcept; // 0..1 -> 0..1 (0 stays 0: a note-off)
 
+// Round 190ao (pain point 12; LYNX's own: FL's wrapper has no velocity setting, its MIDI group is the ports, release
+// velocity, pitch bend range, MOD X aftertouch and All Notes Off [DATA Fruity Wrapper DFM, REA round 149 C7]): a hosted
+// instrument's own answer to the notes played into it from MIDI devices (PluginRef::velocityMode / fixedVelocity).
+// Mode 0 follows the MIDI settings' curve (the default: nothing changes); 1…4 is the plugin's own curve
+// (VelocityCurve + 1), where Fixed plays every note at `fixedVelocity` (1…127), not at full velocity.
+constexpr int pluginVelocityFollow = 0;
+constexpr int pluginVelocityFixed = (int) VelocityCurve::fixed + 1;
+constexpr int defaultFixedVelocity = 100; // (FL's default note velocity, 100 of 127)
+constexpr int clampPluginVelocityMode (int mode) noexcept { return mode < 0 || mode > pluginVelocityFixed ? pluginVelocityFollow : mode; }
+constexpr int clampFixedVelocity (int velocity) noexcept { return velocity < 1 ? 1 : velocity > 127 ? 127 : velocity; }
+float mapPluginVelocity (float velocity, int mode, int fixedVelocity, VelocityCurve global) noexcept; // (0 stays 0)
+
 struct MidiInputPrefs
 {
     std::string name;     // the device name (as the system shows it)
     bool enabled = true;  // new devices are on
     int midiChannel = 0;  // 0 = any (omni), 1..16 = only that channel
     int target = -1;      // -1 = the selected channels of the Channel Rack, else that Channel Rack channel (0-based)
+    // "Controller type" (round 190aw, core/ControllerProfile.h): "" = detect a profile by the port name,
+    // "generic" = a generic controller (no profile), else a profile's id
+    std::string controller;
+    // MPE (issue #108, core/Mpe.h; a LYNX addition): the device is an MPE controller — lower zone, master channel 1,
+    // `mpeMembers` member channels from 2 up, per-note pitch bend over `mpeBendRange` semitones. The MIDI channel
+    // filter above does not apply then.
+    bool mpe = false;
+    int mpeMembers = 15;
+    int mpeBendRange = 48;
 
     bool operator== (const MidiInputPrefs&) const = default;
 };
@@ -149,12 +202,18 @@ struct MidiPrefs
     std::vector<GlobalLink> globalLinks;
     VelocityCurve velocity = VelocityCurve::linear;
     bool pickup = false;                // a controller takes over a parameter only once it reaches its value
+    // FL's "Foot pedal controls note off" (KbHoldSupportBox, on; round 187a): LYNX holds the notes on CC 64 (sustain)
+    // and CC 66 (sostenuto); off, the pedal goes to the plugins as a controller
+    bool footPedalNoteOff = true;
     // FL's Options › MIDI "Song marker jump (MIDI channel)": a note on this channel (1..16; 0 = off) jumps the song to
     // a marker (note 0 = the first marker...) instead of playing
     int songMarkerJumpChannel = 0;
     // FL's "MIDI channel used for playlist live mode" (round 165m): notes on this channel (1…16, 0 = off) launch the
     // Playlist's performance clips while Performance mode is on (core/Performance.h, perf::MidiMapping)
     int performanceChannel = 0;
+    // "Use a game controller" (round 184a, S16): the first XInput pad plays the transport and is linkable like a
+    // MIDI controller (core/GamepadMap.h); off by default
+    bool gamepad = false;
 
     // The settings of a device (the defaults when it was never changed).
     MidiInputPrefs input (const std::string& name) const;

@@ -92,6 +92,26 @@ void addFolderViewItems (juce::PopupMenu& menu, AudioEngine& engine);
 // under its folder's heading only, as in FL where every plugin is in one folder)
 bool inUserFolder (AudioEngine& engine, const std::string& key);
 
+// Round 190ba (issue #104): the Plugin database is a folder on disk (core/PluginDbFolder.h; FL keeps its own the same
+// way and its users arrange it in Explorer). pluginDatabaseFolder(): Documents/LYNX/Plugin database, or the folder of
+// one kind's user folder ("" = Effects / Generators). refreshPluginDatabase reads it into the plugin host (folders,
+// places, names; the first time it is made from the settings), at most every two seconds unless `force`; the plugin
+// menus, the Browser's Plugin database and the Plugin picker call it before they list anything. installPluginDatabase
+// (once, at start) also makes the host write the changes made in LYNX to the folder. Nothing happens for an engine
+// whose plugin host keeps no settings (snapshots, exports, tests).
+juce::File pluginDatabaseFolder();
+juce::File pluginDatabaseFolder (bool instruments, const std::string& userFolder);
+void refreshPluginDatabase (AudioEngine& engine, bool force = false);
+// Round 190bf: the entry file of a plugin in that folder (its place under Effects / Generators, else under Installed;
+// a missing file when it has none), for the Browser's "System" items; and "the folder changed on disk" (the folder
+// watcher, ui/MainComponent): the next plugin menu or picker reads it again (FL: menus and the picker that are already
+// open stay as they are, the next one shows the change).
+juce::File pluginDatabaseEntry (const std::string& key, bool instruments);
+void markPluginDatabaseChanged();
+// A radio item (FL's Categories / Simple / Tree, Disk recording's Format): a dot instead of a tick
+void addRadioItem (juce::PopupMenu& menu, const juce::String& text, bool selected, std::function<void()> action);
+void installPluginDatabase (AudioEngine& engine);
+
 // Adds `picks` at the top of `menu` under a header ("Renamed plugins: type the first character").
 void addPicks (juce::PopupMenu& menu, const std::vector<Pick>& picks);
 

@@ -5,6 +5,8 @@
 #include "core/VoltageController.h"
 #include "core/MidiOut.h"
 #include "core/PatternBlocks.h"
+#include "core/MidiControls.h"
+#include "core/SessionIds.h"
 
 #include <algorithm>
 #include <iterator>
@@ -130,6 +132,77 @@ void followPatternLengths (const std::vector<std::int64_t>& before, Song& song)
     }
 }
 
+namespace
+{
+template <typename Song_, typename Fn>
+void forEachHostedPlugin (Song_& song, Fn&& fn)
+{
+    for (auto& c : song.channels)
+        if (c.instrument == InstrumentKind::plugin && ! c.plugin.id.empty())
+            fn (c.plugin);
+    for (auto& track : song.mixer)
+        for (auto& slot : track.effects)
+            if (slot.kind == EffectKind::plugin && ! slot.plugin.id.empty())
+                fn (slot.plugin);
+}
+} // namespace
+
+namespace
+{
+// a plugin an edit may have just added: no saved state yet (not loaded with a project, not a clone) and still docked
+bool looksJustAdded (const PluginRef& ref) { return ref.state.empty() && ! ref.detached; }
+} // namespace
+
+std::map<std::string, int> freshPluginCounts (const Song& song)
+{
+    std::map<std::string, int> counts;
+    forEachHostedPlugin (song, [&counts] (const PluginRef& ref) {
+        if (looksJustAdded (ref))
+            ++counts[ref.id];
+    });
+    return counts;
+}
+
+int detachNewPlugins (const std::map<std::string, int>& before, Song& song)
+{
+    // only fresh plugins count on both sides, so a clone or a loaded plugin (with a state) that raises the number of
+    // an id never gets an older fresh plugin of that id (one the user docked again) marked in its place
+    auto added = freshPluginCounts (song);
+    for (auto& [id, n] : added)
+        if (const auto it = before.find (id); it != before.end())
+            n -= it->second;
+
+    // the newest of an id are the last ones: skip the fresh plugins that were already there
+    std::map<std::string, int> seen;
+    const auto now = freshPluginCounts (song);
+    int marked = 0;
+    forEachHostedPlugin (song, [&] (PluginRef& ref) {
+        if (! looksJustAdded (ref))
+            return;
+        const auto index = seen[ref.id]++;
+        const auto left = added[ref.id];
+        if (left > 0 && index >= now.at (ref.id) - left)
+        {
+            ref.detached = true;
+            ++marked;
+        }
+    });
+    return marked;
+}
+
+int setAllPluginsDetached (Song& song, bool detached)
+{
+    int changed = 0;
+    forEachHostedPlugin (song, [&] (PluginRef& ref) {
+        if (ref.detached != detached)
+        {
+            ref.detached = detached;
+            ++changed;
+        }
+    });
+    return changed;
+}
+
 std::vector<std::int64_t> patternLengths (const Song& song)
 {
     std::vector<std::int64_t> lengths;
@@ -207,7 +280,7 @@ bool Song::insertInUse (int t) const
         return true;
     // round 163 (hiding unused inserts): a fader, pan, mute or colour moved by hand, or automation on it, counts too
     const auto& m = mixer[(std::size_t) t];
-    if (m.volume != unityFader || m.pan != 0.0f || m.muted || m.solo || m.colour != 0 || m.stereo != 0.0f || m.eq.active()
+    if (m.volume != unityFader || m.pan != 0.0f || m.muted || m.solo || m.colour != 0 || m.stereo != 0.0f || m.eq.hasBoostOrCut()
         || m.outputChannel != outputDefault)
         return true;
     if (std::any_of (mixer.begin(), mixer.end(), [t] (const MixerTrack& o) {
@@ -410,7 +483,7 @@ int fruitySendTarget (const EffectSlot& slot) noexcept
 int slotSendTarget (const EffectSlot& slot, int output) noexcept
 {
     if (slot.kind == EffectKind::transmitter || (slot.kind == EffectKind::equo && output == 0)) // (EQUO: its band sends, round 173d3)
-        return output >= 0 && output < maxSlotSends && slot.sendTracks[(std::size_t) output] > 0 ? slot.sendTracks[(std::size_t) output] : -1;
+        return output >= 0 && output < (int) slot.sendTracks.size() && slot.sendTracks[(std::size_t) output] > 0 ? slot.sendTracks[(std::size_t) output] : -1;
     return output == 0 ? fruitySendTarget (slot) : -1;
 }
 
@@ -422,11 +495,95 @@ std::vector<SlotSendTap> fruitySendsOf (const Song& song, int track)
         return out;
     const auto& slots = song.mixer[(std::size_t) track].effects;
     for (int s = 0; s < (int) slots.size() && s < maxEffectSlots; ++s)
+    {
+        const auto& slot = slots[(std::size_t) s];
+        if (slot.kind == EffectKind::plugin)
+        {
+            // a hosted effect's output pairs that its Connections send elsewhere (round 189j), after its processing
+            const auto c = slotConnections (song, track, slot);
+            for (int o = 0; o < maxPluginConnections && c.routed; ++o)
+                if (const auto target = c.outputs[(std::size_t) o]; target >= 0 && target < n && target != track)
+                    out.push_back ({ s, target, o, true });
+            continue;
+        }
         for (int o = 0; o < maxSlotSends; ++o)
-            if (const auto target = slotSendTarget (slots[(std::size_t) s], o); target > 0 && target < n && target != track)
-                out.push_back ({ s, target, o, slots[(std::size_t) s].kind == EffectKind::transmitter
-                                                                                       || slots[(std::size_t) s].kind == EffectKind::equo });
+            if (const auto target = slotSendTarget (slot, o); target > 0 && target < n && target != track)
+                out.push_back ({ s, target, o, slot.kind == EffectKind::transmitter || slot.kind == EffectKind::equo });
+    }
     return out;
+}
+
+std::vector<int> insertInputList (const Song& song, int track)
+{
+    std::vector<int> list { track };
+    for (int from = 1; from < (int) song.mixer.size(); ++from)
+        if (from != track && song.routes (from, track))
+            list.push_back (from);
+    return list;
+}
+
+std::vector<int> insertOutputList (const Song& song, int track)
+{
+    std::vector<int> list { track };
+    if (track <= 0 || track >= (int) song.mixer.size())
+        return list;
+    for (int to = 0; to < (int) song.mixer.size(); ++to)
+        if (to != track && song.routes (track, to))
+            list.push_back (to);
+    return list;
+}
+
+SlotConnections slotConnections (const Song& song, int track, const EffectSlot& slot)
+{
+    SlotConnections c;
+    const auto n = (int) song.mixer.size();
+    const auto& ref = slot.plugin;
+    if (slot.kind != EffectKind::plugin || track <= 0 || track >= n || (ref.inputs.empty() && ref.outputs.empty()))
+        return c;
+    c.routed = true;
+    // an inactive input / output: silent, unless "Process inactive inputs and outputs" (on by default) [EXEC]
+    auto on = [&ref] (const PluginOutputRoute& r) { return r.isActive (true) || ref.processInactive; };
+    const auto at = [] (const std::vector<PluginOutputRoute>& list, std::size_t k) { return k < list.size() ? list[k] : PluginOutputRoute {}; };
+
+    // index k = entry k of the inputs list; 0 or past the list = the slot's own input [EXEC e01 e02 e10]
+    std::vector<int> sources;
+    auto source = [&] (int k) {
+        if (k <= 0)
+            return -1;
+        if (sources.empty())
+            sources = insertInputList (song, track);
+        return k < (int) sources.size() ? sources[(std::size_t) k] : -1;
+    };
+    const auto in1 = at (ref.inputs, 0), in2 = at (ref.inputs, 1);
+    c.mainSource = on (in1) ? source (in1.offset) : -2;
+    // input 2: the slot's side input source (LYNX's SC picker, or its index, which sets it: core/MixerOps.h), else
+    // its index; without either the slot's own input [EXEC e00: FL feeds an input at index 0 the insert's audio]
+    if (! on (in2))
+        c.sideSource = -2;
+    else if (slot.sidechain > 0 && slot.sidechain != track && slot.sidechain < n)
+        c.sideSource = slot.sidechain;
+    else
+        c.sideSource = source (in2.offset);
+
+    // outputs: index 0 = into the insert; k = entry k of the outputs list, past its end the last one [EXEC e05 e07 e11
+    // e12 e13 e18 e19]; (a negative index, which FL's wheel never gives, went to the Master past the fader, e17 e23)
+    std::vector<int> targets;
+    for (int o = 0; o < maxPluginConnections; ++o)
+    {
+        const auto r = ref.outputRoute (o);
+        if (! on (r))
+            c.outputs[(std::size_t) o] = -2;
+        else if (r.offset < 0)
+            c.outputs[(std::size_t) o] = 0;
+        else if (r.offset > 0)
+        {
+            if (targets.empty())
+                targets = insertOutputList (song, track);
+            if (targets.size() > 1)
+                c.outputs[(std::size_t) o] = targets[(std::size_t) std::min (r.offset, (int) targets.size() - 1)];
+        }
+    }
+    return c;
 }
 
 bool Song::routes (int from, int to) const noexcept
@@ -473,6 +630,25 @@ void Song::setRouteLevel (int from, int to, float level)
         for (auto& s : t.sends)
             if (s.target == to)
                 s.level = v;
+}
+
+bool Song::sendPre (int from, int to) const noexcept
+{
+    if (to <= 0 || ! routes (from, to))
+        return false;
+    for (const auto& s : mixer[(std::size_t) from].sends)
+        if (s.target == to)
+            return s.pre;
+    return false;
+}
+
+void Song::setSendPre (int from, int to, bool pre)
+{
+    if (to <= 0 || ! routes (from, to))
+        return;
+    for (auto& s : mixer[(std::size_t) from].sends)
+        if (s.target == to)
+            s.pre = pre;
 }
 
 bool Song::canRoute (int from, int to) const
@@ -740,6 +916,15 @@ void Song::removeAutomation (int index)
         return;
 
     automations.erase (automations.begin() + index);
+
+    for (auto& track : playlistTracks) // round 177b: lanes follow the renumbering; the removed one's lane goes
+    {
+        track.lanes.erase (std::remove_if (track.lanes.begin(), track.lanes.end(), [index] (const AutomationLane& l) { return l.automation == index; }),
+                           track.lanes.end());
+        for (auto& l : track.lanes)
+            if (l.automation > index)
+                --l.automation;
+    }
 
     forEachClipList ([index] (std::vector<Clip>& clips) {
         clips.erase (std::remove_if (clips.begin(), clips.end(),
@@ -1154,9 +1339,9 @@ float Song::targetValueAt (const AutomationTarget& target, double tick) const
             ended = &c;
     }
     if (playing != nullptr)
-        return automations[(std::size_t) playing->automation].valueAt (tick - (double) playing->start + (double) playing->offset);
+        return automations[(std::size_t) playing->automation].playAt (tick - (double) playing->start + (double) playing->offset, tick);
     if (ended != nullptr)
-        return automations[(std::size_t) ended->automation].valueAt ((double) (ended->length + ended->offset));
+        return automations[(std::size_t) ended->automation].playAt ((double) (ended->length + ended->offset), (double) ended->end());
     return std::numeric_limits<float>::quiet_NaN();
 }
 
@@ -1207,6 +1392,11 @@ float PatternEvents::valueAt (double tick) const noexcept
 
 float Automation::valueAt (double tick) const noexcept
 {
+    return automationCurveAt (points, tick);
+}
+
+float automationCurveAt (const std::vector<AutomationPoint>& points, double tick) noexcept
+{
     if (points.empty())
         return 0.5f;
 
@@ -1232,6 +1422,152 @@ float Automation::valueAt (double tick) const noexcept
     }
 
     return points.back().value;
+}
+
+// --- FL's automation clip LFO (REA round 177b; FUN_00ba1700, FUN_00ba0710, FUN_00ba03d0, FUN_00677660/820) ---------
+bool AutomationLfo::isDefault() const noexcept
+{
+    return *this == AutomationLfo {};
+}
+
+double AutomationLfo::cyclesPerBeat (int speed) noexcept
+{
+    // rate = (10001^(speed/65536) − 1) · 2^32/625 phase units per beat (FL: 45819 = 1 beat, 40898 = 2, 26257 = 16)
+    return (std::pow (10001.0, (double) speed / 65536.0) - 1.0) / 625.0;
+}
+
+int AutomationLfo::speedForBeats (double beatsPerCycle) noexcept
+{
+    if (beatsPerCycle <= 0.0)
+        return 65536;
+    const auto speed = 65536.0 * std::log (625.0 / beatsPerCycle + 1.0) / std::log (10001.0);
+    return (int) std::clamp (std::lround (speed), 512L, 65536L);
+}
+
+float AutomationLfo::shape (std::uint32_t phase, int tensionKnob, int skewKnob, int pulseWidthKnob, bool unipolar) noexcept
+{
+    constexpr double full = 4294967296.0; // 2^32: one cycle
+    const auto p = (double) pulseWidthKnob / 128.0;
+    const auto s = (double) skewKnob / 256.0;
+    const auto s7 = p > 0.0 ? std::round ((1.0 - p) * full - 1.0) : 4294967295.0;
+    const auto d = std::clamp (((1.0 - p) * 0.5 - s * (1.0 - std::abs (p))) * full, 1.0, s7 - 1.0);
+    const auto s5 = std::round (d);
+    const auto s6 = p < 0.0 ? std::max (1.0, std::round (d + p * full)) : s5;
+    const auto phi = (double) phase;
+
+    double x;
+    if (phi > s7)
+        return 1.0f; // the pulse's top (p > 0)
+    if (phi < s6)
+        x = 1.0 - phi * (2.0 / s6); // falling +1 → −1
+    else if (phi < s5)
+        return -1.0f; // the pulse's bottom (p < 0)
+    else
+        x = (phi - s5) * (2.0 / (s7 - s5)) - 1.0; // rising −1 → +1
+
+    // tension (FUN_00ba0250): T = sign(t)·((1e18)^((21^(|t|/128) − 1)·0.05) − 1)
+    const auto t = (double) tensionKnob;
+    const auto T = t == 0.0 ? 0.0 : (t > 0.0 ? 1.0 : -1.0) * (std::pow (9.99999984e17, (std::pow (21.0, std::abs (t) / 128.0) - 1.0) * 0.05) - 1.0);
+    auto curve = [T] (double a) {
+        if (T == 0.0)
+            return a;
+        if (T > 0.0)
+            return 1.0 - (std::pow (T + 1.0, 1.0 - a) - 1.0) / T;
+        return (std::pow (-T + 1.0, a) - 1.0) / -T;
+    };
+    const auto y = unipolar ? 2.0 * curve ((x + 1.0) * 0.5) - 1.0 : (x < 0.0 ? -curve (-x) : curve (x));
+    return (float) std::clamp (y, -1.0, 1.0);
+}
+
+float AutomationLfo::output (double clipTick, double songTick) const noexcept
+{
+    constexpr double full = 4294967296.0;
+    // the amplitude points are bipolar: 0.5 = no swing, 1 = full, 0 = full and inverted (FL's renders, round 177b:
+    // a single point at 0.5 plays no LFO; points 0 → 1 swing, pass through nothing at the middle and swing back)
+    const auto amplitude = 2.0f * automationCurveAt (amp, clipTick) - 1.0f;
+    // the start: the middle of the rising ramp (the LFO starts at 0 going up) plus the phase knob (FUN_00ba06a0)
+    const auto p = (double) pulseWidth / 128.0, sk = (double) skew / 256.0;
+    const auto s7 = p > 0.0 ? std::round ((1.0 - p) * full - 1.0) : 4294967295.0;
+    const auto s5 = std::round (std::clamp (((1.0 - p) * 0.5 - sk * (1.0 - std::abs (p))) * full, 1.0, s7 - 1.0));
+    const auto start = std::fmod (s5 + (s7 - s5) * 0.5 + 1.0 + (double) phase, full);
+    // frozen: no movement inside the clip; global: the phase runs with the song instead of restarting with the clip
+    const auto frozen = (flags & 8) != 0, global = (flags & 2) != 0;
+    const auto beats = frozen ? 0.0 : std::max (0.0, global ? songTick : clipTick) / (double) ppq;
+    auto cycles = beats * cyclesPerBeat (speed);
+    cycles -= std::floor (cycles);
+    const auto at = (std::uint32_t) (std::uint64_t) std::fmod (start + cycles * full, full);
+    return amplitude * shape (at, tension, skew, pulseWidth, (flags & 4) != 0);
+}
+
+float AutomationLfo::apply (float value, double clipTick, double songTick) const noexcept
+{
+    // TACArticulator.Compute (FUN_00ba1700): add mode out += L·amount; multiply mode out *= 1 + 2·L·amount, with L
+    // at half the waveform: FL's own renders (round 177b, lfo/meas: default, level 128, add and shaped clips) match
+    // only with the LFO's swing at ±0.5 × its amplitude, in both modes
+    const auto amount = (float) level / 128.0f * range;
+    const auto l = 0.5f * output (clipTick, songTick);
+    const auto out = add ? value + l * amount : value * (1.0f + 2.0f * l * amount);
+    return std::clamp (out, 0.0f, 1.0f);
+}
+
+// --- modulators (round 177b) ------------------------------------------------------------------------------------
+namespace
+{
+float modNoise (std::uint32_t seed, std::int64_t step) noexcept
+{
+    // a hash of (seed, step) to -1..1: the same output at the same song position, whatever was played before
+    auto x = (std::uint64_t) (std::uint32_t) step * 0x9E3779B97F4A7C15ull ^ ((std::uint64_t) seed << 32 | (std::uint32_t) (step >> 32));
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return (float) ((double) (x >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+}
+} // namespace
+
+float Modulator::output (double cycles) const noexcept
+{
+    const auto c = cycles + (double) phase;
+    const auto whole = std::floor (c);
+    const auto f = (float) (c - whole); // 0..1 within the cycle
+    float y = 0.0f;
+    switch (shape)
+    {
+        case ModShape::sine: y = std::sin (f * 6.28318530718f); break;
+        case ModShape::triangle: y = f < 0.25f ? f * 4.0f : (f < 0.75f ? 2.0f - f * 4.0f : f * 4.0f - 4.0f); break;
+        case ModShape::sawUp: y = f * 2.0f - 1.0f; break;
+        case ModShape::sawDown: y = 1.0f - f * 2.0f; break;
+        case ModShape::square: y = f < 0.5f ? 1.0f : -1.0f; break;
+        case ModShape::random: y = modNoise (seed, (std::int64_t) whole); break;
+        case ModShape::smoothRandom:
+        {
+            const auto a = modNoise (seed, (std::int64_t) whole), b = modNoise (seed, (std::int64_t) whole + 1);
+            const auto s = f * f * (3.0f - 2.0f * f);
+            y = a + (b - a) * s;
+            break;
+        }
+    }
+    return unipolar ? (y + 1.0f) * 0.5f : y;
+}
+
+bool Modulator::canModulate (const Song& song, const AutomationTarget& t) noexcept
+{
+    // LYNX's own controls: not the tempo, not a plugin's parameters (their value lives in the plugin)
+    if (t.kind == AutomationTargetKind::none || t.kind == AutomationTargetKind::tempo || song.targetValue (t) < 0.0f)
+        return false;
+    if (t.kind == AutomationTargetKind::effectParam && t.index >= 0 && t.index < (int) song.mixer.size() && t.slot >= 0
+        && t.slot < (int) song.mixer[(std::size_t) t.index].effects.size())
+    {
+        const auto kind = song.mixer[(std::size_t) t.index].effects[(std::size_t) t.slot].kind;
+        return kind != EffectKind::plugin && kind != EffectKind::patcher;
+    }
+    if (t.kind == AutomationTargetKind::channelParam && t.index >= 0 && t.index < (int) song.channels.size())
+    {
+        const auto kind = song.channels[(std::size_t) t.index].instrument;
+        return kind != InstrumentKind::plugin && kind != InstrumentKind::patcher && ! midictl::isMidiParam (t.param);
+    }
+    return true;
 }
 
 std::int64_t Automation::length() const noexcept
@@ -1279,7 +1615,8 @@ bool PatcherDoc::operator== (const PatcherDoc& o) const
 {
     return nodes == o.nodes && wires == o.wires && published == o.published && inputX == o.inputX && inputY == o.inputY && outputX == o.outputX && outputY == o.outputY
            && outputTracks == o.outputTracks && surface == o.surface && surfaceX == o.surfaceX && surfaceY == o.surfaceY
-           && fromMidiPorts == o.fromMidiPorts && toMidiPorts == o.toMidiPorts && fromNotesHidden == o.fromNotesHidden;
+           && fromMidiPorts == o.fromMidiPorts && toMidiPorts == o.toMidiPorts && fromNotesHidden == o.fromNotesHidden
+           && rack == o.rack && zones == o.zones;
 }
 
 bool PatchNode::BusHead::operator== (const BusHead& o) const { return bus == o.bus && head == o.head && gain == o.gain; }
@@ -1296,7 +1633,7 @@ bool EffectSlot::operator== (const EffectSlot& o) const
     if (kind != o.kind || enabled != o.enabled || params != o.params || mix != o.mix || ! (plugin == o.plugin) || sidechain != o.sidechain
         || sidechain2 != o.sidechain2 || sendTracks != o.sendTracks || state != o.state || samplePath != o.samplePath || ! (substituteFor == o.substituteFor)
         || presetName != o.presetName || abOther != o.abOther || abShowingB != o.abShowingB || branches.size() != o.branches.size()
-        || links.size() != o.links.size() || ! (patcher == o.patcher) || row != o.row || ! (flOrigin == o.flOrigin)
+        || links.size() != o.links.size() || ! (patcher == o.patcher) || row != o.row || look != o.look || ! (flOrigin == o.flOrigin)
         || recorderDocument != o.recorderDocument)
         return false;
     for (std::size_t i = 0; i < branches.size(); ++i)
@@ -1387,14 +1724,31 @@ Song makeBounceSong (const Song& song, int track)
     auto& insert = out.mixer[(std::size_t) track];
     insert.sends.clear();
     insert.toMaster = true;
+    insert.masterLevel = 1.0f; // the insert's own output: its route level to Master is the route's (Render to audio keeps the
+                               // route on the new insert; rendering it too played a route at 50 % at 25 %, round 186b)
     insert.muted = false;
     insert.solo = true; // it and whatever feeds it are audible
 
+    // the Master neutral: the render plays through the song's Master again (Render to audio), so nothing of it may be in
+    // the file — effects, fader, pan, separation, phase / swap, EQ and its automation (round 186b, as StandIns' stems)
     auto& master = out.mixer[0];
     master.effects.clear();
     master.volume = unityFader;
     master.pan = 0.0f;
     master.muted = false;
+    master.stereo = 0.0f;
+    master.invertPhase = master.swapChannels = false;
+    master.eq = {};
+    auto onMaster = [] (const AutomationTarget& t) { return refs::targetsInsert (t) && t.index == 0; };
+    for (auto& a : out.automations)
+        if (onMaster (a.target))
+            a.target = {};
+    for (auto& p : out.patterns)
+        p.events.erase (std::remove_if (p.events.begin(), p.events.end(), [&] (const PatternEvents& lane) { return onMaster (lane.target); }),
+                        p.events.end());
+    out.initialValues.erase (std::remove_if (out.initialValues.begin(), out.initialValues.end(),
+                                             [&] (const Song::InitialValue& v) { return onMaster (v.target); }),
+                             out.initialValues.end());
     out.mode = PlayMode::song;
     return out;
 }
@@ -1417,9 +1771,10 @@ int applyBounce (Song& song, int track, const std::string& samplePath, std::int6
     ChannelDef c;
     c.name = copy.name;
     c.instrument = InstrumentKind::audioClip;
+    c.sampler.declickMode = audioClipDeclickMode; // FL's AudioTrack.fst
     c.samplePath = samplePath;
     c.mixerTrack = newTrack;
-    c.volume = 1.0f;
+    c.volume = audioClipUnityVolume; // the render plays at the level of what it replaces (1.0 was +5.18 dB, round 186b)
     song.channels.push_back (c);
 
     int lane = 0;

@@ -6,11 +6,14 @@
 #include <map>
 #include <tuple>
 
+#include "core/WindowFit.h"
 #include "core/MixerOps.h"
 #include "core/ApexLimiter.h"
 #include "core/DynamicsSuite.h"
 #include "core/FacetEq.h"
 #include "core/MixSuite.h"
+#include "core/StrikeShaper.h"
+#include "core/PocketFx.h"
 #include "ui/DynamicsDisplays.h"
 #include "ui/ParametricEqEditor.h"
 #include "ui/ProEditorBase.h"
@@ -87,7 +90,11 @@ public:
     ApexEditor (AudioEngine& e, int t, int s, bool d) : ProEditor (e, t, s, EffectKind::apexLimiter, d, 950, 600) { knobRanges = captionAbove = true; fillDemo(); }
 
 private:
-    enum { idPanel = 1, idGain, idCeiling, idTp, idAdvanced, idLoudness, idLoudReset };
+    enum { idPanel = 1, idGain, idCeiling, idTp, idAdvanced, idLoudness, idLoudReset, idLevel };
+    // round 190ar: the levelling stage (Level threshold; 0 = off, as every project saved before has it) is switched
+    // by a toggle that remembers the threshold it had (-12 dB the first time)
+    float levelThreshold = 1.0f / 3.0f;
+    bool levelling() const { return v (apex::pLevelThreshold) > 0.0f; }
     // round tp172b4: the reference opens with its knob panel folded into the tab at the lower left (its idle view)
     bool panelOpen = false, advancedOpen = false;
     static constexpr const char* styles = "Clean|Glue|Punch|Dynamic|Dense|Loud|Bus|Safe";
@@ -248,6 +255,18 @@ private:
                 auto sc = toggle ({ ad.getX() + 10.0f, ad.getY() + 76.0f, ad.getWidth() - 20.0f, 17.0f }, apex::pSidechain, tr ("Side-chain triggering"));
                 sc.hint = tr ("The limiter reacts to the slot's side-chain input (mixer: right-click the slot - Side chain)");
                 out.push_back (sc);
+                // round 190ar: the levelling stage under the ceiling — off unless switched on here
+                auto lv = toggle ({ ad.getX() + 10.0f, ad.getY() + 104.0f, ad.getWidth() - 20.0f, 17.0f }, -1, tr ("Levelling"));
+                lv.id = idLevel;
+                lv.lit = levelling();
+                lv.hint = tr ("Levelling: holds the level at a threshold under the ceiling with a slow attack, the ceiling catches the rest (off by default)");
+                out.push_back (lv);
+                auto lt = barValue ({ ad.getX() + 6.0f, ad.getY() + 123.0f, ad.getWidth() - 12.0f, 17.0f }, apex::pLevelThreshold, tr ("Threshold"));
+                lt.hint = tr ("Levelling threshold: the level held under the ceiling (Off: no levelling)");
+                out.push_back (lt);
+                auto lat = barValue ({ ad.getX() + 6.0f, ad.getY() + 141.0f, ad.getWidth() - 12.0f, 17.0f }, apex::pLevelAttack, tr ("Attack"));
+                lat.hint = tr ("Levelling attack: how much of a transient passes before the level is held");
+                out.push_back (lat);
             }
         }
         else // (its caption, CONTROLS, is written up the tab by paintBody)
@@ -272,14 +291,26 @@ private:
 
     juce::Rectangle<float> advanced() const
     {
+        // (round 190ar: taller by the levelling rows, and its foot above the display's lower-right strip — display
+        // speed, TP, LUFS, meter scale — which the panel used to cover)
         const auto pn = panel();
-        return { pn.getRight() + 6.0f, pn.getY(), 170.0f, pn.getHeight() };
+        return { pn.getRight() + 6.0f, pn.getY() - 96.0f, 170.0f, pn.getHeight() + 66.0f };
     }
 
     void buttonPressed (const Ctl& c, const juce::MouseEvent&) override
     {
         if (c.id == idPanel) panelOpen = ! panelOpen;
         if (c.id == idAdvanced) advancedOpen = ! advancedOpen;
+        if (c.id == idLevel)
+        {
+            if (levelling())
+            {
+                levelThreshold = v (apex::pLevelThreshold);
+                set ({ { apex::pLevelThreshold, 0.0f } });
+            }
+            else
+                set ({ { apex::pLevelThreshold, levelThreshold } });
+        }
         if (c.id == idTp) set ({ { 5, v (5) >= 0.5f ? 0.0f : 1.0f } });
         if (c.id == idLoudness) set ({ { apex::pLoudnessShown, loudnessShown() ? 0.0f : 1.0f } });
         if (c.id == idLoudReset) set ({ { apex::pLoudnessReset, v (apex::pLoudnessReset) >= 0.5f ? 0.0f : 1.0f } }, false);
@@ -481,6 +512,8 @@ private:
                 const auto ad = advanced();
                 drawPanel (g, ad);
                 caption (g, { ad.getX(), ad.getY() + 6.0f, ad.getWidth(), 14.0f }, tr ("Advanced"));
+                g.setColour (colour::border); // (round 190ar: the levelling rows under the four switches)
+                g.drawHorizontalLine ((int) ad.getY() + 98, ad.getX() + 10.0f, ad.getRight() - 10.0f);
             }
         }
         // latency (constant: the maximum look-ahead, + the oversampler)
@@ -4079,6 +4112,8 @@ private:
 };
 
 #include "ui/ProEditorsStrips.inc"
+#include "ui/ProEditorsStrike.inc" // round trans189d: Strike Shaper
+#include "ui/PocketEditors.inc"
 
 // --- windows -------------------------------------------------------------------------------------------------
 std::unique_ptr<ProEditor> make (AudioEngine& engine, int track, int slot, bool demo)
@@ -4098,6 +4133,15 @@ std::unique_ptr<ProEditor> make (AudioEngine& engine, int track, int slot, bool 
         case EffectKind::kilnChannel: return std::make_unique<KilnEditor> (engine, track, slot, demo);
         case EffectKind::fretChannel: return std::make_unique<FretEditor> (engine, track, slot, demo);
         case EffectKind::shellChannel: return std::make_unique<ShellEditor> (engine, track, slot, demo);
+        case EffectKind::strikeShaper: return std::make_unique<StrikeEditor> (engine, track, slot, demo);
+        case EffectKind::pocketDistortion: return std::make_unique<PocketDistortionEditor> (engine, track, slot, demo);
+        case EffectKind::pocketLimiterClassic: return std::make_unique<PocketLimiterClassicEditor> (engine, track, slot, demo);
+        case EffectKind::pocketLimiter: return std::make_unique<PocketLimiterEditor> (engine, track, slot, demo);
+        case EffectKind::pocketTranceDelay: return std::make_unique<PocketTranceDelayEditor> (engine, track, slot, demo);
+        case EffectKind::pocketLeveller: return std::make_unique<PocketLevellerEditor> (engine, track, slot, demo);
+        case EffectKind::pocketGate: return std::make_unique<PocketGateEditor> (engine, track, slot, demo);
+        case EffectKind::pocketTapeDelay: return std::make_unique<PocketTapeDelayEditor> (engine, track, slot, demo);
+        case EffectKind::pocketMultiFx: return std::make_unique<PocketMultiFxEditor> (engine, track, slot, demo);
         default: return nullptr;
     }
 }
@@ -4124,6 +4168,36 @@ public:
     int baseW = 1, baseH = 1;
 };
 
+// round 190bj (QA: the Apex Limiter's bottom status row was cut off by the window edge at its default size): JUCE's
+// setFixedAspectRatio applies the ratio to the whole window, native title bar and borders included, so the content was
+// about 30 px shorter than the editor; and the open animation then reset the holder's scale, so the editor was cut
+// instead of scaled. The ratio now applies to the content (core/WindowFit.h aspectContent).
+class ContentAspectConstrainer final : public juce::ComponentBoundsConstrainer
+{
+public:
+    ContentAspectConstrainer (juce::Component& w, int bw, int bh) : window (w), baseW (bw), baseH (bh) {}
+
+    void checkBounds (juce::Rectangle<int>& bounds, const juce::Rectangle<int>&, const juce::Rectangle<int>&,
+                      bool top, bool left, bool bottom, bool right) override
+    {
+        // (JUCE passes the outer bounds: the content plus the native frame)
+        juce::BorderSize<int> frame;
+        if (auto* peer = window.getPeer())
+            if (const auto size = peer->getFrameSizeIfPresent())
+                frame = *size;
+        const auto out = windowfit::aspectContent ({ bounds.getX(), bounds.getY(), bounds.getWidth(), bounds.getHeight() },
+                                                   { frame.getLeft(), frame.getTop(), frame.getRight(), frame.getBottom() },
+                                                   baseW, baseH, minScale, maxScale, top, left, bottom, right);
+        bounds = { out.x, out.y, out.w, out.h };
+    }
+
+    static constexpr double minScale = 0.7, maxScale = 2.0;
+
+private:
+    juce::Component& window;
+    int baseW, baseH;
+};
+
 class ProEditorWindow final : public juce::DocumentWindow
 {
 public:
@@ -4136,23 +4210,24 @@ public:
         auto holder = std::make_unique<ScaledHolder> (std::move (editor));
         const auto w = holder->baseW, h = holder->baseH;
         setContentOwned (holder.release(), true);
+        aspect = std::make_unique<ContentAspectConstrainer> (*this, w, h);
+        setConstrainer (aspect.get());
         setResizable (true, false);
-        if (auto* c = getConstrainer())
-        {
-            c->setFixedAspectRatio ((double) w / (double) h);
-            c->setMinimumSize (juce::roundToInt (w * 0.7), juce::roundToInt (h * 0.7));
-            c->setMaximumSize (w * 2, h * 2);
-        }
-        centreWithSize (getWidth(), getHeight());
+        centreWithSize (w, h);
         setVisible (true);
         keepAboveMainWindow (*this);
-        if (content != nullptr) skin::playOpenAnimation (*content, content->editorStyle()); // round 126: fade / scale in
+        // round 126: fade / scale in — on the holder: the editor's own transform is the holder's scale (round 190bj)
+        if (content != nullptr)
+            if (auto* holder = getContentComponent())
+                skin::playOpenAnimation (*holder, content->editorStyle());
     }
+    ~ProEditorWindow() override { setConstrainer (nullptr); }
     void closeButtonPressed() override;
     ProEditor* content = nullptr;
 
 private:
     ui::SlotGoneWatcher gone;
+    std::unique_ptr<ContentAspectConstrainer> aspect;
 };
 
 std::map<std::pair<int, int>, std::unique_ptr<ProEditorWindow>>& windows()
@@ -4179,7 +4254,10 @@ bool handles (EffectKind kind) noexcept
     return kind == EffectKind::apexLimiter || kind == EffectKind::hushDeEsser || kind == EffectKind::crestCompressor
            || kind == EffectKind::sentryGate || kind == EffectKind::prismMultiband || kind == EffectKind::ember
            || kind == EffectKind::aether || kind == EffectKind::kilnChannel || kind == EffectKind::fretChannel
-           || kind == EffectKind::shellChannel;
+           || kind == EffectKind::shellChannel || kind == EffectKind::strikeShaper
+           || kind == EffectKind::pocketDistortion || kind == EffectKind::pocketLimiterClassic
+           || kind == EffectKind::pocketLimiter || kind == EffectKind::pocketTranceDelay || kind == EffectKind::pocketLeveller
+           || kind == EffectKind::pocketGate || kind == EffectKind::pocketTapeDelay || kind == EffectKind::pocketMultiFx;
 }
 
 void open (AudioEngine& engine, int track, int slot)
@@ -4202,6 +4280,39 @@ void open (AudioEngine& engine, int track, int slot)
     const auto title = utf8 (effectInfo (mixer[(std::size_t) track].effects[(std::size_t) slot].kind).name) + " - "
                        + (name.isNotEmpty() ? name : tr ("Insert {0}", { juce::String (track) })) + " (" + tr ("slot {0}", { juce::String (slot + 1) }) + ")";
     open[key] = std::make_unique<ProEditorWindow> (std::move (editor), title, engine, track, slot);
+}
+
+juce::Image windowContentForSnapshot (AudioEngine& engine, int track, int slot, bool juceAspect)
+{
+    auto editor = make (engine, track, slot, true);
+    if (editor == nullptr)
+        return {};
+    ScaledHolder holder (std::move (editor));
+    const auto w = holder.baseW, h = holder.baseH;
+    const windowfit::Frame frame { 8, 31, 8, 8 }; // a native Windows 10/11 frame at 100 % (title bar, borders)
+    windowfit::Box outer { 100, 100, w + frame.left + frame.right, h + frame.top + frame.bottom };
+    if (juceAspect) // before round 190bj: JUCE's fixed ratio on the whole window, then the open animation's end
+    {
+        juce::ComponentBoundsConstrainer c;
+        c.setFixedAspectRatio ((double) w / (double) h);
+        c.setMinimumSize (juce::roundToInt (w * 0.7), juce::roundToInt (h * 0.7));
+        c.setMaximumSize (w * 2, h * 2);
+        juce::Rectangle<int> b (outer.x, outer.y, outer.w, outer.h);
+        c.checkBounds (b, b, { 0, 0, 10000, 10000 }, false, false, false, false);
+        outer = { b.getX(), b.getY(), b.getWidth(), b.getHeight() };
+    }
+    else
+        outer = windowfit::aspectContent (outer, frame, w, h, ContentAspectConstrainer::minScale, ContentAspectConstrainer::maxScale);
+    holder.setSize (outer.w - frame.left - frame.right, outer.h - frame.top - frame.bottom);
+    if (juceAspect)
+        holder.editor->setTransform ({}); // (the animation reset the editor's transform: the holder's scale was lost)
+    juce::Image image (juce::Image::ARGB, holder.getWidth(), holder.getHeight(), true);
+    {
+        juce::Graphics g (image);
+        g.fillAll (colour::bg1);
+        holder.paintEntireComponent (g, false);
+    }
+    return image;
 }
 
 void close (int track, int slot) { windows().erase ({ track, slot }); }

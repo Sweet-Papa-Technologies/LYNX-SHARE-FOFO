@@ -183,7 +183,7 @@ Core Audio / ALSA + JACK (PipeWire).
   reFX VST engine FL runs in its bridge — six waveguide strings at 44.1 kHz with the recorded picks, chord/glide
   tables read from the user's `Slayer_Engine.dll`, the six play modes, 15 effects, four amps, EQ and cabinet, under the
   engine's x87 truncating rounding; bit-identical to FL's DLL on all 64 presets in every tested scenario and on 340
-  random parameter sets at 22.05–96 kHz); Fruity Dance as a silent channel (REA round 68: a visual plugin); Sakura and Drumpad on physical models rebuilt from their
+  random parameter sets at 22.05–96 kHz); Fruity Dance as a silent channel with LYNX SHARE's own animated dancer (round 165e: the notes pick the move); Sakura and Drumpad on physical models rebuilt from their
   engines (REA round 28), BooBass on its engine with the multisample read from the user's own FL installation
   (REA round 29; within −138 dB of the reference renders verified against FL's DLLs).
 - Third-party plugins in the Fruity Wrapper are matched to installed VST3/CLAP plugins (VST3 class ID, CLAP id
@@ -192,6 +192,33 @@ Core Audio / ALSA + JACK (PipeWire).
 - FL presets: 169 3x Osc channel presets, ~2800 `.fst` synth presets and the effect presets of the supported
   effects.
 - An import report lists what was converted, approximated or left out.
+
+### Export to FL Studio (`.flp`)
+- File › Export › FL Studio project: an FL Studio 2026 `.flp` (or a zip with the samples). FL's own channels, plugins
+  (native, and third-party ones inside Fruity Wrapper), patterns, Playlist, mixer and automation go over as FL data;
+  LYNX-only instruments and effects are rendered to audio (default) or replaced by the nearest FL plugin. Format:
+  `docs/analise/REA_rodada171e.md`.
+
+### Ableton Live sets (`.als`, Live 11 / 12)
+- Import and export (`docs/analise/ALS_FORMAT.md`): MIDI / audio / group / return tracks, clips and notes, warp
+  markers and modes, mixer and sends with their automation, tempo, time signature, locators; Session clips and scenes
+  ↔ the clip grid (launch settings, follow actions, stop buttons).
+- Third-party VST2 / VST3 plugins keep their state both ways. Live's Simpler / Sampler / Drum Rack import as the
+  closest LYNX instrument; other Live devices are listed in the report. LYNX's own instruments and
+  effects are not converted in exported sets yet (listed in the export report).
+- Since 0.1.26: Instrument and Audio Effect Racks (chains, zones, macros) both ways; MIDI Effect Racks are written
+  on export only (Live's own are listed as unsupported on import); note chance,
+  velocity range and probability groups, the project key as Live's Scale Mode, and Live 12's MIDI Transformations in
+  the Clip View. A Clip View and Device View are part of the Clip-launch workflow.
+
+### FL Studio Mobile import (`.flm`, partial)
+- `docs/analise/FLM_FORMAT.md`: tempo, time signature, title; note, drum and audio lanes → patterns, clips and audio
+  clips; samples (the project's folder and FL Studio's copy of the app's resources), drum kits, DirectWave
+  single-sample programs; rack level, pan and routes on the mixer inserts.
+- Since 0.1.26: MiniSynth, Transistor Bass, 3x Osc and GMSynth channels on LYNX's engines; FL Studio Mobile's effects
+  as the Pocket effects, with their automation; rack mute / solo, level, pan, pitch bend and send automation as
+  automation clips; note pan, drum note pitch, repeats and slides. Other instruments play LYNX's built-in synth for
+  now; what is not converted is listed in the import report.
 
 ## Confirmed vs approximated (FL import)
 
@@ -363,8 +390,8 @@ accordingly. Highlights of what is **confirmed and applied**:
   volume and pan reach the engine as FL's MIDI events (the engine's cubic volume law, the pan counted twice as in FL),
   cut groups no longer cut it (FL ignores them for Kepler). FL's renders of 253 of the 277 presets null against LYNX's engine
   fed like FL's export (the other 24 differ the same way with FL's DLL itself) (see REA_rodada165g-flbeta165k §4). The synth conversion (`synthFromKepler`) stays the fallback
-  (gate/noise/×4 bytes, DLL missing). **Kepler Exo** ("Kepler-2" states) has no LYNX engine yet: its channels import as
-  an unsupported FL plugin (§5 of that round doc).
+  (gate/noise/×4 bytes, DLL missing). **Kepler Exo** ("Kepler-2" states) runs on the same port (`core/Kepler.h`: `keplerExoState`),
+  with its own editor layout (`core/EngineLayouts.h`).
   **BassDrum** (fallback when the engine can't run): Peak `1 + 100x³·s⁴`.
   **Sakura:** ADSR, Tune, Mix, Hi-Cut. **BooBass:** 3-band EQ. **Drumpad:** Pitch and Mallet Amplitude.
 - **GMS:** its own instrument (`core/Gms.cpp`, REA round 39 §1): FL's wrapper (velocity from Init.Vol, per-note
@@ -677,7 +704,7 @@ accordingly. Highlights of what is **confirmed and applied**:
   FL's render where FL's DLL itself, fed the same notes, differs the same way (host state not identified, possibly a
   phase started at plugin creation); old (version < 4) synced states get the
   converted LFO1 rate at the rate set-up after loading; the synth fallback keeps its earlier approximations (chorus,
-  LFO1). Kepler Exo is not ported.
+  LFO1). Kepler Exo runs on the Kepler port (see above).
 - Harmless: the rack compressor needs the user's FL installation (its four presets are read from it; otherwise it
   stays off and the import report says so); the chorus/delay use the x87 kernels FL picks on the test machine (another
   CPU may make FL round the chorus delay instead of truncating it — not confirmed); a fresh delay starts its feedback

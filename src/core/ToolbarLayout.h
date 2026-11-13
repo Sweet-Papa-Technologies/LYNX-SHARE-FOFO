@@ -30,6 +30,8 @@ enum class Group
     meters,    // CPU / memory / polyphony
     output,    // output scope and peak meter
     chord,     // FL's Chord detection panel: the chord being played (round 181b)
+    multilink, // FL's Multilink controllers switch (MultiLinkBtn; round 177b-4): hidden by default, as in FL
+    key,       // the project key button (round 184a S11; LYNX's own): hidden by default; Simple and Clip-launch show it
     count_
 };
 
@@ -38,7 +40,7 @@ constexpr int groupCount = (int) Group::count_;
 // The id used in the settings line (stable; never translated).
 inline const char* groupId (Group g)
 {
-    static constexpr std::array<const char*, groupCount> ids { "transport", "master", "record", "snap", "windows", "file", "meters", "output", "chord" };
+    static constexpr std::array<const char*, groupCount> ids { "transport", "master", "record", "snap", "windows", "file", "meters", "output", "chord", "multilink", "key" };
     return ids[(std::size_t) g];
 }
 
@@ -47,7 +49,8 @@ inline const char* groupName (Group g)
 {
     static constexpr std::array<const char*, groupCount> names {
         TR_NOOP ("Transport"), TR_NOOP ("Master volume and pitch"), TR_NOOP ("Recording options"), TR_NOOP ("Snap and pattern"),
-        TR_NOOP ("Window shortcuts"), TR_NOOP ("File and undo"), TR_NOOP ("CPU, memory and polyphony"), TR_NOOP ("Output monitor"), TR_NOOP ("Chord detection")
+        TR_NOOP ("Window shortcuts"), TR_NOOP ("File and undo"), TR_NOOP ("CPU, memory and polyphony"), TR_NOOP ("Output monitor"), TR_NOOP ("Chord detection"),
+        TR_NOOP ("Multilink to controllers"), TR_NOOP ("Project key")
     };
     return names[(std::size_t) g];
 }
@@ -57,19 +60,26 @@ inline const char* groupName (Group g)
 // Save / Undo are also in the File and Edit menus and their keys).
 inline int groupPriority (Group g)
 {
-    static constexpr std::array<int, groupCount> p { 100, 80, 70, 90, 75, 60, 55, 50, 45 };
+    static constexpr std::array<int, groupCount> p { 100, 80, 70, 90, 75, 60, 55, 50, 45, 65, 72 }; // (Multilink: one button, shown only on request; Key: shown only in the workflows that use it, round 184a S11)
     return p[(std::size_t) g];
 }
 
 // Groups that sit at the right end of the toolbar (after the spare room) by default.
 inline bool rightAligned (Group g) { return g == Group::meters || g == Group::output || g == Group::chord; }
 
+// Shown on a new install: every group but the Multilink switch (FL keeps its MultiLinkBtn off the default toolbar; it
+// is shown from the toolbar's edit mode). Round 184a: the Key button is LYNX's own, so FL's Pattern workflow opens
+// without it; the Simple and Clip-launch workflows show it (MainComponent::setLayoutStyle) until the user decides.
+inline bool shownByDefault (Group g) { return g != Group::multilink && g != Group::key; }
+
 // The toolbar's order on a new install. Round 181b: FL has its Chord detection panel on the default toolbar, on the
 // left of its meters (seen in FL 2026's toolbar edit mode).
 inline const std::array<Group, groupCount>& defaultOrder()
 {
+    // round 177b-4: FL's MultiLinkBtn sits in its bottom toolbar after the window, pattern and edit buttons (DFM:
+    // ... ParamCtrlBigBtn, DownloaderBtn, MultiLinkBtn, GopherBtn); LYNX's nearest neighbour is the window shortcuts
     static constexpr std::array<Group, groupCount> order { Group::transport, Group::master, Group::record, Group::snap, Group::windows,
-                                                           Group::file, Group::chord, Group::meters, Group::output };
+                                                           Group::multilink, Group::file, Group::key, Group::chord, Group::meters, Group::output };
     return order;
 }
 
@@ -127,7 +137,7 @@ struct Layout
     {
         Layout l;
         for (auto g : defaultOrder())
-            l.entries.push_back ({ g, true });
+            l.entries.push_back ({ g, shownByDefault (g) });
         return l;
     }
 
@@ -276,7 +286,7 @@ struct Layout
                     break;
                 }
             }
-            parsed.insert (at, { group, group != Group::chord || plainOldDefault });
+            parsed.insert (at, { group, shownByDefault (group) && (group != Group::chord || plainOldDefault) });
         }
 
         entries = parsed;

@@ -1,4 +1,5 @@
 #include "core/PlaylistOps.h"
+#include "core/QuickRender.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -538,6 +539,24 @@ int armableInsert (const Song& song, int track)
     return t.mode == PlaylistTrackMode::audio && t.mixerTrack > 0 && t.mixerTrack < (int) song.mixer.size() ? t.mixerTrack : -1;
 }
 
+int meteredInsert (const Song& song, int track, const HeaderOptions& options)
+{
+    if (track < 0 || track >= (int) song.playlistTracks.size())
+        return -1;
+    const auto& t = song.playlistTracks[(std::size_t) track];
+    if (t.mode == PlaylistTrackMode::audio)
+        return options.audioLevels ? armableInsert (song, track) : -1;
+    if (t.mode != PlaylistTrackMode::instrument || ! options.instrumentLevels)
+        return -1;
+    // the channel's own route (it may have moved since the track was made); the linked mixer track without a channel
+    if (t.channel >= 0 && t.channel < (int) song.channels.size())
+    {
+        const auto m = song.channels[(std::size_t) t.channel].mixerTrack;
+        return m >= 0 && m < (int) song.mixer.size() ? m : -1;
+    }
+    return t.mixerTrack >= 0 && t.mixerTrack < (int) song.mixer.size() ? t.mixerTrack : -1;
+}
+
 namespace
 {
 int audioMixerOf (const Song& song, int track)
@@ -631,4 +650,368 @@ int followAudioTracks (Song& song, const std::vector<int>& touched, bool makeUni
     return changed;
 }
 
+HeaderDropOptions& headerDropOptions() noexcept
+{
+    static HeaderDropOptions options;
+    return options;
+}
+
+bool dropOnHeader (Song& song, int track, const std::string& path, const std::string& name, std::int64_t lengthTicks, HeaderDrop how, bool lock)
+{
+    if (track < 0 || track >= 500 || how == HeaderDrop::ask || path.empty())
+        return false;
+    if (track < (int) song.playlistTracks.size() && song.playlistTracks[(std::size_t) track].mode != PlaylistTrackMode::unassigned)
+        return false; // (FUN_00e71980: only an unassigned track takes a header drop)
+    const auto before = song; // (all or nothing)
+    auto fail = [&song, &before] {
+        song = before;
+        return false;
+    };
+
+    auto newChannel = [&song, &name, &path] (InstrumentKind kind) {
+        ChannelDef c;
+        c.name = quickrender::uniqueChannelName (song, name);
+        c.instrument = kind;
+        c.samplePath = path;
+        if (kind == InstrumentKind::audioClip)
+            c.sampler.declickMode = audioClipDeclickMode; // FL's AudioTrack.fst
+        song.channels.push_back (c);
+        return (int) song.channels.size() - 1;
+    };
+    auto placeAudio = [&song, track, lengthTicks] (int channel) {
+        Clip clip;
+        clip.kind = ClipKind::audio;
+        clip.channel = channel;
+        clip.track = track;
+        clip.start = 0;
+        clip.length = std::max<std::int64_t> (1, lengthTicks);
+        song.playlist.push_back (clip);
+        followAudioTracks (song, { (int) song.playlist.size() - 1 });
+    };
+
+    if (how == HeaderDrop::audioClips)
+    {
+        int channel = -1;
+        for (int c = 0; c < (int) song.channels.size(); ++c)
+            if (song.channels[(std::size_t) c].instrument == InstrumentKind::audioClip && song.channels[(std::size_t) c].samplePath == path)
+                channel = c;
+        if (channel < 0)
+        {
+            channel = newChannel (InstrumentKind::audioClip);
+            song.channels[(std::size_t) channel].mixerTrack = song.claimFreeInsert();
+        }
+        auto* t = trackAt (song, track);
+        t->name = song.channels[(std::size_t) channel].name;
+        if (const auto colour = song.channels[(std::size_t) channel].colour; colour != 0)
+            t->colour = colour;
+        placeAudio (channel);
+    }
+    else if (how == HeaderDrop::audioTracks)
+    {
+        const auto channel = newChannel (InstrumentKind::audioClip);
+        auto* t = trackAt (song, track);
+        t->name = song.channels[(std::size_t) channel].name;
+        if (! makeAudioTrack (song, track))
+            return fail();
+        placeAudio (channel); // (routed to the track's mixer track by followAudioTracks)
+    }
+    else
+    {
+        const auto channel = newChannel (InstrumentKind::sampler);
+        trackAt (song, track)->name.clear(); // (named after its channel)
+        if (! makeInstrumentTrack (song, track, channel))
+            return fail();
+        const auto pattern = instrumentTrackPattern (song, track);
+        if (pattern < 0)
+            return fail();
+        Clip clip;
+        clip.kind = ClipKind::pattern;
+        clip.pattern = pattern;
+        clip.track = track;
+        clip.start = 0;
+        clip.length = song.patterns[(std::size_t) pattern].effectiveLength (song.beatsPerBar);
+        song.playlist.push_back (clip);
+    }
+    if (lock)
+        trackAt (song, track)->lockedToContent = true;
+    song.mode = PlayMode::song;
+    return true;
+}
+
 } // namespace lynx::trackmodes
+
+namespace lynx::audioclips
+{
+int repairChannels (Song& song)
+{
+    int changed = 0;
+    const auto channels = (int) song.channels.size(); // (copies added below are audio clip channels already)
+    for (int index = 0; index < channels; ++index)
+    {
+        if (song.channels[(std::size_t) index].instrument != InstrumentKind::sampler || song.channels[(std::size_t) index].samplePath.empty())
+            continue;
+
+        auto used = false;
+        song.forEachClipList ([&] (const std::vector<Clip>& clips) {
+            for (const auto& c : clips)
+                used = used || (c.kind == ClipKind::audio && c.channel == index);
+        });
+        if (! used)
+            continue;
+
+        const auto playsNotes = std::any_of (song.patterns.begin(), song.patterns.end(), [index] (const Pattern& p) {
+            return std::any_of (p.notes.begin(), p.notes.end(), [index] (const Note& n) { return n.channel == index; });
+        });
+        ++changed;
+        if (! playsNotes)
+        {
+            song.channels[(std::size_t) index].instrument = InstrumentKind::audioClip;
+            continue;
+        }
+
+        auto copy = song.channels[(std::size_t) index];
+        copy.instrument = InstrumentKind::audioClip;
+        copy.instance.renew(); // (a new channel: the renderer must not take it for the Sampler it was copied from)
+        song.channels.push_back (std::move (copy));
+        const auto target = (int) song.channels.size() - 1;
+        song.forEachClipList ([&] (std::vector<Clip>& clips) {
+            for (auto& c : clips)
+                if (c.kind == ClipKind::audio && c.channel == index)
+                    c.channel = target;
+        });
+    }
+    return changed;
+}
+
+void loadSampleInto (ChannelDef& channel, const std::string& path, const std::string& name)
+{
+    channel.samplePath = path;
+    if (channel.instrument == InstrumentKind::granulizer || channel.instrument == InstrumentKind::wavetraveller)
+        return; // FL's Granulizer keeps its engine and plays the file (round 142); so does Wave Traveller
+    if (channel.instrument != InstrumentKind::audioClip)
+        channel.instrument = InstrumentKind::sampler;
+    channel.name = name;
+}
+} // namespace lynx::audioclips
+
+namespace lynx::autoclipplace
+{
+Place forNewClip (const Song& song, bool atPlayback, std::int64_t playTick)
+{
+    const auto bar = (std::int64_t) ppq * std::max (1, song.beatsPerBar);
+    const auto songEnd = song.playlist.empty() ? (std::int64_t) 0 : song.songLength();
+    Place place;
+    if (song.hasLoop())
+    {
+        place.start = song.loopStart;
+        place.length = song.loopEnd - song.loopStart;
+    }
+    else
+    {
+        // FL (checked live, round 177b): the clip starts at the song position even past the last clip, and is one bar
+        // long when nothing lies after it.
+        place.start = atPlayback ? std::max ((std::int64_t) 0, playTick) : 0;
+        place.length = std::max (bar, songEnd - place.start);
+    }
+    // FL (checked live, round 177b): the first track with no clips at all; a free gap on a used track is not taken
+    auto busy = [&] (int track) {
+        if (track < (int) song.playlistTracks.size() && song.playlistTracks[(std::size_t) track].mode == PlaylistTrackMode::instrument)
+            return true;
+        for (const auto& c : song.playlist)
+            if (c.track == track)
+                return true;
+        return false;
+    };
+    while (busy (place.track))
+        ++place.track;
+    return place;
+}
+} // namespace lynx::autoclipplace
+
+namespace lynx::autolanes
+{
+int ownerTrack (const Song& song, int automation)
+{
+    for (int t = 0; t < (int) song.playlistTracks.size(); ++t)
+        for (const auto& l : song.playlistTracks[(std::size_t) t].lanes)
+            if (l.automation == automation)
+                return t;
+    return -1;
+}
+
+namespace
+{
+std::int64_t songEnd (const Song& song)
+{
+    const auto bar = (std::int64_t) ppq * std::max (1, song.beatsPerBar);
+    return std::max (bar * 4, song.playlist.empty() ? 0 : song.songLength());
+}
+
+int laneFor (const Song& song, int track, const AutomationTarget& target)
+{
+    if (track < 0 || track >= (int) song.playlistTracks.size())
+        return -1;
+    for (const auto& l : song.playlistTracks[(std::size_t) track].lanes)
+        if (l.automation >= 0 && l.automation < (int) song.automations.size() && song.automations[(std::size_t) l.automation].target == target)
+            return l.automation;
+    return -1;
+}
+} // namespace
+
+int trackFor (const Song& song, const AutomationTarget& target)
+{
+    const auto& tracks = song.playlistTracks;
+    for (int t = 0; t < (int) tracks.size(); ++t)
+        if (laneFor (song, t, target) >= 0)
+            return t;
+
+    int channel = -1, insert = -1;
+    switch (target.kind)
+    {
+        case AutomationTargetKind::channelVolume:
+        case AutomationTargetKind::channelPan:
+        case AutomationTargetKind::channelParam:
+            channel = target.index;
+            if (channel >= 0 && channel < (int) song.channels.size())
+                insert = song.channels[(std::size_t) channel].mixerTrack;
+            break;
+        case AutomationTargetKind::mixerVolume:
+        case AutomationTargetKind::mixerPan:
+        case AutomationTargetKind::effectParam:
+        case AutomationTargetKind::effectMix:
+        case AutomationTargetKind::mixerSend:
+            insert = target.index;
+            break;
+        case AutomationTargetKind::none:
+        case AutomationTargetKind::tempo:
+            break;
+    }
+    if (channel >= 0)
+        for (int t = 0; t < (int) tracks.size(); ++t)
+            if (tracks[(std::size_t) t].mode == PlaylistTrackMode::instrument && tracks[(std::size_t) t].channel == channel)
+                return t;
+    if (insert > 0)
+        for (int t = 0; t < (int) tracks.size(); ++t)
+            if (tracks[(std::size_t) t].mode != PlaylistTrackMode::unassigned && tracks[(std::size_t) t].mixerTrack == insert)
+                return t;
+
+    for (int t = 0; t < 500; ++t)
+    {
+        if (t < (int) tracks.size() && ! tracks[(std::size_t) t].lanes.empty())
+            continue;
+        if (std::none_of (song.playlist.begin(), song.playlist.end(), [t] (const Clip& c) { return c.track == t; }))
+            return t;
+    }
+    return 0;
+}
+
+int addLane (Song& song, int track, const AutomationTarget& target, const std::string& name, float value)
+{
+    if (track < 0 || track >= 500)
+        return -1;
+    if (const auto existing = laneFor (song, track, target); existing >= 0)
+        return existing;
+    if ((int) song.playlistTracks.size() <= track)
+        song.playlistTracks.resize ((std::size_t) track + 1);
+    Automation a;
+    a.name = name;
+    a.target = target;
+    a.points = { { 0, value, 0.0f }, { songEnd (song), value, 0.0f } };
+    song.automations.push_back (std::move (a));
+    const auto index = (int) song.automations.size() - 1;
+    song.playlistTracks[(std::size_t) track].lanes.push_back ({ index, 0 });
+    song.playlistTracks[(std::size_t) track].lanesFolded = false;
+    return index;
+}
+
+bool removeLane (Song& song, int track, int lane)
+{
+    if (track < 0 || track >= (int) song.playlistTracks.size() || lane < 0 || lane >= (int) song.playlistTracks[(std::size_t) track].lanes.size())
+        return false;
+    song.removeAutomation (song.playlistTracks[(std::size_t) track].lanes[(std::size_t) lane].automation); // (drops the lane too)
+    return true;
+}
+
+int clipToLane (Song& song, int clipIndex, int track)
+{
+    if (clipIndex < 0 || clipIndex >= (int) song.playlist.size())
+        return -1;
+    const auto clip = song.playlist[(std::size_t) clipIndex];
+    if (clip.kind != ClipKind::automation || clip.automation < 0 || clip.automation >= (int) song.automations.size() || clip.length <= 0)
+        return -1;
+    const auto source = song.automations[(std::size_t) clip.automation]; // (a copy: addLane may grow the list)
+    auto lane = laneFor (song, track, source.target);
+    if (lane < 0)
+        lane = addLane (song, track, source.target, source.name, source.valueAt ((double) clip.offset));
+    if (lane < 0)
+        return -1;
+
+    // the clip's curve in song time: its edges exact, the points inside it shifted by start − offset
+    std::vector<AutomationPoint> inside;
+    inside.push_back ({ clip.start, source.valueAt ((double) clip.offset), 0.0f });
+    for (const auto& p : source.points)
+        if (p.tick > clip.offset && p.tick < clip.offset + clip.length)
+            inside.push_back ({ clip.start + p.tick - clip.offset, p.value, p.tension });
+    inside.push_back ({ clip.end(), source.valueAt ((double) (clip.offset + clip.length)), 0.0f });
+
+    auto& points = song.automations[(std::size_t) lane].points;
+    // what the lane had before and after the clip stays its own value up to the clip's edges
+    const auto before = song.automations[(std::size_t) lane].valueAt ((double) clip.start - 1.0);
+    const auto after = song.automations[(std::size_t) lane].valueAt ((double) clip.end() + 1.0);
+    points.erase (std::remove_if (points.begin(), points.end(), [&] (const AutomationPoint& p) { return p.tick >= clip.start && p.tick <= clip.end(); }),
+                  points.end());
+    points.insert (points.end(), inside.begin(), inside.end());
+    if (clip.start > 0 && std::none_of (points.begin(), points.end(), [&] (const AutomationPoint& p) { return p.tick == clip.start - 1; }))
+        points.push_back ({ clip.start - 1, before, 0.0f });
+    if (std::none_of (points.begin(), points.end(), [&] (const AutomationPoint& p) { return p.tick == clip.end() + 1; }))
+        points.push_back ({ clip.end() + 1, after, 0.0f });
+    std::sort (points.begin(), points.end(), [] (const AutomationPoint& a, const AutomationPoint& b) { return a.tick < b.tick; });
+
+    // the clip goes (its automation stays: other clips may use it, as FL keeps it)
+    song.playlist.erase (song.playlist.begin() + clipIndex);
+    return lane;
+}
+
+int laneToClip (Song& song, int track, int lane)
+{
+    if (track < 0 || track >= (int) song.playlistTracks.size() || lane < 0 || lane >= (int) song.playlistTracks[(std::size_t) track].lanes.size())
+        return -1;
+    const auto automation = song.playlistTracks[(std::size_t) track].lanes[(std::size_t) lane].automation;
+    auto& lanes = song.playlistTracks[(std::size_t) track].lanes;
+    lanes.erase (lanes.begin() + lane);
+    if (automation < 0 || automation >= (int) song.automations.size())
+        return -1;
+    const auto& points = song.automations[(std::size_t) automation].points;
+    const auto end = std::max (songEnd (song), points.empty() ? 0 : points.back().tick);
+
+    Clip clip;
+    clip.kind = ClipKind::automation;
+    clip.automation = automation;
+    clip.start = 0;
+    clip.length = std::max<std::int64_t> (1, end);
+    clip.track = 0;
+    // the first track whose [0, end) is free (instrument tracks take no automation clips)
+    auto busy = [&] (int t) {
+        if (t < (int) song.playlistTracks.size() && song.playlistTracks[(std::size_t) t].mode == PlaylistTrackMode::instrument)
+            return true;
+        for (const auto& c : song.playlist)
+            if (c.track == t && c.start < clip.length && c.end() > 0)
+                return true;
+        return false;
+    };
+    while (busy (clip.track))
+        ++clip.track;
+    song.playlist.push_back (clip);
+    return (int) song.playlist.size() - 1;
+}
+
+int lanesToClips (Song& song)
+{
+    int n = 0;
+    for (int t = 0; t < (int) song.playlistTracks.size(); ++t)
+        while (! song.playlistTracks[(std::size_t) t].lanes.empty())
+            if (laneToClip (song, t, 0) >= 0)
+                ++n;
+    return n;
+}
+} // namespace lynx::autolanes

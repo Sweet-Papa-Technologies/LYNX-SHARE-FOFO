@@ -429,7 +429,12 @@ protected:
             }
             switch (c.type)
             {
-                case K::toggle: set ({ { c.param, v (c.param) >= 0.5f ? 0.0f : 1.0f } }); return;
+                case K::toggle:
+                    if (c.id != 0) // (round 190ar: a toggle the editor answers itself: its state is `lit`)
+                        buttonPressed (c, e);
+                    else
+                        set ({ { c.param, v (c.param) >= 0.5f ? 0.0f : 1.0f } });
+                    return;
                 case K::menu: case K::barMenu: showOptions (c); return;
                 case K::tabs:
                 {
@@ -633,8 +638,9 @@ protected:
         const auto w = skin::titleText (g, juce::Rectangle<float> (46.0f, 0.0f, 300.0f, h.getHeight()), name, accent);
         g.setColour (colour::textSecondary);
         g.setFont (font (type::small));
-        g.drawText (trackName() + "  -  " + tr ("slot {0}", { juce::String (slot + 1) }), juce::Rectangle<float> (58.0f + w, 0.0f, 220.0f, h.getHeight()),
-                    juce::Justification::centredLeft, true);
+        if (! plugui::hostedElsewhere) // (no mixer around a plugin in another host, round 188b)
+            g.drawText (trackName() + "  -  " + tr ("slot {0}", { juce::String (slot + 1) }), juce::Rectangle<float> (58.0f + w, 0.0f, 220.0f, h.getHeight()),
+                        juce::Justification::centredLeft, true);
         const auto left = bar.place (h.withTrimmedLeft (w + 270.0f));
         bar.paint (g, accent);
         g.setColour (colour::textDisabled);
@@ -748,7 +754,7 @@ protected:
             }
             case K::toggle:
             {
-                const auto lit = v (c.param) >= 0.5f;
+                const auto lit = c.id != 0 ? c.lit : v (c.param) >= 0.5f;
                 skin::button (g, c.r, false, hover, ac);
                 skin::powerLed (g, { c.r.getX() + 11.0f, c.r.getCentreY() }, 6.0f, false);
                 if (lit)

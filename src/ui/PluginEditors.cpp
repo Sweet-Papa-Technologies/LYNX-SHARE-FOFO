@@ -8,6 +8,7 @@
 #include "ui/FlExtraEditors.h"
 #include "ui/AudioEditor.h"
 #include "ui/PluginEditors.h"
+#include "core/EditorLimit.h"
 #include "core/LuxeVerb.h"
 #include "core/PresetCycle.h"
 #include "core/ShownEffectSlot.h"
@@ -5686,11 +5687,21 @@ public:
         }
         centreWithSize (getWidth(), getHeight());
         setVisible (true);
+        markLinkedWindow (*this, -1, track); // FL's Auto select linked modules (round 187a)
         keepAboveMainWindow (*this);
         skin::playOpenAnimation (*editor, editor->editorStyle()); // round 126: fade / scale in
     }
 
+    ~NativeEffectWindow() override { editorlimit::forget (this); }
+
     void closeButtonPressed() override;
+
+    void activeWindowStatusChanged() override
+    {
+        DocumentWindow::activeWindowStatusChanged();
+        if (isActiveWindow())
+            editorlimit::touch (this);
+    }
 
 private:
     ui::SlotGoneWatcher gone;
@@ -5838,6 +5849,7 @@ void open (AudioEngine& engine, int track, int slot)
         if (it->second->getContentComponent() != nullptr && static_cast<NativeEffectEditor*> (it->second->getContentComponent())->current() != nullptr)
         {
             it->second->toFront (true);
+            editorlimit::touch (it->second.get());
             return;
         }
         open.erase (it); // the slot now holds another effect
@@ -5847,6 +5859,20 @@ void open (AudioEngine& engine, int track, int slot)
     const auto title = utf8 (isSoundgoodizerApprox (fxSlot) ? "Soundgoodizer" : effectInfo (kind).name) + " - " + (name.isNotEmpty() ? name : tr ("Insert {0}", { juce::String (track) })) + " ("
                        + tr ("slot {0}", { juce::String (slot + 1) }) + ")";
     open[key] = std::make_unique<NativeEffectWindow> (engine, track, slot, title);
+    // FL's "Limit the number of open plugin editors" (round 189o, core/EditorLimit.h): LYNX's own effect windows count too
+    auto* window = open[key].get();
+    editorlimit::opened (window, [window] {
+        editorlimit::forget (window);
+        juce::MessageManager::callAsync ([window] {
+            auto& all = windows();
+            for (auto it = all.begin(); it != all.end(); ++it)
+                if (it->second.get() == window)
+                {
+                    all.erase (it);
+                    return;
+                }
+        });
+    });
 }
 
 void switchEmberEditor (AudioEngine& engine, int track, int slot, bool classic)

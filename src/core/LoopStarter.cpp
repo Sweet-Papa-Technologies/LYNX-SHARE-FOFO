@@ -1030,6 +1030,20 @@ void setBlanks (const Genre& genre, std::vector<ChannelPlan>& channels, FlRand& 
     }
 }
 
+int suggestedTempo (const Genre& genre)
+{
+    return (int) std::lround (genre.defaultTempo);
+}
+
+int suggestedTempo (const Sources& sources, const std::string& genreId)
+{
+    const auto* genre = sources.config != nullptr ? sources.config->find (genreId) : nullptr;
+    static const Config own = builtinConfig();
+    if (genre == nullptr)
+        genre = own.find (genreId) != nullptr ? own.find (genreId) : own.find (own.defaultGenre);
+    return suggestedTempo (*genre);
+}
+
 Plan generate (const Sources& sources, const std::string& genreId, std::uint64_t seed)
 {
     Plan plan;
@@ -1149,6 +1163,39 @@ int apply (Song& song, const Plan& plan)
     song.swing = plan.swing;
     song.currentPattern = patternIndex;
     return patternIndex;
+}
+
+std::vector<ChannelDef> kitChannels (const Plan& plan)
+{
+    std::vector<ChannelDef> out;
+    for (const auto& c : plan.channels)
+    {
+        ChannelDef def;
+        def.name = displayName (c.category);
+        if (! c.samplePath.empty())
+        {
+            def.instrument = InstrumentKind::sampler;
+            def.samplePath = c.samplePath;
+        }
+        else
+            def.instrument = builtinDrumFor (c.category);
+        out.push_back (std::move (def));
+    }
+    return out;
+}
+
+Pattern kitPattern (const Plan& plan)
+{
+    Pattern p;
+    p.lengthTicks = (std::int64_t) std::max (1, plan.bars) * 16 * ticksPerStep;
+    for (int row = 0; row < (int) plan.channels.size(); ++row)
+        for (auto n : plan.channels[(std::size_t) row].notes)
+        {
+            n.channel = row;
+            p.notes.push_back (n);
+        }
+    p.sortNotes();
+    return p;
 }
 
 std::vector<int> channelsOf (const Song& song, int pattern)

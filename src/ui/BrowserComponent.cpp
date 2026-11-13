@@ -3,6 +3,10 @@
 #include "ui/QuickPick.h"
 #include "engine/FlStudio.h"
 #include "ui/BrowserComponent.h"
+
+#include "core/PluginDbFolder.h"
+
+#include "ui/AudioClipboard.h"
 #include "ui/SpeechDialog.h"
 #include "ui/UiTrace.h"
 
@@ -13,6 +17,9 @@
 #include "core/SearchIndex.h"
 #include "core/SearchQuery.h"
 #include "core/SearchService.h"
+#include "core/SampleFiles.h"
+#include "core/SampleSimilarity.h"
+#include "engine/SampleLibrary.h"
 #include "core/ValueMath.h"
 #include "core/Vfx.h"
 #include "platform/Paths.h"
@@ -45,10 +52,11 @@ bool isAudio (const juce::File& f)
 
 bool isListed (const juce::File& f)
 {
-    return f.hasFileExtension ("wav;flac;ogg;mp3;aif;aiff;wv;mid;midi;lynx;flp;fst;sf2;sf3;sfz");
+    return f.hasFileExtension ("wav;flac;ogg;mp3;aif;aiff;wv;mid;midi;lynx;flp;als;flm;fst;sf2;sf3;sfz");
 }
 
 constexpr int maxResults = 500;
+constexpr int maxSimilar = 100; // "Find similar samples" lists the nearest 100
 
 juce::Array<juce::File> childrenOf (const juce::File& folder)
 {
@@ -115,7 +123,7 @@ Icon iconFor (const juce::File& f, bool folder)
         return Icon::audioFile;
     if (f.hasFileExtension ("mid;midi"))
         return Icon::pianoRoll;
-    if (f.hasFileExtension ("lynx;flp"))
+    if (f.hasFileExtension ("lynx;flp;als;flm"))
         return Icon::project;
     if (f.hasFileExtension ("fst;sf2;sf3;sfz;lynxpreset;fxp;fxb;vstpreset"))
         return Icon::preset;
@@ -132,7 +140,7 @@ juce::String rowHint (const juce::File& f, bool folder, bool expanded)
                    "[Shift][Up] / [Shift][Down] swap through the files");
     if (f.hasFileExtension ("mid;midi"))
         return tr ("MIDI file: [2xLMB] open it as a project");
-    if (f.hasFileExtension ("lynx;flp"))
+    if (f.hasFileExtension ("lynx;flp;als;flm"))
         return tr ("Project: [2xLMB] open it");
     if (f.hasFileExtension ("lynxtrack") || (f.hasFileExtension ("fst") && f.getFullPathName().containsIgnoreCase ("Mixer presets")))
         return tr ("Mixer preset: [2xLMB] load it onto the selected mixer tracks  drag onto a mixer track (onto the empty mixer space: a new track)");
@@ -280,6 +288,68 @@ struct BrowserComponent::SearchShared
     }
 };
 
+// "Find similar samples" (round 190as): the analysis of the Browser's samples and its worker (core/SampleSimilarity.h),
+// one per process while a Browser exists, the index kept in the settings folder between sessions. The worker has the
+// lowest priority, rests as long as it works and waits while LYNX plays, records or renders.
+struct BrowserComponent::SimilarShared
+{
+    juce::ChangeBroadcaster statusChanged;
+    SampleLibrary library;                        // its own readers: nothing goes into the engine's sample cache
+    std::unique_ptr<similarity::Service> service; // (last: goes first)
+    bool passAsked = false;                       // the background pass was started in this session (message thread)
+
+    ~SimilarShared() { service.reset(); }
+
+    static juce::File file() { return platform::settingsFile ("browser-similar.idx"); }
+
+    static std::shared_ptr<SimilarShared> get (AudioEngine& engine)
+    {
+        static std::weak_ptr<SimilarShared> current; // (message thread)
+        if (auto s = current.lock())
+            return s;
+        auto s = std::make_shared<SimilarShared>();
+        similarity::Service::Callbacks cb;
+        cb.fs = diskFileSystem();
+        cb.stat = [] (const std::string& path, std::int64_t& size, std::int64_t& time) {
+            const juce::File f (juce::String::fromUTF8 (path.c_str()));
+            if (! f.existsAsFile())
+                return false;
+            size = f.getSize();
+            time = f.getLastModificationTime().toMilliseconds();
+            return true;
+        };
+        cb.decode = [raw = s.get()] (const std::string& path, double seconds, std::vector<float>& mono, double& rate) {
+            return raw->library.readMono (juce::File (juce::String::fromUTF8 (path.c_str())), seconds, mono, rate);
+        };
+        cb.accepts = [] (const std::string& name) {
+            const auto dot = name.find_last_of ('.');
+            if (dot == std::string::npos)
+                return false;
+            const auto extension = name.substr (dot + 1);
+            return isSampleExtension (extension) && extension.size() != 6; // (not .speech: it has no audio of its own)
+        };
+        cb.load = [] {
+            const auto f = file();
+            juce::MemoryBlock data;
+            if (! f.existsAsFile() || f.getSize() > 64 * 1024 * 1024 || ! f.loadFileAsData (data))
+                return std::string();
+            return std::string (static_cast<const char*> (data.getData()), data.getSize());
+        };
+        cb.save = [] (const std::string& bytes) {
+            const auto f = file();
+            const auto temp = f.getSiblingFile (f.getFileName() + ".tmp");
+            if (temp.replaceWithData (bytes.data(), bytes.size()))
+                temp.moveFileTo (f);
+        };
+        cb.statusChanged = [raw = s.get()] { raw->statusChanged.sendChangeMessage(); };
+        // (the engine outlives every Browser; these are atomics)
+        cb.shouldPause = [&engine] { return engine.bounceStillPlaying() || engine.isRecording() || AudioEngine::offlineRendersRunning().load() > 0; };
+        s->service = std::make_unique<similarity::Service> (std::move (cb));
+        current = s;
+        return s;
+    }
+};
+
 // A click anywhere outside the search box (another panel, the toolbar, the Browser's own list) takes the keyboard
 // back from it, so Space plays / stops again (issue #9; FL ends typing in its search field the same way).
 class BrowserComponent::FocusWatcher final : public juce::MouseListener
@@ -336,6 +406,7 @@ public:
     {
         Kind kind = Kind::file;
         juce::File file;
+        juce::Array<juce::File> also; // fsFolder: more folders listed as this one (a merged root and its shared subfolders, round 178a)
         bool folder = false, expanded = false, loaded = false;
         int depth = 0;
         Node* parent = nullptr;
@@ -358,6 +429,10 @@ public:
         // Generators' (-1 the other database folders); userFolder = the user's folder path ("" = Effects / Generators)
         int folderKind = -1;
         std::string userFolder;
+        // round 190bj (issue B4): LYNX's own groups under Effects / Generators — the format folder of their Installed
+        // entries ("LYNX", "FL engines", "VFX"; "" = Installed itself), core/PluginDbFolder.h groupFolder()
+        std::string group;
+        bool isGroup = false;
     };
 
     // tree mode: the given top-level nodes
@@ -453,6 +528,7 @@ public:
             parent.children.push_back (std::move (n));
             return *parent.children.back();
         };
+        quickpick::refreshPluginDatabase (browser.engine); // (the folders as they are on disk now: issue #104)
         auto root = folder (nullptr, tr ("Plugin database"), Icon::plugin);
         root->colour = theme::colour::info;
         auto safe = juce::Component::SafePointer<BrowserComponent> (&browser);
@@ -494,6 +570,12 @@ public:
             auto installed = folder (gens.get(), tr ("Installed"), Icon::folder);
             Node* folders[] = { lynxGens.get(), flGens.get(), vfxGens.get(), installed.get() };
             gens->folderKind = 1;
+            for (auto [node, group] : { std::pair { folders[0], "LYNX" }, std::pair { folders[1], "FL engines" }, std::pair { folders[2], "VFX" },
+                                        std::pair { folders[3], "" } })
+            {
+                node->group = group;
+                node->isGroup = true;
+            }
             const auto mine = userFolderNodes (*gens, true, folder, engine); // round 166f: the user's folders first
             for (auto& e : quickpick::generatorEntries (engine))
             {
@@ -520,6 +602,11 @@ public:
             auto installed = folder (fxs.get(), tr ("Installed"), Icon::folder);
             Node* folders[] = { lynxFx.get(), flFx.get(), installed.get(), installed.get() };
             fxs->folderKind = 0;
+            for (auto [node, group] : { std::pair { folders[0], "LYNX" }, std::pair { folders[1], "FL engines" }, std::pair { folders[2], "" } })
+            {
+                node->group = group;
+                node->isGroup = true;
+            }
             const auto mine = userFolderNodes (*fxs, false, folder, engine); // round 166f: the user's folders first
             for (auto& e : quickpick::effectEntries (engine))
             {
@@ -564,7 +651,9 @@ public:
     }
 
     // flat mode: a list of files with their path relative to the folder searched that holds them
-    void setFiles (const juce::Array<juce::File>& files, const juce::Array<juce::File>& newBases, const juce::String& newStatus)
+    // (`details`: the dimmed text after each name, e.g. how similar the file is; round 190as)
+    void setFiles (const juce::Array<juce::File>& files, const juce::Array<juce::File>& newBases, const juce::String& newStatus,
+                   const juce::StringArray& details = {})
     {
         bases = newBases;
         status = newStatus;
@@ -573,6 +662,7 @@ public:
         {
             auto n = std::make_unique<Node>();
             n->file = f;
+            n->detail = details[(int) flatNodes.size()];
             flatNodes.push_back (std::move (n));
         }
         selected = hovered = -1;
@@ -607,7 +697,7 @@ public:
             for (auto it = n.children.begin(); it != n.children.end();)
             {
                 auto& c = **it;
-                if (c.kind == Kind::fsFolder && drop (c.file))
+                if (c.kind == Kind::fsFolder && drop (c.file) && std::all_of (c.also.begin(), c.also.end(), drop))
                 {
                     for (auto* s = keep; s != nullptr; s = s->parent)
                         lostSelection = lostSelection || s == &c;
@@ -875,9 +965,10 @@ public:
 
             auto text = r.withLeft ((int) x).withTrimmedRight (6);
 
-            if (flat && n.kind == Kind::file) // the folder it lives in, on the right
+            const auto flatDetail = flat && n.kind == Kind::file && n.detail.isNotEmpty(); // "87%" of a similar sample
+            if (flat && n.kind == Kind::file) // the folder it lives in, on the right (similar samples: how similar)
             {
-                const auto where = n.file.getParentDirectory().getRelativePathFrom (baseOf (n.file));
+                const auto where = flatDetail ? n.detail : n.file.getParentDirectory().getRelativePathFrom (baseOf (n.file));
                 g.setFont (theme::font (theme::type::caption));
                 g.setColour (textDisabled);
                 const auto w = juce::jmin (text.getWidth() / 2, juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), where) + 4);
@@ -904,7 +995,7 @@ public:
             g.drawText (name, text, juce::Justification::centredLeft, true);
 
             // the detail after the name, dimmed: "(insert)", "3x", "missing", a section's count
-            if (n.detail.isNotEmpty() && nameWidth + 12 < text.getWidth())
+            if (n.detail.isNotEmpty() && ! flatDetail && nameWidth + 12 < text.getWidth())
             {
                 g.setFont (theme::font (theme::type::small));
                 g.setColour (n.missing ? meterClip.withAlpha (0.7f) : textDisabled);
@@ -1339,15 +1430,52 @@ private:
             return;
         }
 
-       #if JUCE_MAC
-        // not JUCE's iterator on macOS: one name NSString rejects would end the app as the folder opens (issue #42)
+        auto list = [] (const juce::File& folder, juce::Array<juce::File>& folders, juce::Array<juce::File>& files) {
+           #if JUCE_MAC
+            // not JUCE's iterator on macOS: one name NSString rejects would end the app as the folder opens (issue #42)
+            for (const auto& c : childrenOf (folder))
+                (c.isDirectory() ? folders : files).add (c);
+           #else
+            folders = folder.findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::noCycles);
+            files = folder.findChildFiles (juce::File::findFiles, false, "*", juce::File::FollowSymlinks::noCycles);
+           #endif
+        };
         juce::Array<juce::File> folders, files;
-        for (const auto& c : childrenOf (n.file))
-            (c.isDirectory() ? folders : files).add (c);
-       #else
-        auto folders = n.file.findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::noCycles);
-        auto files = n.file.findChildFiles (juce::File::findFiles, false, "*", juce::File::FollowSymlinks::noCycles);
-       #endif
+        std::map<juce::String, juce::Array<juce::File>> alsoOf; // a merged subfolder's other copies (by its path)
+        if (n.also.isEmpty())
+            list (n.file, folders, files);
+        else
+        {
+            // a merged root (FL's Scores, Mixer presets): the union of its folders, the first one's entry on a clash
+            juce::Array<juce::File> sources { n.file };
+            sources.addArray (n.also);
+            std::vector<juce::Array<juce::File>> srcFolders (sources.size()), srcFiles (sources.size());
+            std::vector<browserview::Listing> listings (sources.size());
+            for (int i = 0; i < sources.size(); ++i)
+            {
+                list (sources[i], srcFolders[(std::size_t) i], srcFiles[(std::size_t) i]);
+                for (const auto& f : srcFolders[(std::size_t) i])
+                    listings[(std::size_t) i].folders.push_back (f.getFileName().toStdString());
+                for (const auto& f : srcFiles[(std::size_t) i])
+                    listings[(std::size_t) i].files.push_back (f.getFileName().toStdString());
+            }
+            auto find = [] (const juce::Array<juce::File>& in, const std::string& name) {
+                for (const auto& f : in)
+                    if (f.getFileName().equalsIgnoreCase (juce::String (name)))
+                        return f;
+                return juce::File();
+            };
+            const auto merged = browserview::mergeListings (listings);
+            for (const auto& e : merged.folders)
+            {
+                const auto f = find (srcFolders[(std::size_t) e.from], e.name);
+                folders.add (f);
+                for (const auto a : e.also)
+                    alsoOf[f.getFullPathName()].add (find (srcFolders[(std::size_t) a], e.name));
+            }
+            for (const auto& e : merged.files)
+                files.add (find (srcFiles[(std::size_t) e.from], e.name));
+        }
         auto byName = [] (const juce::File& a, const juce::File& b) { return a.getFileName().compareNatural (b.getFileName()) < 0; };
         std::sort (folders.begin(), folders.end(), byName);
         std::sort (files.begin(), files.end(), byName);
@@ -1356,11 +1484,13 @@ private:
         {
             if (f.isHidden() || f.getFileName().startsWithChar ('.'))
                 continue;
-            if (browser.filterHides (f)) // nothing in it is listed under the content filter (round 164)
-                continue;
+            const auto also = alsoOf.count (f.getFullPathName()) ? alsoOf[f.getFullPathName()] : juce::Array<juce::File>();
+            if (browser.filterHides (f) && std::all_of (also.begin(), also.end(), [this] (const juce::File& a) { return browser.filterHides (a); }))
+                continue; // nothing in it is listed under the content filter (round 164)
             auto c = std::make_unique<Node>();
             c->kind = Kind::fsFolder;
             c->file = f;
+            c->also = also;
             c->folder = true;
             c->depth = n.depth + 1;
             c->parent = &n;
@@ -1683,6 +1813,24 @@ private:
         }
     }
 
+    // FL's "Delete file..." on a Plugin database entry (round 190bf): to the recycle bin after asking; the plugin leaves
+    // the menus' folders and the picker (it stays installed), as when the file is deleted in the file manager
+    void deleteDatabaseEntry (const juce::File& entry)
+    {
+        auto safe = juce::Component::SafePointer<FileTree> (this);
+        juce::AlertWindow::showOkCancelBox (juce::MessageBoxIconType::WarningIcon, tr ("Delete file"),
+                                            tr ("Move \"{0}\" to the recycle bin?", { entry.getFileName() }), tr ("Delete"), tr ("Cancel"), nullptr,
+                                            juce::ModalCallbackFunction::create ([safe, entry] (int result) {
+                                                if (result == 0 || safe == nullptr)
+                                                    return;
+                                                if (! entry.moveToTrash())
+                                                    juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Delete file"),
+                                                                                            tr ("The file could not be deleted."));
+                                                quickpick::refreshPluginDatabase (safe->browser.engine, true);
+                                                safe->browser.rebuildTree();
+                                            }));
+    }
+
 public:
     void renamePlugin (const std::string& key, const juce::String& original)
     {
@@ -1704,7 +1852,35 @@ public:
         return true;
     }
 
+    // --snapshot (round 190bf): the menu a right-click on that row shows (the Plugin database's), without showing it
+    juce::PopupMenu menuForSnapshot (int row)
+    {
+        juce::PopupMenu out;
+        if (! juce::isPositiveAndBelow (row, (int) rows.size()))
+            return out;
+        captured = &out;
+        showMenu (*rows[(std::size_t) row]);
+        captured = nullptr;
+        return out;
+    }
+    int firstRowOfKind (bool plugin) const
+    {
+        for (int i = 0; i < (int) rows.size(); ++i)
+            if (rows[(std::size_t) i]->kind == (plugin ? Kind::plugin : Kind::plugins) && (plugin || rows[(std::size_t) i]->folderKind >= 0))
+                return i;
+        return -1;
+    }
+
 private:
+    juce::PopupMenu* captured = nullptr;
+    void present (juce::PopupMenu& menu)
+    {
+        if (captured != nullptr)
+            *captured = menu;
+        else
+            menu.showMenuAsync (juce::PopupMenu::Options().withMousePosition());
+    }
+
     void showMenu (Node& n)
     {
         auto& engine = browser.engine;
@@ -1724,6 +1900,9 @@ private:
             });
         };
 
+        // (issue #104: the items below act on the Plugin database folder as it is on disk now)
+        if (n.kind == Kind::plugin || n.kind == Kind::plugins)
+            quickpick::refreshPluginDatabase (engine, true);
         if (n.kind == Kind::plugin)
         {
             menu.addSectionHeader (n.label);
@@ -1767,21 +1946,55 @@ private:
                 });
                 menu.addSubMenu (tr ("Move to folder"), move);
             }
-            menu.showMenuAsync (juce::PopupMenu::Options().withMousePosition());
+            // FL's "System" group on an entry (round 190bf, fl190be q1-entry-menu.png): its file in the Plugin database
+            // folder (the Installed one for a plugin in no folder). FL's "Windows shell menu" is left out: LYNX has no
+            // shell context menu of its own.
+            {
+                const auto entry = n.pluginKey.empty() ? juce::File() : quickpick::pluginDatabaseEntry (n.pluginKey, (bool) n.generator);
+                const auto ok = entry.existsAsFile();
+                menu.addSectionHeader (tr ("System"));
+                menu.addItem (tr ("Open parent folder"), ok, false, [entry] { entry.getParentDirectory().startAsProcess(); });
+                menu.addItem (tr ("Locate file"), ok, false, [entry] { entry.revealToUser(); });
+                menu.addItem (tr ("Delete file..."), ok, false, [safe, entry] {
+                    if (safe != nullptr)
+                        safe->deleteDatabaseEntry (entry);
+                });
+            }
+            present (menu);
             return;
         }
         if (n.kind == Kind::project || n.kind == Kind::category || n.kind == Kind::plugins)
         {
             menu.addSectionHeader (n.label);
             expandItems();
+            juce::File databaseDir; // (a Plugin database folder: its place on disk)
             if (n.kind == Kind::plugins && n.folderKind >= 0) // round 166f (issue #16): the user's folders
                 addFolderItems (menu, n);
+            if (n.kind == Kind::plugins)
+            {
+                // round 190ba (issue #104): the Plugin database is a folder the user can arrange in the file manager, as
+                // FL's (its Browser opens the folder from this menu too). The database itself, Effects / Generators, one
+                // of the user's folders; LYNX's own groups (LYNX SHARE, FL engines, Installed) open the Installed entries
+                juce::File dir = quickpick::pluginDatabaseFolder();
+                if (n.folderKind >= 0)
+                    dir = quickpick::pluginDatabaseFolder (n.folderKind == 1, n.userFolder);
+                else if (n.isGroup && n.parent != nullptr && n.parent->kind == Kind::plugins && n.parent->folderKind >= 0)
+                    dir = juce::File (juce::String::fromUTF8 (plugindb::groupFolder (dir.getFullPathName().toStdString(), n.parent->folderKind == 1, n.group).c_str()));
+                databaseDir = dir;
+            }
             if ((n.kind == Kind::project || n.kind == Kind::plugins) && n.parent == nullptr && browser.tab == allTab) // round 163
             {
                 menu.addSeparator();
                 browser.addHideItem (menu, n.kind == Kind::project ? browserview::projectRootId : browserview::pluginsRootId, n.label);
             }
-            menu.showMenuAsync (juce::PopupMenu::Options().withMousePosition());
+            if (n.kind == Kind::plugins)
+            {
+                // FL's "System" group at the end of a folder's menu (round 190bf, fl190be q1-folder-menu.png): "Open"
+                // (FL's "Windows shell menu" is left out: LYNX has no shell context menu of its own)
+                menu.addSectionHeader (tr ("System"));
+                menu.addItem (tr ("Open"), databaseDir.isDirectory(), false, [dir = databaseDir] { dir.startAsProcess(); });
+            }
+            present (menu);
             return;
         }
 
@@ -2117,7 +2330,7 @@ public:
                     peaks.assign (count, 0.0f);
                     const auto* l = sample->leftData();
                     const auto* r = sample->rightData();
-                    const auto stride = juce::jmax<std::size_t> (1, frames / (count * 64)); // look at up to 64 points per peak
+                    const auto stride = std::max<std::size_t> (1, frames / (count * 64)); // look at up to 64 points per peak
 
                     for (std::size_t i = 0; i < count; ++i)
                     {
@@ -2170,7 +2383,7 @@ public:
         g.drawText (file.getFileNameWithoutExtension(), top, juce::Justification::centredLeft, true);
         g.setFont (theme::font (theme::type::caption));
         g.setColour (textSecondary);
-        g.drawText (info, top, juce::Justification::centredRight, true);
+        g.drawText (info + tempoText(), top, juce::Justification::centredRight, true);
         area.removeFromTop (2);
 
         g.setColour (bg0);
@@ -2244,6 +2457,18 @@ public:
 
     bool isPlaying() const { return position() > 0.0 && position() < 1.0; }
 
+    // "Preview in time" (round 190aq): the tempo found in the file and the project's, after the file's details
+    juce::String tempoText() const
+    {
+        const auto& timing = browser.engine.getPreviewTiming();
+        if (! browser.engine.isPreviewInTime() || timing.path != file.getFullPathName() || ! (timing.fileBpm > 0.0))
+            return {};
+        auto bpm = [] (double v) { return juce::String (v, std::abs (v - std::round (v)) < 0.05 ? 0 : 1); };
+        // "120 BPM" at the project's tempo already, else "120 → 140 BPM" (what it is stretched to)
+        return "  " + tr ("{0} BPM", { timing.ratio == 1.0 ? bpm (timing.fileBpm)
+                                                             : bpm (timing.fileBpm) + juce::String::fromUTF8 (" \xe2\x86\x92 ") + bpm (timing.fileBpm / timing.ratio) });
+    }
+
     void stop()
     {
         startedAt = 0.0;
@@ -2258,6 +2483,13 @@ private:
     {
         if (startedAt <= 0.0 || seconds <= 0.0)
             return 0.0;
+        // "Preview in time" (round 190aq): the stretched preview starts later (its stretch, then its beat) and lasts
+        // another time, so the engine says where it is
+        if (const auto& timing = browser.engine.getPreviewTiming(); timing.path == file.getFullPathName() && (timing.pending || timing.inTime))
+        {
+            const auto p = browser.engine.getPreviewInTimeProgress();
+            return p < 0.0 ? 1.0 : juce::jlimit (1.0e-6, 1.0 - 1.0e-6, p);
+        }
         return juce::jlimit (0.0, 1.0, (juce::Time::getMillisecondCounterHiRes() - startedAt) / 1000.0 / seconds);
     }
 
@@ -2376,7 +2608,16 @@ BrowserComponent::BrowserComponent (AudioEngine& e, Role r)
     searcher->indexChanged.addChangeListener (this);
     juce::Timer::callAfterDelay (4000, [safe = juce::Component::SafePointer<BrowserComponent> (this)] {
         if (safe != nullptr && safe->role == Role::main && ! safe->allRoots.isEmpty())
-            safe->searcher->service->refresh (toPaths (safe->allRoots));
+            safe->searcher->service->refresh (toPaths (safe->withMerged (safe->allRoots)));
+    });
+    // "Find similar samples" (round 190as): once it was used (its index file exists), the folders are checked for new
+    // samples in the background a while after start; before that nothing is analysed
+    similar = SimilarShared::get (engine);
+    similar->statusChanged.addChangeListener (this);
+    juce::Timer::callAfterDelay (20000, [safe = juce::Component::SafePointer<BrowserComponent> (this)] {
+        if (safe != nullptr && safe->role == Role::main && ! safe->allRoots.isEmpty() && SimilarShared::file().existsAsFile()
+            && ! std::exchange (safe->similar->passAsked, true))
+            safe->similar->service->refresh (toPaths (safe->withMerged (safe->allRoots)));
     });
     focusWatcher = std::make_unique<FocusWatcher> (*this);
 
@@ -2587,6 +2828,7 @@ void BrowserComponent::setRootShown (const juce::String& id, bool shown)
 void BrowserComponent::showAllRoots()
 {
     view.hidden.clear();
+    view.excluded.clear(); // (and every folder of the merged roots, round 178a)
     saveView();
     rebuildRoots();
 }
@@ -2851,7 +3093,8 @@ std::vector<BrowserComponent::FolderEntry> BrowserComponent::folderEntries() con
         e.name = allRootNames[i];
         e.shown = view.shows (e.id.toStdString());
         e.user = allRootKinds[(std::size_t) i] == browserview::RootKind::user;
-        e.empty = filterHides (allRoots[i]);
+        const auto merged = withMerged ({ allRoots[i] });
+        e.empty = std::all_of (merged.begin(), merged.end(), [this] (const juce::File& f) { return filterHides (f); });
         out.push_back (std::move (e));
     }
     return out;
@@ -2885,9 +3128,23 @@ std::unique_ptr<juce::Component> BrowserComponent::makeFoldersPanelForSnapshot()
 
 void BrowserComponent::showViewMenu()
 {
+    buildViewMenu().showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&viewButton));
+}
+
+juce::PopupMenu BrowserComponent::buildViewMenu()
+{
     juce::PopupMenu menu;
     addViewItems (menu);
     juce::Component::SafePointer<BrowserComponent> safe (this);
+    menu.addSeparator();
+    // LYNX's own (round 190aq, off by default): loops are auditioned at the project's tempo, starting on the beat
+    menu.addItem (tr ("Preview in time (loops play at the project's tempo, on the beat)"), true, engine.isPreviewInTime(), [safe] {
+        if (safe == nullptr)
+            return;
+        safe->engine.setPreviewInTime (! safe->engine.isPreviewInTime());
+        if (safe->onPreviewVolumeChanged != nullptr)
+            safe->onPreviewVolumeChanged(); // (saved with the preview volume)
+    });
     menu.addSeparator();
     menu.addItem (tr ("Refresh"), [safe] { if (safe != nullptr) safe->rebuildRoots(); });
     menu.addItem (tr ("Refresh search index"), [safe] { if (safe != nullptr) safe->refreshSearchIndex (false); });
@@ -2897,7 +3154,7 @@ void BrowserComponent::showViewMenu()
         menu.addItem (role == Role::samples ? tr ("Close the Sample browser") : tr ("Sample browser (separate window)"),
                       [safe] { if (safe != nullptr && safe->onToggleSampleBrowser != nullptr) safe->onToggleSampleBrowser(); });
     }
-    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&viewButton));
+    return menu;
 }
 
 namespace
@@ -2955,6 +3212,16 @@ std::unique_ptr<juce::Component> BrowserComponent::makeSampleBrowserContent (Aud
     return host;
 }
 
+juce::File BrowserComponent::firstSampleFolder() const
+{
+    using browserview::RootKind;
+    for (auto wanted : { RootKind::flSamples, RootKind::user, RootKind::music })
+        for (int i = 0; i < allRoots.size() && i < (int) allRootKinds.size(); ++i)
+            if (allRootKinds[(std::size_t) i] == wanted && allRoots[i].isDirectory())
+                return allRoots[i];
+    return {};
+}
+
 void BrowserComponent::rebuildRoots()
 {
     roots.clear();
@@ -2962,15 +3229,14 @@ void BrowserComponent::rebuildRoots()
     allRoots.clear();
     allRootNames.clear();
     allRootKinds.clear();
+    rootAlso.clear();
     using browserview::RootKind;
 
-    // FL folders (if installed) and user folders
-    const auto programs = juce::File::getSpecialLocation (juce::File::globalApplicationsDirectory);
-    juce::File fl;
-
-    for (const auto& dir : programs.getChildFile ("Image-Line").findChildFiles (juce::File::findDirectories, false, "FL Studio*"))
-        if (dir.getChildFile ("Data").isDirectory() && dir.getFileName() > fl.getFileName()) // "FL Studio ASIO" is the driver
-            fl = dir;
+    // FL folders (if installed) and user folders. Round 190bj (QA: the FL folders were listed with LYNX_NO_FL=1): the
+    // installation comes from findFlStudio, as everywhere else (FL's own install path, Program Files\Image-Line, Wine,
+    // LYNX_FL_INSTALL; none with LYNX_NO_FL)
+    const auto flInstall = findFlStudio();
+    const auto fl = flInstall.installDir;
 
     auto add = [this] (const juce::String& name, const juce::File& folder, RootKind kind) {
         if (folder.isDirectory() && ! allRoots.contains (folder))
@@ -2980,22 +3246,38 @@ void BrowserComponent::rebuildRoots()
             allRootKinds.push_back (kind);
         }
     };
+    // one root for several folders, as FL's Browser shows its Scores and Mixer presets (the user's Presets folder and
+    // its own Data\\Patches one, round 178a): the first folder that exists is the root, the others are merged into it
+    auto addMerged = [this, &add] (const juce::String& name, juce::Array<juce::File> folders, RootKind kind) {
+        folders.removeIf ([] (const juce::File& f) { return ! f.isDirectory(); });
+        if (folders.isEmpty())
+            return;
+        const auto root = folders.removeAndReturn (0);
+        add (name, root, kind);
+        if (! folders.isEmpty() && allRoots.contains (root))
+            rootAlso[root.getFullPathName()] = folders;
+    };
 
     const auto data = fl.getChildFile ("Data");
     add (tr ("FL samples (Packs)"), data.getChildFile ("Patches").getChildFile ("Packs"), RootKind::flSamples);
     add (tr ("FL demo projects"), data.getChildFile ("Demo projects"), RootKind::flDemos);
-    add (tr ("FL MIDI"), data.getChildFile ("Patches").getChildFile ("Scores"), RootKind::flMidi);
+    const auto userData = flInstall.userData;
+    auto userPresets = [&userData] (const char* folder) {
+        return userData.isDirectory() ? userData.getChildFile ("Presets").getChildFile (folder) : juce::File();
+    };
+    addMerged (tr ("Scores"), { userPresets ("Scores"), data.getChildFile ("Patches").getChildFile ("Scores") }, RootKind::flMidi);
     add (tr ("3x Osc presets (FL)"), data.getChildFile ("Patches").getChildFile ("Channel presets").getChildFile ("3x Osc"), RootKind::flPresets);
     add (tr ("Synth presets (FL)"), data.getChildFile ("Patches").getChildFile ("Plugin presets").getChildFile ("Generators"), RootKind::flPresets);
     add (tr ("Speech (FL)"), data.getChildFile ("Patches").getChildFile ("Speech"), RootKind::speech);
     speechui::userSpeechFolder().createDirectory(); // (the Speech properties save there; round 168b)
     add (tr ("Speech"), speechui::userSpeechFolder(), RootKind::speech);
-    // FL's Browser folder "Mixer presets" (REA round 167q, FUN_009db5b0: the user's and the installation's)
-    if (const auto userData = findFlStudio().userData; userData.isDirectory())
-        add (tr ("Mixer presets"), userData.getChildFile ("Presets").getChildFile ("Mixer presets"), RootKind::flPresets);
-    add (tr ("Mixer presets (FL)"), data.getChildFile ("Patches").getChildFile ("Mixer presets"), RootKind::flPresets);
+    // FL's Browser folder "Mixer presets" (REA round 167q, FUN_009db5b0: the user's and the installation's, one root)
+    addMerged (tr ("Mixer presets"), { userPresets ("Mixer presets"), data.getChildFile ("Patches").getChildFile ("Mixer presets") },
+               RootKind::flPresets);
     pluginpresetui::presetsRoot().createDirectory(); // (the plugin window saves presets there; round 162d)
     add (tr ("Plugin presets"), pluginpresetui::presetsRoot(), RootKind::pluginPresets);
+    audioclipboard::folder().createDirectory(); // (Tools › Clipboard saves there; round 181b)
+    add (tr ("Clipboard files"), audioclipboard::folder(), RootKind::clipboardFiles);
     add (tr ("Documents"), juce::File::getSpecialLocation (juce::File::userDocumentsDirectory), RootKind::documents);
     add (tr ("Music"), juce::File::getSpecialLocation (juce::File::userMusicDirectory), RootKind::music);
     add (tr ("Desktop"), juce::File::getSpecialLocation (juce::File::userDesktopDirectory), RootKind::desktop);
@@ -3007,6 +3289,11 @@ void BrowserComponent::rebuildRoots()
 
     if (! viewLoaded)
         loadView();
+    bool migrated = false; // (round 178a: the old "FL MIDI" / "Mixer presets (FL)" roots' hidden state)
+    for (const auto& [rootPath, folders] : rootAlso)
+        migrated = browserview::migrateMergedRoot (view, rootPath.toStdString(), toPaths (folders)) || migrated;
+    if (migrated && viewFromFile)
+        saveView();
     for (int i = 0; i < allRoots.size(); ++i)
         if (view.shows (allRoots[i].getFullPathName().toStdString()))
         {
@@ -3061,11 +3348,16 @@ void BrowserComponent::rebuildTree()
         {
             if (! roots.contains (allRoots[i]))
                 continue; // hidden from this Browser (round 163)
-            if (filterHides (allRoots[i]))
+            if (const auto merged = withMerged ({ allRoots[i] });
+                std::all_of (merged.begin(), merged.end(), [this] (const juce::File& f) { return filterHides (f); }))
                 continue; // nothing in it is listed under the content filter (round 164)
             // the FL folders keep their colour by position; the user's own folders share one
             auto colour = rootColour (i < 9 ? i : 99);
-            top.push_back (FileTree::makeFolder (allRoots[i], allRootNames[i], colour));
+            auto n = FileTree::makeFolder (allRoots[i], allRootNames[i], colour);
+            n->also = mergedInto (allRoots[i]);
+            if (allRootKinds[(std::size_t) i] == browserview::RootKind::flMidi)
+                n->icon = Icon::note; // (FL's Scores folder has a note)
+            top.push_back (std::move (n));
         }
 
     tree->setTopLevel (std::move (top));
@@ -3097,6 +3389,11 @@ void BrowserComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
     if (source == &searcher->statusChanged)
     {
         indexStatusChanged();
+        return;
+    }
+    if (source == &similar->statusChanged)
+    {
+        similarStatusChanged();
         return;
     }
     if (source == &searcher->indexChanged)
@@ -3150,6 +3447,9 @@ BrowserComponent::~BrowserComponent()
     searcher->statusChanged.removeChangeListener (this);
     searcher->indexChanged.removeChangeListener (this);
     searcher->service->cancelSearch();
+    similar->statusChanged.removeChangeListener (this);
+    if (similarId != 0)
+        similar->service->cancel();
     focusWatcher.reset();
     engine.previewFile ({});
 }
@@ -3305,8 +3605,12 @@ void BrowserComponent::showFileMenu (const juce::File& file)
         menu.addItem (tr ("Send to the Playlist as an audio clip"), onSendToPlaylist != nullptr, false, [this, file] { onSendToPlaylist (file); });
         menu.addSeparator();
         menu.addItem (tr ("Edit in the audio editor..."), [this, file] { openAudioEditor (engine, file); });
+        // FL's Sounds tab menu: "Open/Edit in...", then "Find similar samples" (FL asks FL Cloud; LYNX looks through
+        // the Browser's own folders, round 190as)
+        if (! file.hasFileExtension ("speech"))
+            menu.addItem (tr ("Find similar samples"), [this, file] { findSimilar (file); });
     }
-    else if (file.hasFileExtension ("lynx;flp"))
+    else if (file.hasFileExtension ("lynx;flp;als;flm"))
         menu.addItem (tr ("Open project"), onOpenProject != nullptr, false, [this, file] { onOpenProject (file); });
     else if (file.hasFileExtension ("mid;midi"))
         menu.addItem (tr ("Open MIDI file"), onOpenProject != nullptr, false, [this, file] { onOpenProject (file); });
@@ -3349,6 +3653,30 @@ void BrowserComponent::showFolderMenu (const juce::File& folder, std::function<v
                 if (safe != nullptr)
                     safe->removeUserFolder (folder);
             });
+        if (const auto merged = rootAlso.find (folder.getFullPathName()); merged != rootAlso.end())
+        {
+            // a LYNX extra (FL has no exclusion; round 178a): the folders this root merges, each one ticked in or out;
+            // the root's own folder stays (Hide... hides the root)
+            juce::PopupMenu folders;
+            folders.addItem (folder.getFullPathName(), false, true, nullptr);
+            for (const auto& f : merged->second)
+            {
+                const auto path = f.getFullPathName().toStdString();
+                folders.addItem (f.getFullPathName(), true, view.excluded.count (path) == 0,
+                                 [safe = juce::Component::SafePointer<BrowserComponent> (this), path] {
+                                     if (safe == nullptr)
+                                         return;
+                                     if (safe->view.excluded.erase (path) == 0)
+                                         safe->view.excluded.insert (path);
+                                     safe->saveView();
+                                     safe->rebuildRoots();
+                                     safe->searcher->service->refresh (toPaths (safe->withMerged (safe->allRoots)));
+                                     if (safe->searchBox.getText().trim().isNotEmpty())
+                                         safe->runSearch();
+                                 });
+            }
+            menu.addSubMenu (tr ("Folders"), folders);
+        }
     }
     juce::PopupMenu browserMenu;
     addViewItems (browserMenu);
@@ -3376,7 +3704,7 @@ juce::Array<juce::File> BrowserComponent::searchRoots() const
 {
     // the top-level folder holding the selection; nothing selected there: every folder
     if (const auto root = tree->selectedRoot(); root.isDirectory())
-        return { root };
+        return withMerged ({ root });
     if (tab == starredTab) // the starred folders
     {
         juce::Array<juce::File> folders;
@@ -3385,7 +3713,25 @@ juce::Array<juce::File> BrowserComponent::searchRoots() const
                 folders.add (f);
         return folders;
     }
-    return roots;
+    return withMerged (roots);
+}
+
+juce::Array<juce::File> BrowserComponent::mergedInto (const juce::File& root) const
+{
+    const auto it = rootAlso.find (root.getFullPathName());
+    if (it == rootAlso.end())
+        return {};
+    auto folders = it->second; // (less the folders this view leaves out: a hidden "FL MIDI" before round 178a)
+    folders.removeIf ([this] (const juce::File& f) { return view.excluded.count (f.getFullPathName().toStdString()) > 0; });
+    return folders;
+}
+
+juce::Array<juce::File> BrowserComponent::withMerged (const juce::Array<juce::File>& folders) const
+{
+    auto out = folders;
+    for (const auto& f : folders)
+        out.addArray (mergedInto (f));
+    return out;
 }
 
 void BrowserComponent::setSearchForSnapshot (const juce::String& text)
@@ -3457,6 +3803,16 @@ void BrowserComponent::resetViewForSnapshot()
     rebuildRoots();
 }
 
+std::vector<juce::PopupMenu> BrowserComponent::pluginDatabaseMenusForSnapshot()
+{
+    // a folder of the user's (else Effects / Generators) and the first plugin entry shown, as a right-click opens them
+    showPluginDatabaseForSnapshot();
+    std::vector<juce::PopupMenu> out;
+    out.push_back (tree->menuForSnapshot (tree->firstRowOfKind (false)));
+    out.push_back (tree->menuForSnapshot (tree->firstRowOfKind (true)));
+    return out;
+}
+
 void BrowserComponent::showPluginDatabaseForSnapshot()
 {
     openPluginFolders = { tr ("Plugin database"), tr ("Plugin database") + "/" + tr ("Generators"), tr ("Generators") + "/" + tr ("FL engines"),
@@ -3491,7 +3847,8 @@ void BrowserComponent::showPluginDatabase (const juce::String& folder, int gener
 void BrowserComponent::showScores (const juce::String& subfolder)
 {
     // the Piano roll's File › Browse scores (round 168g; FL: FUN_0123a580 opens its browser at the Scores folder): the
-    // "FL MIDI" root (Data/Patches/Scores) shown, opened and selected
+    // "Scores" root shown, opened and selected. With a subfolder (the Event editor's File › Browse automations: FL
+    // opens Scores\\Automation, the user's when there is one; REA round 178a) that folder's row is selected
     for (int i = 0; i < allRoots.size(); ++i)
         if (i < (int) allRootKinds.size() && allRootKinds[(std::size_t) i] == browserview::RootKind::flMidi)
         {
@@ -3501,8 +3858,11 @@ void BrowserComponent::showScores (const juce::String& subfolder)
             setTab (allTab);
             rebuildTree();
             tree->expandTop (folder, 1);
-            // (the Event editor's File › Browse automations: FL opens its Scores\\Automation folder)
-            auto row = subfolder.isNotEmpty() ? tree->rowOfFile (folder.getChildFile (subfolder)) : -1;
+            int row = -1;
+            if (subfolder.isNotEmpty())
+                for (const auto& f : withMerged ({ folder })) // (the merged row is the first folder's that has it)
+                    if (row < 0)
+                        row = tree->rowOfFile (f.getChildFile (subfolder));
             if (row < 0)
                 row = tree->rowLabelled (allRootNames[i]);
             if (row >= 0)
@@ -3588,6 +3948,19 @@ void BrowserComponent::runSearch (bool quiet)
 {
     searcher->service->cancelSearch();
     searchId = 0;
+    if (similarTo != juce::File())
+    {
+        // similar samples are listed while the box still says so; any other text is an ordinary search again
+        if (tab != projectTab && searchBox.getText() == similarLabel())
+        {
+            runSimilar (quiet);
+            return;
+        }
+        similarTo = juce::File();
+        similarPartial = false;
+        if (std::exchange (similarId, 0) != 0)
+            similar->service->cancel();
+    }
     const auto query = searchBox.getText().trim();
     resultsView->setVisible (query.isNotEmpty());
     treeView->setVisible (query.isEmpty());
@@ -3681,6 +4054,8 @@ void BrowserComponent::searchAnswered (const search::SearchResult& r, const juce
 void BrowserComponent::indexStatusChanged()
 {
     applyFilterToTree(); // the index changed: folders found empty under the content filter go (round 164)
+    if (similarTo != juce::File() && resultsView->isVisible())
+        return; // similar samples are listed: their own line stays
     const auto st = searcher->service->status();
     juce::String line;
     if (resultsView->isVisible() && tab != projectTab && searchBox.getText().trim().isNotEmpty())
@@ -3703,11 +4078,141 @@ void BrowserComponent::indexStatusChanged()
     }
 }
 
+// --- "Find similar samples" (round 190as) ------------------------------------------------------------------------
+
+juce::String BrowserComponent::similarLabel() const
+{
+    return tr ("Similar to {0}", { similarTo.getFileNameWithoutExtension() });
+}
+
+juce::Array<juce::File> BrowserComponent::similarScope() const
+{
+    return withMerged (roots); // every folder this Browser shows, wherever the sample itself is
+}
+
+void BrowserComponent::findSimilar (const juce::File& file)
+{
+    if (! file.existsAsFile())
+        return;
+    if (tab == projectTab)
+        setTab (allTab);
+    similarTo = file;
+    searchPending = false;
+    searchBox.setText (similarLabel(), juce::dontSendNotification);
+    // the first use starts the analysis of the Browser's folders (the clicked file is analysed first, at once)
+    if (! allRoots.isEmpty() && ! std::exchange (similar->passAsked, true))
+        similar->service->refresh (toPaths (withMerged (allRoots)));
+    runSearch();
+}
+
+void BrowserComponent::runSimilar (bool quiet)
+{
+    resultsView->setVisible (true);
+    treeView->setVisible (false);
+    const auto scope = similarScope();
+    if (! quiet)
+    {
+        results->setFiles ({}, scope, tr ("Listening to \"{0}\"...", { similarTo.getFileName() }));
+        resultsView->setViewPosition (0, 0);
+    }
+    similarAskedAt = juce::Time::getMillisecondCounter();
+    // the worker answers on its thread: the answer comes to the message thread (and is dropped if this Browser went)
+    similarId = similar->service->findSimilar (similarTo.getFullPathName().toStdString(), toPaths (scope), (std::size_t) maxSimilar,
+                                               [safe = juce::Component::SafePointer<BrowserComponent> (this)] (const similarity::Result& r) {
+                                                   juce::MessageManager::callAsync ([safe, r] {
+                                                       if (safe != nullptr)
+                                                           safe->similarAnswered (r);
+                                                   });
+                                               });
+}
+
+void BrowserComponent::similarAnswered (const similarity::Result& r)
+{
+    if (r.id != similarId || similarTo == juce::File() || r.query != similarTo.getFullPathName().toStdString())
+        return;
+
+    juce::Array<juce::File> found;
+    juce::StringArray details;
+    for (const auto& m : r.matches)
+        if (juce::File f (juce::String::fromUTF8 (m.path.c_str())); view.filter == browserview::ContentFilter::all || lists (f))
+        {
+            found.add (f);
+            details.add (juce::String (similarity::percent (m.distance)) + "%");
+        }
+
+    const auto name = similarTo.getFileName();
+    // (partial answers keep the selection and the scroll position)
+    const auto selected = results->selectedFile();
+    const auto scroll = resultsView->getViewPosition();
+    results->setFiles (found, similarScope(),
+                       r.failed ? tr ("\"{0}\" can't be compared: it is silent or can't be read.", { name })
+                       : found.isEmpty() ? (r.partial ? tr ("Listening to the Browser's samples... nothing like \"{0}\" yet.", { name })
+                                                      : tr ("No other samples to compare \"{0}\" with.", { name }))
+                                         : juce::String(),
+                       details);
+    if (selected != juce::File())
+        if (const auto row = found.indexOf (selected); row >= 0)
+            results->select (row, false);
+    resultsView->setViewPosition (scroll);
+
+    similarPartial = r.partial && ! r.failed;
+    juce::String line;
+    if (! r.failed)
+    {
+        line = found.size() == 1 ? tr ("1 similar sample, most similar first") : tr ("{0} similar samples, most similar first", { juce::String (found.size()) });
+        if (r.partial)
+            line << "  ·  " << tr ("{0} samples analysed so far", { juce::String ((int) r.searched) });
+        else if (! found.isEmpty())
+            ui::postHint ({ tr ("Compared with {0} samples", { juce::String ((int) r.searched) }), {}, false, false }, 4000);
+    }
+    if (line != statusLine)
+    {
+        const auto relayout = line.isEmpty() != statusLine.isEmpty();
+        statusLine = line;
+        if (relayout)
+            resized();
+        repaint (statusArea);
+    }
+}
+
+void BrowserComponent::similarStatusChanged()
+{
+    // the background analysis moved on: a list still marked "so far" is asked again (not more than every 3 s; the
+    // last time when the pass ends)
+    if (similarTo == juce::File() || ! similarPartial || ! resultsView->isVisible())
+        return;
+    const auto busy = similar->service->status().busy;
+    if (! busy || juce::Time::getMillisecondCounter() - similarAskedAt > 3000)
+        runSimilar (true);
+}
+
+void BrowserComponent::findSimilarForSnapshot (const juce::File& file, const juce::File& folder)
+{
+    similar->passAsked = true;
+    similar->service->refresh (toPaths ({ folder }));
+    similar->service->waitIdle (300000);
+    if (tab == projectTab)
+        setTab (allTab);
+    similarTo = file;
+    searchBox.setText (similarLabel(), juce::dontSendNotification);
+    resultsView->setVisible (true);
+    treeView->setVisible (false);
+    auto answer = std::make_shared<std::pair<std::mutex, similarity::Result>>();
+    similarId = similar->service->findSimilar (file.getFullPathName().toStdString(), toPaths ({ folder }), (std::size_t) maxSimilar,
+                                               [answer] (const similarity::Result& r) {
+                                                   const std::lock_guard<std::mutex> hold (answer->first);
+                                                   answer->second = r;
+                                               });
+    similar->service->waitIdle (120000);
+    const std::lock_guard<std::mutex> hold (answer->first);
+    similarAnswered (answer->second);
+}
+
 void BrowserComponent::refreshSearchIndex (bool rebuild)
 {
     // the index is shared by every Browser: it covers every folder, hidden ones too
     if (! allRoots.isEmpty())
-        searcher->service->refresh (toPaths (allRoots), rebuild);
+        searcher->service->refresh (toPaths (withMerged (allRoots)), rebuild);
     ui::postHint ({ rebuild ? tr ("Rebuilding the Browser's search index in the background...")
                             : tr ("Checking the Browser's search index in the background (only changed folders are read again)..."),
                     {}, false, false },
@@ -3951,7 +4456,7 @@ void BrowserComponent::openFile (const juce::File& file)
         return;
     }
 
-    if (file.hasFileExtension ("lynx;flp;mid;midi") && onOpenProject)
+    if (file.hasFileExtension ("lynx;flp;als;flm;mid;midi") && onOpenProject)
         onOpenProject (file);
 }
 } // namespace lynx

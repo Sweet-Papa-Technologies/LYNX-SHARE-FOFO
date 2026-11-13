@@ -3,6 +3,8 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "core/NoteTools.h"
+#include "core/PianoKeys.h"
+#include "core/ScaleSnap.h"
 #include "engine/AudioEngine.h"
 #include "ui/TimerWhileShowing.h"
 #include "ui/EditorTools.h"
@@ -12,6 +14,7 @@
 #include "ui/ValueControl.h"
 #include "core/NoteEdit.h"
 #include "core/MidiImport.h"
+#include "core/ScriptDialog.h"
 
 namespace lynx
 {
@@ -34,6 +37,12 @@ namespace lynx
 //  - keys (via handleKey): Delete, Backspace (global grid on/off), Ctrl+A/C/X/V/B, Ctrl+Q quantise,
 //    Shift+Q quantise starts, Ctrl+U chop, Ctrl+G join, Ctrl+L legato, Shift+D shrink to grid,
 //    Ctrl+Shift+Left/Right rotate, Ctrl+M mute, Ctrl+P porta, Esc, arrows (Shift = octave/bar)
+namespace pianoroll
+{
+// the toolbar's chord stamp box when the full box (100 px) doesn't fit: its icon and its arrow
+constexpr int compactChordBoxWidth = 46;
+} // namespace pianoroll
+
 class PianoRollComponent final : public juce::Component,
                                  public SharesTitleBar,
                                  public ui::HintSource,
@@ -108,6 +117,14 @@ public:
     // default): a selection of 2 to 10 different keys shows its chord name over the grid's top-left corner. The main
     // window saves both with the UI options.
     static inline bool gridHighlights = true, showChordName = false;
+    // View › Keyboard style (round 190j, discussion #136; LYNX's own): flat = FL's keyboard (the default), piano = a
+    // traditional keyboard with a line between every two white keys (core/PianoKeys.h). Saved with the UI options.
+    static inline pianokeys::Style keyStyle = pianokeys::Style::flat;
+    void setKeyStyle (pianokeys::Style style);
+    static inline bool songBarsRuler = false; // round 177d: the ruler numbers song bars (off = FL: pattern bars)
+    // FL's General › "Monophonic painting in piano roll" (round 189o, off): on, the Paint tool paints monophonically
+    // without Shift (noteedit::monophonicPaint). Saved with the UI options.
+    static inline bool monophonicPainting = false;
     // the keys of the selection, on every change (the toolbar's chord panel)
     static inline std::function<void (const std::vector<int>&)> onSelectedKeys;
     // View › Background waveform (Alt+N): an audio file dropped on the Piano roll is drawn behind the notes from the
@@ -135,6 +152,12 @@ public:
     std::int64_t timeSelectionFrom() const noexcept { return timeFrom; }
     std::int64_t timeSelectionTo() const noexcept { return timeTo; }
     std::vector<int> selectionForTests() const { return selection; }
+    // The MIDI Tools panel (round 190s): the notes a tool works on (the selection, or every note of the channel when
+    // nothing is selected: `selected` false), and its result becomes the selection.
+    std::vector<int> midiToolNotes (bool& selected) const { selected = ! selection.empty(); return selectionOrAll(); }
+    void selectMidiToolResult (std::vector<int> indices) { setSelection (std::move (indices)); }
+    std::int64_t midiToolGrid() const { return gridTicks(); }
+    void openMidiTools(); // Tools › MIDI Tools: the panel in its own small window
     std::int64_t markerKeyTickForTests() const { return markerKeyTick(); }
     juce::String chordBubbleTextForTests() const { return chordBubble.isVisible() ? chordBubble.getText() : juce::String(); }
 
@@ -150,8 +173,18 @@ public:
     std::vector<int> noteIndicesForSnapshot() const { return selectionOrAll(); }
     std::int64_t gridForSnapshot() const { return gridTicks(); }
     juce::PopupMenu getToolsMenuForSnapshot() { return toolsMenu(); }
+    juce::PopupMenu getScriptsMenuForSnapshot() { return scriptsMenu(); }
+    // runs a Piano roll script by its menu name (LYNX's own, or a file of the script folders)
+    void runScriptForSnapshot (const juce::String& name);
+    juce::PopupMenu getStampMenuForSnapshot() { return stampMenu(); }
+    void squeezeToolbarForSnapshot (int pixels); // the toolbar as in a window `pixels` narrower (negative: back)
     // zooms in (taller rows, wider steps) and hovers the right edge of the first note; returns its hint
     ui::Hint hoverForSnapshot();
+    // the lane box's note properties (ids; pattern event lanes follow from eventLaneIdBase)
+    static constexpr int laneVelocity = 1, lanePan = 2, laneFinePitch = 3, laneRelease = 4, laneModX = 5, laneModY = 6, laneChance = 7,
+                         laneVelocityRange = 8, laneLast = 8;
+    // the bottom lane's property (laneVelocity … laneVelocityRange; round 187c)
+    void setLaneForSnapshot (int id) { laneBox.setSelectedId (id, juce::sendNotificationSync); }
 
     static constexpr int keyboardWidth = 72;
     static constexpr int toolbarHeight = 32; // the panel title row (Workspace::titleHeight)
@@ -159,7 +192,26 @@ public:
     static constexpr int timelineHeight = 22;
     static constexpr int rulerTop = toolbarHeight + overviewHeight;
     static constexpr int headerHeight = rulerTop + timelineHeight;
-    static constexpr int velocityHeight = 72;
+    static constexpr int defaultVelocityHeight = 72;
+    static constexpr int compactVelocityHeight = 30; // docked in the Clip-launch detail view (round 183a): the reference's lane is ~30 px
+    int velocityHeight = defaultVelocityHeight;
+    // docked in the Clip-launch detail view (round 183a): a short lane, and the keys fitted to the notes when it scrolls to them;
+    // the floating panel's key height comes back when it goes home
+    void setDocked (bool docked)
+    {
+        if (fitKeysToNotes == docked)
+            return;
+        fitKeysToNotes = docked;
+        velocityHeight = docked ? compactVelocityHeight : defaultVelocityHeight;
+        if (docked)
+            undockedRowHeight = rowHeight;
+        else
+            rowHeight = undockedRowHeight;
+        resized();
+        repaint();
+    }
+    bool fitKeysToNotes = false;
+    int undockedRowHeight = 14;
     int rowHeight = 14; // vertical zoom (Ctrl+middle-drag, Ctrl+Alt+wheel): gesture::minKeyHeight..maxKeyHeight px per key
     static constexpr int scrollBarSize = 12;
 
@@ -191,6 +243,7 @@ private:
     double xToTick (int x) const;
     int keyToY (int key) const;
     int yToKey (int y) const;
+    int keyboardKeyAt (int x, int y) const; // the key a point of the keyboard plays (the keyboard style decides)
     int rowFor (int key) const noexcept;  // the key's row from the top (a folded-away key: the row above it)
     void updateKeyRows();                 // after the scale or the fold changed
     notetools::KeyRows rows = notetools::keyRows (0, 0, false);
@@ -229,15 +282,22 @@ private:
     void setSelection (std::vector<int> indices);
     void sortNotes();                                // sorts while keeping the selection (no undo step)
     void editNotes (const std::function<void (Pattern&)>& edit, bool undoable = true);
+    // Freeze (round 190ay): the notes of a frozen channel are read-only. True = the channel shown is frozen; the hint
+    // bar says "Unfreeze to edit" (the edit is refused, not silently dropped).
+    bool refuseFrozenEdit();
     void applyVelocity (int fromX, int toX, int y);
     float laneValue (const Note& n) const;          // 0..1 of the chosen property
     void setLaneValue (Note& n, float value) const; // inverse
     bool laneIsBipolar() const;
+    bool laneIsChance() const;
+    void addNoteLanes();
     void setNotesMuted (bool mute); // the selection (or all notes)
     void togglePorta(); // porta notes glide from the previous note (toggles the channel's porta)
 
     void deleteSelection();
     void copySelection();
+    std::vector<Note> visibleGhostNotes() const; // round 177d: the ghost notes on show, as notes (song pattern ticks)
+    void copyGhostNotes();
     void paste();
     void duplicateSelection();
     void nudge (std::int64_t ticks, int keys);
@@ -287,6 +347,7 @@ private:
     int scaleRoot() const;  // 0..11
     int scaleIndex() const; // index into notetools::scales(), 0 = none
     int snapKey (int key) const; // the key itself, or the nearest in-scale key while scale snap is on
+    scalesnap::Scale snapScale() const; // the chosen scale and the Snap to scale switch (core/ScaleSnap.h)
     void publishScale();
     bool scaleSnap = false;
     double panStartTicks = 0.0;
@@ -297,6 +358,30 @@ private:
     void zoomAll();
     void centreOnPlayhead();
     juce::PopupMenu toolsMenu();
+
+    // --- scripts (Tools › Scripts: FL's Piano roll scripts, round 190as; ui/PianoRollScripts.cpp) ---------------------
+    struct ScriptRef
+    {
+        juce::String name;  // menu name
+        juce::String key;   // the form memory's key (the script's path, or "lynx:<name>")
+        std::string source; // a built-in script's text (a file is read when it runs)
+        juce::File file;
+    };
+    struct ScriptJob;
+    struct ScriptResult;
+    juce::PopupMenu scriptsMenu();
+    void addScriptItems (juce::PopupMenu& menu);
+    void runScript (const ScriptRef& ref);
+    void runLastScript();
+    void scriptStep (std::shared_ptr<ScriptJob> job, std::vector<scriptform::Form> answers, bool preview);
+    void scriptFinished (std::shared_ptr<ScriptJob> job, ScriptResult& result, bool preview, std::uint64_t ticket);
+    bool scriptTargetStill (const ScriptJob& job) const;
+    void showScriptPattern (const Pattern& pattern, const std::vector<int>& select, bool undoable);
+    void commitScript (const ScriptJob& job, const Pattern& result, const std::vector<int>& select, std::int64_t from, std::int64_t to, bool takeTimeSelection);
+    void showScriptText (const juce::String& title, const juce::String& text);
+    ScriptRef lastScript;
+    bool scriptBusy = false;
+    std::uint64_t scriptTicket = 0;
     std::unique_ptr<juce::FileChooser> chooser;
     juce::PopupMenu midiMenu();
 
@@ -336,6 +421,11 @@ private:
     gesture::HeightZoomDrag keyZoomDrag;
     gesture::SpanZoomDrag timeZoomDrag;
     void beginKeyZoom (const juce::MouseEvent&);
+    // round 190j: the zoom wheel (FL's VZoomSelect) at the right end of the overview strip
+    static constexpr int zoomWheelSize = 16;
+    juce::Rectangle<int> zoomWheelArea() const;
+    int zoomAnchorKey() const; // the key whose centre stays put: the middle of the notes in view, else of the view
+    void setRowHeightAround (int height, int key, int centreY);
     void beginTimeZoom (const juce::MouseEvent&);
 
     // smooth wheel scrolling
@@ -358,7 +448,7 @@ private:
     std::int64_t grabOffset = 0;    // note tick - mouse tick at drag start
     std::int64_t lastLength = ticksPerStep * 2;
     int previewKey = -1;
-    int lastScaleDragKeys = 0; // (a snap-to-scale group drag: the mouse's semitones last applied)
+    int lastScaleDragKeys = 0; // (a snap-to-scale drag: the scale steps last applied)
     NoteMask litKeys {}; // keys sounding on the channel(s) shown: lit on the keyboard (issue #14, FL)
     NoteMask soundingNow() const;
     bool isLit (int key) const noexcept { return key >= 0 && key < 128 && ((litKeys[(std::size_t) (key >> 6)] >> (key & 63)) & 1u) != 0; }
@@ -417,6 +507,7 @@ private:
     juce::PopupMenu fileMenu();
     juce::PopupMenu editMenu();
     juce::PopupMenu viewMenu();
+    juce::PopupMenu stampMenu(); // the chord stamp's list (the toolbar chord box's items)
     // FL's Piano roll › Time markers on the pattern's own markers (round 168g)
     juce::PopupMenu markersMenu();
     std::int64_t markerKeyTick() const;   // Alt+T / Ctrl+T: the time selection's start, the playhead in view, else a bar

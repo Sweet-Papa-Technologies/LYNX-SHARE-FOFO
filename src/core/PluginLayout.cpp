@@ -1254,11 +1254,14 @@ Layout lynxTune()
     v.push_back (toggle (490, 22, 82, 18, "Formant preserve", TR_NOOP ("Formant")));
     // round 166c: SHIFT and the THROAT beside it (the modelled throat length, formant on only); Transpose, or the
     // steps of the scale while IN SCALE is on
-    v.push_back (knob (510, 60, 22, "Formant shift", TR_NOOP ("SHIFT"), 82, bipolar));
-    v.push_back (knob (552, 60, 22, "Throat length", TR_NOOP ("THROAT"), 82, 0));
-    v.push_back (when (stepper (584, 40, 78, 22, "Transpose", TR_NOOP ("Transpose"), 25), "Transpose in scale", 0.0f, 0.49f));
-    v.push_back (when (stepper (584, 40, 78, 22, "Scale transpose", TR_NOOP ("Scale steps"), 15), "Transpose in scale", 0.5f, 1.0f));
-    v.push_back (toggle (584, 66, 78, 18, "Transpose in scale", TR_NOOP ("In scale")));
+    // round 190bb (issue #103): + BREATH (Breathiness: aspiration noise with the voice's formants), the third knob of
+    // the voice-character group; the transpose column moves 16 px right and loses 8 px of width to make room
+    v.push_back (knob (506, 60, 22, "Formant shift", TR_NOOP ("SHIFT"), 82, bipolar));
+    v.push_back (knob (542, 60, 22, "Throat length", TR_NOOP ("THROAT"), 82, 0));
+    v.push_back (knob (578, 60, 22, "Breathiness", TR_NOOP ("BREATH"), 82, 0));
+    v.push_back (when (stepper (600, 40, 70, 22, "Transpose", TR_NOOP ("Transpose"), 25), "Transpose in scale", 0.0f, 0.49f));
+    v.push_back (when (stepper (600, 40, 70, 22, "Scale transpose", TR_NOOP ("Scale steps"), 15), "Transpose in scale", 0.5f, 1.0f));
+    v.push_back (toggle (600, 66, 70, 18, "Transpose in scale", TR_NOOP ("In scale")));
     v.push_back (knob (700, 44, 30, "Reference", TR_NOOP ("A4"), 70, showValue));
     v.push_back (knob (760, 44, 30, "Mix", TR_NOOP ("MIX"), 70, showValue));
     // --- correction row
@@ -1992,6 +1995,8 @@ Layout compressorLayout()
     // round 135w: the reference's ARC / Manual, Electro / Opto and Warm / Smooth switches (the vintage voicing's), and
     // its output limiter with the activity pill
     v.push_back (when (tabs (314, 108, 94, 20, "Release mode", TR_NOOP ("ARC|Manual")), "Voicing", 0.5f, 1.0f));
+    // round 190ar: the classic voicing's law (clean, or the FET-style knee and program-dependent release)
+    v.push_back (when (tabs (314, 108, 94, 20, "Classic law", TR_NOOP ("Clean|FET")), "Voicing", 0.0f, 0.5f));
     v.push_back (when (tabs (314, 132, 94, 20, "Release curve", TR_NOOP ("Electro|Opto")), "Voicing", 0.5f, 1.0f));
     v.push_back (when (tabs (314, 156, 94, 20, "Character", TR_NOOP ("Warm|Smooth")), "Voicing", 0.5f, 1.0f));
     v.push_back (toggle (314, 182, 94, 20, "Limiter", TR_NOOP ("Limiter")));
@@ -2180,6 +2185,8 @@ Layout withEmberClassic (Layout l)
     add (label (536, 330, 80, 34, TR_NOOP ("Style"), alignLeft));
     // projects saved before round 165 keep round 136's Punish until switched to the measured law
     add (when (tabs (40, 336, 150, 22, "Classic law", TR_NOOP ("Old|Measured")), "Classic law", 0.0f, 0.5f));
+    // … and those saved before round 190ar keep round trial187b's high-drive tables until switched (the row above it)
+    add (when (tabs (40, 310, 150, 22, "Classic hot law", TR_NOOP ("Old|Measured")), "Classic hot law", 0.0f, 0.5f));
     add (toggle (604, 336, 116, 24, "Voicing", TR_NOOP ("Advanced"), inverted));
     return l;
 }
@@ -2295,6 +2302,26 @@ Layout fretLayout()
     v.push_back (when (dial (672, 480, 36, "Bass punch", TR_NOOP ("Punch"), bipolar), "Amp model", 0.5f, 1.0f));
     v.push_back (when (dial (744, 480, 36, "Bass shape", TR_NOOP ("Shape")), "Amp model", 0.5f, 1.0f));
     v.push_back (dial (830, 480, 36, "Drive mix", TR_NOOP ("Mix")));
+    return l;
+}
+
+// round trans189d (issue #94): Strike Shaper, LYNX's level-independent transient designer. The generic layout keeps the
+// two-knob front panel: ATTACK and SUSTAIN big on either side, Output, Guard and Link between them, Mix and the
+// detector's high-pass small underneath (the editor, ui/ProEditors.cpp StrikeEditor, draws the hardware look)
+Layout strikeLayout()
+{
+    Layout l;
+    l.width = 540;
+    l.height = 300;
+    auto& v = l.items;
+    v.push_back (section (4, 4, 532, 292, TR_NOOP ("Transients")));
+    v.push_back (dial (130, 110, 110, "Attack", TR_NOOP ("Attack"), bipolar | big));
+    v.push_back (dial (410, 110, 110, "Sustain", TR_NOOP ("Sustain"), bipolar | big));
+    v.push_back (dial (270, 76, 44, "Output", TR_NOOP ("Output"), bipolar));
+    v.push_back (toggle (236, 150, 68, 24, "Guard", TR_NOOP ("Guard")));
+    v.push_back (toggle (236, 182, 68, 24, "Link", TR_NOOP ("Link")));
+    v.push_back (dial (200, 250, 28, "Mix", TR_NOOP ("Mix")));
+    v.push_back (dial (340, 250, 28, "Detect high-pass", TR_NOOP ("Detect HP")));
     return l;
 }
 
@@ -2628,7 +2655,9 @@ Layout crestCompressor()
     v.push_back (onPage (label (20, 530, 70, 22, TR_NOOP ("Link mode")), 2));
     v.push_back (onPage (tabs (92, 530, 360, 22, "Link mode", TR_NOOP ("Stereo|Mid only|Side only|Mid > side|Side > mid")), 2));
     v.push_back (onPage (label (470, 530, 50, 22, TR_NOOP ("Scale")), 2));
-    v.push_back (onPage (tabs (520, 530, 230, 22, "Meter scale", TR_NOOP ("9 dB|18 dB|36 dB|72 dB|90 dB")), 2));
+    v.push_back (onPage (tabs (520, 530, 200, 22, "Meter scale", TR_NOOP ("9 dB|18 dB|36 dB|72 dB|90 dB")), 2));
+    // round 190v: the two-way / vari-mu law (classic = round 108's, what a project saved before loads with)
+    v.push_back (onPage (tabs (726, 530, 106, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys), 2));
     v.push_back (onPage (toggle (20, 562, 160, 20, "Input meter", TR_NOOP ("Input meter")), 2));
     // round 137 (Pro-C 3's side-chain Host Sync / MIDI inputs): the detector hears a pulse instead of the audio
     v.push_back (onPage (label (192, 562, 52, 20, TR_NOOP ("Trigger")), 2));
@@ -2812,6 +2841,9 @@ Layout sentryGate()
     // round 135: oversampling (the reference's bottom bar)
     v.push_back (label (8, 482, 90, 22, TR_NOOP ("Oversampling")));
     v.push_back (tabs (96, 482, 176, 22, "Oversampling", TR_NOOP ("Off|2x|4x|8x")));
+    // round 190v: the Vocal style's noise reduction (classic = none, what a project saved before loads with)
+    v.push_back (label (300, 482, 56, 22, TR_NOOP ("Model")));
+    v.push_back (tabs (360, 482, 180, 22, "Law", TR_NOOP ("Classic|Measured")));
     return l;
 }
 
@@ -3458,7 +3490,7 @@ Layout horizonLayout()
     v.push_back (label (428, 264, 92, 24, TR_NOOP ("Reverb mode"), alignLeft));
     v.push_back (choiceMenu (522, 264, 150, 24, "Reverb mode", TR_NOOP ("Reverb mode"), TR_NOOP ("Room|Chamber|Plate|Hall|Cathedral|Space|Freeze|Gated")));
     v.push_back (label (752, 264, 52, 24, TR_NOOP ("Color"), alignLeft));
-    v.push_back (choiceMenu (806, 264, 166, 24, "Color", TR_NOOP ("Color"), TR_NOOP ("Bright|Neutral|Dark|Vintage")));
+    v.push_back (choiceMenu (806, 264, 166, 24, "Color", TR_NOOP ("Color"), TR_NOOP ("Bright|Neutral|Dark|Studio")));
     return l;
 }
 
@@ -3935,7 +3967,7 @@ const std::vector<EffectKind>& flLayoutKinds()
 const std::vector<EffectKind>& ownLayoutKinds()
 {
     static const std::vector<EffectKind> kinds { EffectKind::ridgeStrip, EffectKind::glowLeveler, EffectKind::hushDeEsser,
-                                                 EffectKind::aether, EffectKind::ember, EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel, EffectKind::epochVerb, EffectKind::atrium,
+                                                 EffectKind::aether, EffectKind::ember, EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel, EffectKind::strikeShaper, EffectKind::epochVerb, EffectKind::atrium,
                                                  EffectKind::foilPlate, EffectKind::nebula, EffectKind::halo, EffectKind::horizon,
                                                  EffectKind::echoform, EffectKind::spiralEcho, EffectKind::orbit, EffectKind::latticeMod,
                                                  EffectKind::crestCompressor, EffectKind::prismMultiband, EffectKind::sentryGate,
@@ -4022,6 +4054,7 @@ const Layout& layoutFor (EffectKind kind)
         case EffectKind::kilnChannel: l = kilnLayout(); break;
         case EffectKind::fretChannel: l = fretLayout(); break;
         case EffectKind::shellChannel: l = shellLayout(); break;
+        case EffectKind::strikeShaper: l = strikeLayout(); break;
         case EffectKind::epochVerb: l = captionsAbove (epochVerbLayout()); break;
         case EffectKind::atrium: l = captionsAbove (atriumLayout()); break;
         case EffectKind::foilPlate: l = captionsAbove (foilPlateLayout()); break;
@@ -4447,6 +4480,12 @@ Layout poizoneMain()
     return l;
 }
 } // namespace
+
+const Layout* transistorBassFlmLayout()
+{
+    static const Layout mobile = transistorBassMobileLayout();
+    return &mobile;
+}
 
 const Layout* instrumentLayout (InstrumentKind kind)
 {

@@ -1,5 +1,8 @@
 #include "core/AlsImport.h"
+#include "core/Effects.h"
+#include "core/Rack.h"
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -8,9 +11,12 @@
 #include <set>
 #include <unordered_map>
 
+#include "core/ClipLauncher.h"
 #include "core/FlWrapper.h"
 #include "core/Gzip.h"
+#include "core/LiveScales.h"
 #include "core/MissingFiles.h"
+#include "core/TimeStretch.h"
 #include "core/XmlLite.h"
 
 // Evidence tags as in docs/analise/ALS_FORMAT.md: [DATA] the sets Live 12 ships, [BIN] Live 12.4's member-name table.
@@ -98,6 +104,10 @@ struct Ctx
     std::map<std::string, int> audioChannels;        // resolved sample path (+ stretch mode) → audioClip channel
     int nextRow = 0;
     std::set<std::string> missingSeen;
+
+    // the scale of the first MIDI clip that has Live's clip scale switched on (round 190o)
+    std::optional<projectkey::Key> clipKey;
+    bool clipKeySeen = false;
 
     explicit Ctx (const AlsImportOptions& o) : options (o), report (o.common.report) {}
 
@@ -311,8 +321,300 @@ void applySimplerEnvelope (const Element& device, SamplerSettings& s)
     s.release = (float) std::clamp (ms ("ReleaseTime", 50), 0.0, 4.0);
 }
 
+bool instrumentFrom (Ctx& ctx, const Element& device, ChannelDef& channel, std::vector<DrumPad>* pads, int depth = 0);
+
+// ---------------------------------------------------------------------------------------------------------------
+// Racks (round 183c, docs/analise/REA_rodada183c.md §1–5 [DATA]): Live's Audio Effect / Instrument Racks become LYNX
+// racks (a Patcher in rack mode, core/Rack.h) with their chains, zones, chain mixers, macros, variations and the macro
+// mappings onto the devices LYNX keeps (plugins, nested racks, the chains' volume / pan, the chain selector). Live's own
+// devices inside a chain are dropped and listed, as on a track.
+
+// A macro mapping stored on a parameter: KeyMidi on channel 16, NoteOrController = the macro, MidiControllerRange =
+// the range in the parameter's own units [DATA]. nullopt = not mapped.
+struct LiveMapping
+{
+    int macro = 0;
+    double min = 0.0, max = 1.0;
+};
+std::optional<LiveMapping> mappingOf (const Element& parameter)
+{
+    const auto key = parameter.child ("KeyMidi");
+    if (! key || (int) key.number ("Channel", -1) != 16)
+        return std::nullopt;
+    LiveMapping m;
+    m.macro = (int) key.number ("NoteOrController", -1);
+    if (m.macro < 0 || m.macro >= rackMacroCount)
+        return std::nullopt;
+    m.min = parameter.number ("MidiControllerRange/Min", 0.0);
+    m.max = parameter.number ("MidiControllerRange/Max", 1.0);
+    return m;
+}
+
+void mapInto (PatcherDoc& doc, const LiveMapping& m, RackMapping target, float min, float max)
+{
+    target.min = std::clamp (min, 0.0f, 1.0f);
+    target.max = std::clamp (max, 0.0f, 1.0f);
+    rack::map (doc, m.macro, target);
+}
+
+// The plugin parameters of a PluginDevice that a macro drives (VST2: ParameterId is the parameter's index [model];
+// VST3 ids are not indices: listed, not mapped)
+void pluginMappings (Ctx& ctx, const Element& device, PatcherDoc& doc, int node)
+{
+    const auto vst3 = (bool) device.path ("PluginDesc/Vst3PluginInfo");
+    for (const auto& p : device.path ("ParameterList").children ("PluginFloatParameter"))
+        if (const auto m = mappingOf (p.child ("ParameterValue")))
+        {
+            if (vst3)
+            {
+                ctx.note (&FlpImportReport::approximated, "Macro mapping on a VST3 parameter (not kept)");
+                continue;
+            }
+            RackMapping target;
+            target.node = node;
+            target.param = (int) p.number ("ParameterId", -1);
+            if (target.param >= 0)
+                mapInto (doc, *m, target, (float) m->min, (float) m->max);
+        }
+}
+
+bool rackFrom (Ctx& ctx, const Element& device, PatcherDoc& doc, int depth);
+
+// A Live member name as words: "FormantShift" → "Formant Shift"
+std::string spacedName (std::string_view tag)
+{
+    std::string out;
+    for (std::size_t i = 0; i < tag.size(); ++i)
+    {
+        const auto c = tag[i];
+        const auto upper = c >= 'A' && c <= 'Z';
+        const auto prevLower = i > 0 && ((tag[i - 1] >= 'a' && tag[i - 1] <= 'z') || (tag[i - 1] >= '0' && tag[i - 1] <= '9'));
+        if (upper && prevLower)
+            out += ' ';
+        out += c;
+    }
+    return out;
+}
+
+// One device of a rack chain → a Patcher node (−1 = dropped and listed)
+int rackDeviceFrom (Ctx& ctx, const Element& d, PatcherDoc& doc, int chain, bool instrumentRack, int depth)
+{
+    const auto tag = std::string (d.name());
+    PatchNode node;
+    if (tag == "PluginDevice")
+    {
+        const auto p = pluginOf (d);
+        if (! p)
+            return -1;
+        // in an Instrument Rack chain, the chain's instrument: a VST3 Live marks as one (DeviceType 1 [DATA]) or a VST2
+        // with no audio input (NumAudioInputs 0 [DATA]), when the chain has none yet
+        const auto chainNodes = rack::devices (*rack::rackOf (doc), chain);
+        const auto hasInstrument = std::any_of (chainNodes.begin(), chainNodes.end(), [&doc] (int n) { return doc.nodes[(std::size_t) n].generator; });
+        const auto asInstrument = instrumentRack && ! hasInstrument
+                                  && ((int) d.number ("PluginDesc/Vst3PluginInfo/DeviceType", 0) == 1
+                                      || ((bool) d.path ("PluginDesc/VstPluginInfo") && (int) d.number ("PluginDesc/VstPluginInfo/NumAudioInputs", 2) == 0));
+        if (asInstrument)
+        {
+            node.generator = true;
+            node.channel.instrument = InstrumentKind::plugin;
+            node.channel.plugin.name = p->name;
+            node.channel.plugin.foreign = *p;
+            node.channel.name = p->name;
+        }
+        else
+        {
+            node.effect.kind = EffectKind::plugin;
+            node.effect.enabled = d.boolean ("On/Manual", true);
+            node.effect.plugin.name = p->name;
+            node.effect.plugin.foreign = *p;
+        }
+        ctx.note (&FlpImportReport::converted, "Plugin: " + p->name);
+        const auto n = rack::addDevice (doc, chain, std::move (node));
+        if (n >= 0)
+            pluginMappings (ctx, d, doc, n);
+        return n;
+    }
+    if ((tag == "AudioEffectGroupDevice" || tag == "InstrumentGroupDevice") && depth < 8)
+    {
+        auto inner = rack::makeRack (tag == "InstrumentGroupDevice" ? RackDoc::Kind::instrument : RackDoc::Kind::audioEffect);
+        if (! rackFrom (ctx, d, inner, depth + 1))
+            return -1;
+        if (tag == "InstrumentGroupDevice")
+        {
+            node.generator = true;
+            node.channel.instrument = InstrumentKind::patcher;
+            node.channel.name = d.value ("UserName");
+            node.channel.patcher = std::move (inner);
+        }
+        else
+        {
+            node.effect = makeEffectSlot (EffectKind::patcher);
+            node.effect.enabled = d.boolean ("On/Manual", true);
+            node.effect.patcher = std::move (inner);
+        }
+        node.label = d.value ("UserName");
+        const auto n = rack::addDevice (doc, chain, std::move (node));
+        if (n < 0)
+            return -1;
+        // the inner rack's macros mapped onto the outer rack's (0…127 → 0..1) [DATA]
+        for (int k = 0; k < rackMacroCount; ++k)
+            if (const auto m = mappingOf (d.child ("MacroControls." + std::to_string (k))))
+            {
+                RackMapping target;
+                target.node = n;
+                target.param = k;
+                mapInto (doc, *m, target, (float) (m->min / 127.0), (float) (m->max / 127.0));
+            }
+        return n;
+    }
+    if (instrumentRack && isInstrumentDevice (tag))
+    {
+        ChannelDef channel;
+        channel.name = d.value ("UserName");
+        if (instrumentFrom (ctx, d, channel, nullptr, depth + 1))
+        {
+            node.generator = true;
+            node.channel = std::move (channel);
+            return rack::addDevice (doc, chain, std::move (node));
+        }
+        return -1;
+    }
+    if (isMidiEffect (tag))
+        ctx.note (&FlpImportReport::unsupported, deviceName (d));
+    else
+        ctx.note (&FlpImportReport::droppedEffects, deviceName (d));
+    return -1;
+}
+
+RackZone zoneOf (const Element& range, RackZone fallback)
+{
+    if (! range)
+        return fallback;
+    RackZone z;
+    z.lo = std::clamp ((int) range.number ("Min", fallback.lo), 0, 127);
+    z.hi = std::clamp ((int) range.number ("Max", fallback.hi), z.lo, 127);
+    z.fadeLo = std::clamp ((int) range.number ("CrossfadeMin", z.lo), z.lo, z.hi);
+    z.fadeHi = std::clamp ((int) range.number ("CrossfadeMax", z.hi), z.fadeLo, z.hi);
+    return z;
+}
+
+// Fills a new rack document from a Live rack device (the document comes from rack::makeRack: its first chain is replaced)
+bool rackFrom (Ctx& ctx, const Element& device, PatcherDoc& doc, int depth)
+{
+    auto* r = rack::rackOf (doc);
+    if (r == nullptr)
+        return false;
+    const auto instrumentRack = r->kind == RackDoc::Kind::instrument;
+    std::array<std::vector<std::string>, rackMacroCount> droppedTargets;
+    while (! r->chains.empty())
+    {
+        rack::removeChain (doc, 0);
+        r = rack::rackOf (doc);
+    }
+    for (const auto& branch : device.path ("Branches").children())
+    {
+        auto name = branch.value ("Name/UserName");
+        if (name.empty())
+            name = branch.value ("Name/EffectiveName");
+        const auto c = rack::addChain (doc, name.empty() ? "Chain" : name);
+        r = rack::rackOf (doc);
+        auto& chain = r->chains[(std::size_t) c];
+        chain.active = branch.boolean ("MixerDevice/Speaker/Manual", true);
+        chain.solo = branch.boolean ("IsSoloed", false);
+        chain.volume = (float) std::clamp (branch.number ("MixerDevice/Volume/Manual", 1.0), 0.0, 2.0);
+        chain.pan = (float) std::clamp (branch.number ("MixerDevice/Panorama/Manual", 0.0), -1.0, 1.0);
+        chain.select = zoneOf (branch.child ("BranchSelectorRange"), RackZone { 0, 0, 0, 0 });
+        chain.key = zoneOf (branch.path ("ZoneSettings/KeyRange"), RackZone {});
+        chain.velocity = zoneOf (branch.path ("ZoneSettings/VelocityRange"), RackZone { 1, 127, 1, 127 });
+        // the chain's devices (Live's chain kinds: AudioToAudio, MidiToAudio, MidiToMidi) [DATA]
+        for (const auto* list : { "DeviceChain/AudioToAudioDeviceChain/Devices", "DeviceChain/MidiToAudioDeviceChain/Devices" })
+            for (const auto& d : branch.path (list).children())
+                if (rackDeviceFrom (ctx, d, doc, c, instrumentRack, depth) < 0)
+                    for (const auto& parameter : d.children()) // a dropped device's mapped parameters (for the macro names)
+                        if (const auto m = mappingOf (parameter))
+                            droppedTargets[(std::size_t) m->macro].push_back (spacedName (parameter.name()));
+        // macros on the chain's volume / pan (Live's linear gain and −1..1 → LYNX's 0..1 controls)
+        if (const auto m = mappingOf (branch.path ("MixerDevice/Volume")))
+        {
+            RackMapping target;
+            target.target = RackMapping::Target::chainVolume;
+            target.chain = c;
+            mapInto (doc, *m, target, rack::volumeValue ((float) m->min), rack::volumeValue ((float) m->max));
+        }
+        if (const auto m = mappingOf (branch.path ("MixerDevice/Panorama")))
+        {
+            RackMapping target;
+            target.target = RackMapping::Target::chainPan;
+            target.chain = c;
+            mapInto (doc, *m, target, (float) ((m->min + 1.0) * 0.5), (float) ((m->max + 1.0) * 0.5));
+        }
+        r = rack::rackOf (doc);
+    }
+    if (r->chains.empty())
+        rack::addChain (doc);
+    r = rack::rackOf (doc);
+    for (int k = 0; k < rackMacroCount; ++k)
+    {
+        const auto n = std::to_string (k);
+        auto& m = r->macros[(std::size_t) k];
+        m.value = (float) std::clamp (device.number ("MacroControls." + n + "/Manual", 0.0), 0.0, 127.0);
+        const auto shown = device.value ("MacroDisplayNames." + n);
+        if (shown != "Macro " + std::to_string (k + 1))
+            m.name = shown;
+        const auto def = device.number ("MacroDefaults." + n, -1.0);
+        m.defaultValue = def < 0.0 ? -1.0f : (float) std::min (def, 127.0);
+        m.excludeFromRandom = device.boolean ("ExcludeMacroFromRandomization." + n, false);
+        m.excludeFromVariations = device.boolean ("ExcludeMacroFromSnapshots." + n, false);
+    }
+    // Live names a macro that wasn't renamed after its one mapped parameter ("Macro 3" stored, "Formant Shift" shown
+    // [SHOT]); when LYNX drops that device, the macro keeps the name Live showed
+    for (int k = 0; k < rackMacroCount; ++k)
+        if (auto& m = r->macros[(std::size_t) k]; m.name.empty() && m.mappings.empty() && droppedTargets[(std::size_t) k].size() == 1)
+            m.name = droppedTargets[(std::size_t) k].front();
+    r->shownMacros = std::clamp ((int) device.number ("NumVisibleMacroControls", 8), 1, rackMacroCount);
+    r->selector = (float) std::clamp (device.number ("ChainSelector/Manual", 0.0), 0.0, 127.0);
+    r->selectorFiltersCtrl = device.boolean ("ChainSelectorFilterMidiCtrl", false);
+    r->autoSelect = device.boolean ("IsAutoSelectEnabled", false);
+    r->showMacros = device.boolean ("AreMacroControlsVisible", true);
+    r->showChains = device.boolean ("IsBranchesListVisible", false);
+    r->showDevices = device.boolean ("AreDevicesVisible", false);
+    // the zone editor: Live keeps only whether it shows [DATA]; an Audio Effect Rack has only the Chain editor, the
+    // others open on Key
+    if (device.boolean ("IsRangesEditorVisible", false))
+        r->zoneEditor = r->kind == RackDoc::Kind::audioEffect ? 2 : 0;
+    r->showVariations = device.boolean ("AreMacroVariationsControlsVisible", false);
+    for (const auto& snapshot : device.path ("MacroVariations/MacroSnapshots").children ("MacroSnapshot"))
+    {
+        RackVariation v;
+        v.name = snapshot.value ("SnapshotName");
+        for (int k = 0; k < rackMacroCount; ++k)
+        {
+            const auto n = std::to_string (k);
+            v.has[(std::size_t) k] = snapshot.boolean ("MacroHasValue." + n, false);
+            v.values[(std::size_t) k] = v.has[(std::size_t) k] ? (float) std::clamp (snapshot.number ("MacroValues." + n, 0.0), 0.0, 127.0) : -1.0f;
+        }
+        r->variations.push_back (std::move (v));
+    }
+    // the chain selector on a macro (0…127 → 0..1)
+    if (const auto m = mappingOf (device.child ("ChainSelector")))
+    {
+        RackMapping target;
+        target.target = RackMapping::Target::selector;
+        mapInto (doc, *m, target, (float) (m->min / 127.0), (float) (m->max / 127.0));
+    }
+    // a mapped parameter follows its macro (Live drives it from the macro; its own stored value may be an old one [DATA:
+    // a chain volume stored at 0 dB under a macro that puts it at −9.6 dB])
+    for (int k = 0; k < rackMacroCount; ++k)
+        if (! rack::rackOf (doc)->macros[(std::size_t) k].mappings.empty())
+            rack::setMacro (doc, k, rack::rackOf (doc)->macros[(std::size_t) k].value);
+    rack::rackOf (doc)->name = device.value ("UserName");
+    rack::compile (doc);
+    ctx.note (&FlpImportReport::converted, instrumentRack ? "Instrument rack" : "Audio effect rack");
+    return true;
+}
+
 // Fills `channel` from a MIDI track's instrument device. Returns false for none.
-bool instrumentFrom (Ctx& ctx, const Element& device, ChannelDef& channel, std::vector<DrumPad>* pads, int depth = 0)
+bool instrumentFrom (Ctx& ctx, const Element& device, ChannelDef& channel, std::vector<DrumPad>* pads, int depth)
 {
     const auto tag = std::string (device.name());
     if (tag == "PluginDevice")
@@ -397,9 +699,20 @@ bool instrumentFrom (Ctx& ctx, const Element& device, ChannelDef& channel, std::
         ctx.note (&FlpImportReport::converted, "Drum rack");
         return true;
     }
-    if ((tag == "InstrumentGroupDevice" || tag == "DrumGroupDevice") && depth < 8)
+    if (tag == "InstrumentGroupDevice" && depth < 8) // (round 183c: a LYNX Instrument Rack)
     {
-        // a rack: its first chain's instrument (the other chains and the macros are not kept yet)
+        auto doc = rack::makeRack (RackDoc::Kind::instrument);
+        if (rackFrom (ctx, device, doc, depth))
+        {
+            channel.instrument = InstrumentKind::patcher;
+            channel.patcher = std::move (doc);
+            return true;
+        }
+        return false;
+    }
+    if (tag == "DrumGroupDevice" && depth < 8)
+    {
+        // a Drum Rack without pads (nested): its first chain's instrument
         for (const auto& branch : device.path ("Branches").children())
             for (const auto& inner : branch.path ("DeviceChain/MidiToAudioDeviceChain/Devices").children())
                 if (isInstrumentDevice (inner.name()) || inner.name() == "PluginDevice")
@@ -433,6 +746,14 @@ void effectsFrom (Ctx& ctx, const std::vector<Element>& devices, MixerTrack& ins
                 insert.effects.push_back (std::move (slot));
                 ctx.note (&FlpImportReport::converted, "Plugin: " + p->name);
             }
+            continue;
+        }
+        if (tag == "AudioEffectGroupDevice" && insert.effects.size() < (std::size_t) maxEffectSlots) // (round 183c)
+        {
+            auto slot = rack::makeRackSlot (RackDoc::Kind::audioEffect);
+            slot.enabled = d.boolean ("On/Manual", true);
+            if (rackFrom (ctx, d, slot.patcher, 0))
+                insert.effects.push_back (std::move (slot));
             continue;
         }
         if (isMidiEffect (tag))
@@ -493,20 +814,57 @@ std::vector<Pass> passesOf (const ClipLoop& loop, double length)
     return passes;
 }
 
-int patternFromMidiClip (Ctx& ctx, const Element& clip, int channel, double length)
+// A set's or a clip's ScaleInformation as a project key (round 190o) [LIVE 12.4 save: Root 0…11, Name = the index into
+// Live's scale chooser; Live 11: RootNote and the name as text]; nullopt when FL's list (which holds the project key)
+// has no scale with the same degrees.
+std::optional<projectkey::Key> liveScaleOf (const Element& owner)
 {
+    const auto info = owner.child ("ScaleInformation");
+    if (! info)
+        return std::nullopt;
+    const auto name = info.value ("Name");
+    const auto numeric = ! name.empty() && std::all_of (name.begin(), name.end(), [] (char ch) { return ch >= '0' && ch <= '9'; });
+    const auto index = numeric ? std::atoi (name.c_str()) : livescales::indexOfName (name);
+    return livescales::keyFor ((int) info.number ("Root", info.number ("RootNote", 0)), index);
+}
+
+int patternFromMidiClip (Ctx& ctx, const Element& clip, int channel, double length, const ClipLoop* loopOverride = nullptr)
+{
+    if (! ctx.clipKeySeen && clip.boolean ("IsInKey", false))
+    {
+        ctx.clipKeySeen = true;
+        ctx.clipKey = liveScaleOf (clip);
+    }
     Pattern p;
     p.name = clip.value ("Name");
     p.colour = alsColour ((int) clip.number ("Color", -1));
-    const auto passes = passesOf (loopOf (clip), length);
+    const auto passes = passesOf (loopOverride != nullptr ? *loopOverride : loopOf (clip), length);
+    // Live 12's probability groups (round 187c) [LIVE 12.4 save: NoteProbabilityGroup { GroupType 0 = Play All, 1 = Play
+    // One; Notes/NoteId; Probability (the group's: its notes keep their own for an ungroup) }]: NoteId → group
+    struct ChanceGroup
+    {
+        int index = 0;
+        bool playOne = false;
+        double chance = 1.0;
+    };
+    std::map<int, ChanceGroup> groupOfNote;
+    int groupCount = 0;
+    for (const auto& g : clip.path ("Notes/NoteProbabilityGroups").children ("NoteProbabilityGroup"))
+    {
+        const ChanceGroup group { ++groupCount, g.number ("GroupType", 0) == 1, std::clamp (g.number ("Probability", 1), 0.0, 1.0) };
+        for (const auto& id : g.path ("Notes").children ("NoteId"))
+            groupOfNote[(int) numberAttr (id, "NoteId", -1)] = group;
+    }
     for (const auto& keyTrack : clip.path ("Notes/KeyTracks").children ("KeyTrack"))
     {
         const auto key = (int) keyTrack.number ("MidiKey", 60);
         for (const auto& n : keyTrack.path ("Notes").children ("MidiNoteEvent"))
         {
             const auto t = numberAttr (n, "Time"), d = numberAttr (n, "Duration", 0.25);
-            for (const auto& pass : passes)
+            const auto grouped = groupOfNote.find ((int) numberAttr (n, "NoteId", -1));
+            for (std::size_t passIndex = 0; passIndex < passes.size(); ++passIndex)
             {
+                const auto& pass = passes[passIndex];
                 if (t < pass.from - 1e-9 || t >= pass.to - 1e-9)
                     continue;
                 Note note;
@@ -517,6 +875,15 @@ int patternFromMidiClip (Ctx& ctx, const Element& clip, int channel, double leng
                 note.velocity = (float) std::clamp (numberAttr (n, "Velocity", 100) / 127.0, 0.0, 1.0);
                 note.release = (float) std::clamp (numberAttr (n, "OffVelocity", 64) / 127.0, 0.0, 1.0);
                 note.muted = n.hasAttr ("IsEnabled") && n.attr ("IsEnabled") == "false";
+                // Live's note Chance and Velocity Range (round 187c; Live 12 leaves out the defaults 1 and 0 [DATA])
+                note.chance = (float) std::clamp (numberAttr (n, "Probability", 1), 0.0, 1.0);
+                note.velocityRange = (float) std::clamp (numberAttr (n, "VelocityDeviation", 0) / 127.0, -1.0, 1.0);
+                if (grouped != groupOfNote.end()) // each pass of a looped clip draws its own groups
+                {
+                    note.chanceGroup = (int) passIndex * groupCount + grouped->second.index;
+                    note.chanceOne = grouped->second.playOne;
+                    note.chance = (float) grouped->second.chance;
+                }
                 p.notes.push_back (note);
             }
         }
@@ -538,10 +905,12 @@ void applyWarpMode (int mode, SamplerSettings& s)
 // `stretchBeats` > 0: the channel plays the file stretched offline to that many beats at the song tempo (the warp
 // modes' own engines, core/TimeStretch); 0: the clips stretch it in real time (their `stretch`)
 int audioChannelFor (Ctx& ctx, const std::string& path, int mixerTrack, int warpMode, bool warped, double stretchBeats = 0.0,
-                     double beatsPitch = 0.0)
+                     double beatsPitch = 0.0, const std::vector<WarpPoint>& warp = {})
 {
-    const auto key = path + "|" + std::to_string (mixerTrack) + "|" + std::to_string (warped ? warpMode : -1) + "|"
-                     + std::to_string (std::llround (stretchBeats * 1.0e6)) + "|" + std::to_string (std::llround (beatsPitch * 100.0));
+    auto key = path + "|" + std::to_string (mixerTrack) + "|" + std::to_string (warped ? warpMode : -1) + "|"
+               + std::to_string (std::llround (stretchBeats * 1.0e6)) + "|" + std::to_string (std::llround (beatsPitch * 100.0));
+    for (const auto& w : warp) // (clips of one file with different markers need channels of their own)
+        key += "|" + std::to_string (std::llround (w.seconds * 1.0e6)) + ":" + std::to_string (std::llround (w.beats * 1.0e6));
     if (const auto it = ctx.audioChannels.find (key); it != ctx.audioChannels.end())
         return it->second;
     ChannelDef c;
@@ -556,13 +925,16 @@ int audioChannelFor (Ctx& ctx, const std::string& path, int mixerTrack, int warp
         applyWarpMode (warpMode, c.sampler);
     c.sampler.stretchBeats = (float) stretchBeats;
     c.sampler.stretchPitch = (float) beatsPitch;
+    c.sampler.warp = warp;
     ctx.song.channels.push_back (std::move (c));
     const auto index = (int) ctx.song.channels.size() - 1;
     ctx.audioChannels[key] = index;
     return index;
 }
 
-void addAudioClip (Ctx& ctx, const Element& clip, int row, int mixerTrack, double at, double length, const std::string& user)
+// `out`: the clips go there instead of the Playlist; `loopOverride`: the content played instead of the clip's own Loop
+void addAudioClip (Ctx& ctx, const Element& clip, int row, int mixerTrack, double at, double length, const std::string& user,
+                   std::vector<Clip>* out = nullptr, const ClipLoop* loopOverride = nullptr)
 {
     const auto path = ctx.resolveSample (clip.child ("SampleRef"), "Audio clip: " + user);
     if (path.empty() || length <= 0)
@@ -572,11 +944,12 @@ void addAudioClip (Ctx& ctx, const Element& clip, int row, int mixerTrack, doubl
     const auto bpm = ctx.song.bpm;
 
     // warp: beats of the clip's content ↔ seconds of the sample, piecewise linear [DATA: WarpMarker SecTime/BeatTime].
-    // LYNX stretches a clip at one rate: the one between the first and the last marker (slice N4 adds the segments).
+    // `rate` is the one between the first and the last marker; a clip stretched offline keeps every segment (round 175a,
+    // M1: the channel's warp markers); one stretched in real time plays at `rate`.
     double rate = bpm / 60.0, beatAtZero = 0.0; // beats per sample second; the content beat at sample time 0
+    std::vector<std::pair<double, double>> marks;
     if (warped)
     {
-        std::vector<std::pair<double, double>> marks;
         for (const auto& m : clip.path ("WarpMarkers").children ("WarpMarker"))
             marks.push_back ({ numberAttr (m, "SecTime"), numberAttr (m, "BeatTime") });
         std::sort (marks.begin(), marks.end());
@@ -584,36 +957,57 @@ void addAudioClip (Ctx& ctx, const Element& clip, int row, int mixerTrack, doubl
             rate = (marks.back().second - marks.front().second) / (marks.back().first - marks.front().first);
         if (! marks.empty())
             beatAtZero = marks.front().second - rate * marks.front().first;
-        if (marks.size() > 3 && ctx.report != nullptr)
-        {
-            // more than one segment (Live writes one marker past the end): an approximation until N4
-            double maxDev = 0;
-            for (const auto& [sec, beat] : marks)
-                maxDev = std::max (maxDev, std::abs (beatAtZero + rate * sec - beat));
-            if (maxDev > 1.0 / 64.0)
-                ++ctx.report->partialEffects["Warp markers (one tempo per clip)"];
-        }
     }
-    // content position (beats, or seconds when not warped) → LYNX playback ticks from the sample's start
-    const auto contentTicks = [&] (double v) { return warped ? (v - beatAtZero) * ppq : v * bpm / 60.0 * ppq; };
+    // more than one tempo inside the clip (Live writes one marker past the last real one, so 2 segments can still be one)
+    const auto bends = [&] {
+        double maxDev = 0;
+        for (const auto& [sec, beat] : marks)
+            maxDev = std::max (maxDev, std::abs (beatAtZero + rate * sec - beat));
+        return marks.size() > 2 && maxDev > 1.0 / 64.0;
+    }();
     auto stretch = warped ? std::clamp (rate * 60.0 / bpm, 0.01, 100.0) : 1.0;
     // a warped clip that keeps its pitch, whose file length the set records [DATA: SampleRef DefaultDuration /
     // DefaultSampleRate]: the channel stretches the whole file offline with the clip's warp mode (round 175a, N4:
     // LYNX's Beats engine only runs offline), to the file's length in content beats; the clip then plays it as is
-    const auto fileFrames = clip.number ("SampleRef/DefaultDuration", 0), fileRate = clip.number ("SampleRef/DefaultSampleRate", 0);
+    auto fileFrames = clip.number ("SampleRef/DefaultDuration", 0), fileRate = clip.number ("SampleRef/DefaultSampleRate", 0);
+    // (a set without the file's length, as LYNX writes them: markers that bend the tempo still need it; the file's own)
+    if (bends && ! (fileFrames > 0 && fileRate > 0) && ctx.options.common.sampleSeconds)
+        if (const auto seconds = ctx.options.common.sampleSeconds (path); seconds > 0.0)
+        {
+            fileFrames = seconds;
+            fileRate = 1.0;
+        }
     // Beats with a transpose: Live resamples each piece (higher and shorter, still on its beat), so the transposition is
     // rendered offline with the stretch, keyed by the pitch, and the clip itself plays untransposed [LIVE: Beats-up5]
     const auto transpose = std::clamp (clip.number ("PitchCoarse", 0) + clip.number ("PitchFine", 0) / 100.0, -48.0, 48.0);
     const auto bakePitch = warped && mode == 0 && transpose != 0.0;
     double fileBeats = 0.0, beatsPitch = 0.0;
-    if (warped && mode != 3 && fileFrames > 0 && fileRate > 0 && (std::abs (stretch - 1.0) > 1.0e-9 || bakePitch))
+    std::vector<WarpPoint> warp;
+    if (warped && mode != 3 && fileFrames > 0 && fileRate > 0 && (std::abs (stretch - 1.0) > 1.0e-9 || bakePitch || bends))
     {
-        fileBeats = rate * fileFrames / fileRate;
         stretch = 1.0;
         beatsPitch = bakePitch ? transpose : 0.0;
+        if (bends)
+        {
+            // every segment: the file from its start to its end, in content beats, with the markers kept for the render
+            StretchMap beatsOf;
+            for (const auto& [sec, beat] : marks)
+                if (beatsOf.empty() || (sec > beatsOf.back().first + 1e-9 && beat > beatsOf.back().second + 1e-9))
+                    beatsOf.push_back ({ sec, beat });
+            beatAtZero = stretchMapOutput (beatsOf, 0.0);
+            fileBeats = stretchMapOutput (beatsOf, fileFrames / fileRate) - beatAtZero;
+            for (const auto& [sec, beat] : beatsOf)
+                warp.push_back ({ sec, beat });
+        }
+        else
+            fileBeats = rate * fileFrames / fileRate;
     }
-    const auto channel = audioChannelFor (ctx, path, mixerTrack, mode, warped, fileBeats, beatsPitch);
-    const auto loop = loopOf (clip);
+    else if (bends && ctx.report != nullptr)
+        ++ctx.report->partialEffects["Warp markers (one tempo per clip)"]; // stretched in real time: one rate
+    // content position (beats, or seconds when not warped) → LYNX playback ticks from the sample's start
+    const auto contentTicks = [&] (double v) { return warped ? (v - beatAtZero) * ppq : v * bpm / 60.0 * ppq; };
+    const auto channel = audioChannelFor (ctx, path, mixerTrack, mode, warped, fileBeats, beatsPitch, warp);
+    const auto loop = loopOverride != nullptr ? *loopOverride : loopOf (clip);
     // not warped: the loop values are seconds [DATA: IsWarped=false clips]; the clip length is in beats either way
     auto unwarpedLoop = loop;
     if (! warped)
@@ -641,22 +1035,42 @@ void addAudioClip (Ctx& ctx, const Element& clip, int row, int mixerTrack, doubl
             c.fadeIn = std::clamp (ticksOf (clip.number ("Fades/FadeInLength", 0)), (std::int64_t) 0, c.length);
         if (&pass == &passes.back())
             c.fadeOut = std::clamp (ticksOf (clip.number ("Fades/FadeOutLength", 0)), (std::int64_t) 0, c.length);
-        ctx.song.playlist.push_back (c);
+        (out != nullptr ? *out : ctx.song.playlist).push_back (c);
     }
 }
 
-void addMidiClip (Ctx& ctx, const Element& clip, int row, int channel, double at, double length)
+void addMidiClip (Ctx& ctx, const Element& clip, int row, int channel, double at, double length, std::vector<Clip>* out = nullptr,
+                  const ClipLoop* loopOverride = nullptr)
 {
     if (length <= 0)
         return;
     Clip c;
     c.kind = ClipKind::pattern;
-    c.pattern = patternFromMidiClip (ctx, clip, channel, length);
+    c.pattern = patternFromMidiClip (ctx, clip, channel, length, loopOverride);
     c.track = row;
     c.start = ticksOf (at);
     c.length = ticksOf (length);
     c.muted = clip.boolean ("Disabled", false);
-    ctx.song.playlist.push_back (c);
+    (out != nullptr ? *out : ctx.song.playlist).push_back (c);
+}
+
+// A clip's or scene's FollowAction block [DATA: section 5; numbers LIVE: REA_rodada181a.md, read in Live 12's Clip View]
+ClipFollow followOf (const Element& f)
+{
+    ClipFollow c;
+    c.enabled = f.boolean ("FollowActionEnabled", false);
+    c.a = (FollowKind) std::clamp ((int) f.number ("FollowActionA", 4), 0, 9);
+    c.b = (FollowKind) std::clamp ((int) f.number ("FollowActionB", 0), 0, 9); // [INFERRED] B uses A's numbers
+    c.chanceA = std::clamp ((int) std::lround (f.number ("FollowChanceA", 100)), 0, 100);
+    c.chanceB = std::clamp ((int) std::lround (f.number ("FollowChanceB", 0)), 0, 100);
+    // the jump target: Live shows the stored number itself, 1-based (5 shows "5", 0 an empty field) [LIVE, 181c];
+    // LYNX's jump row counts from 0. [INFERRED] the number counts scenes from the top, not clips of the group
+    c.jumpA = std::clamp ((int) f.number ("JumpIndexA", 1) - 1, 0, launcher::maxScenes - 1);
+    c.jumpB = std::clamp ((int) f.number ("JumpIndexB", 1) - 1, 0, launcher::maxScenes - 1);
+    c.linked = f.boolean ("IsLinked", true);
+    c.iterations = std::clamp ((int) std::lround (f.number ("LoopIterations", 1)), 1, 999);
+    c.ticks = std::max<std::int64_t> (1, ticksOf (f.number ("FollowTime", 4)));
+    return c;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -722,6 +1136,108 @@ void registerMixerTargets (Ctx& ctx, const Element& mixer, int insert, const std
     if (const auto id = targetId (mixer.child ("Pan")); ! id.empty())
         ctx.targets[id] = { AutomationTarget { AutomationTargetKind::mixerPan, insert, 0, 0 }, ValueMap::pan, "pan" };
     (void) name;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Session view → the clip grid (round 181c). Each track's ClipSlotList holds one ClipSlot per scene [DATA: section 5];
+// launch settings use the numbers read in Live 12's Clip View [LIVE: REA_rodada181a.md]. A grid clip plays one pass of
+// what Live loops: a looping clip becomes its loop region with the slot's Loop on, a one-shot its start…end span.
+void sessionToGrid (Ctx& ctx, const Element& set, const std::vector<Element>& tracks, const std::vector<int>& rowOf,
+                    const std::vector<int>& channelOf, const std::vector<int>& insertOf, const std::vector<Element>& scenes)
+{
+    auto& song = ctx.song;
+    bool any = false;
+    for (std::size_t i = 0; i < tracks.size(); ++i)
+    {
+        const auto kind = tracks[i].name();
+        if (rowOf[i] < 0 || (kind != "MidiTrack" && kind != "AudioTrack"))
+            continue;
+        const auto list = tracks[i].path ("DeviceChain/MainSequencer/ClipSlotList").children ("ClipSlot");
+        for (std::size_t s = 0; s < list.size(); ++s)
+        {
+            if ((int) s >= launcher::maxScenes)
+            {
+                ctx.note (&FlpImportReport::unsupported, "Session scenes past LYNX's grid limit");
+                break;
+            }
+            bool placed = false;
+            for (const auto& clip : list[s].path ("ClipSlot/Value").children())
+            {
+                if (clip.name() != "MidiClip" && clip.name() != "AudioClip")
+                    continue;
+                const auto own = loopOf (clip);
+                auto body = own;
+                if (own.on)
+                {
+                    body.start = own.loopStart;
+                    body.end = own.loopEnd;
+                    if (std::abs (own.start - own.loopStart) > 1e-6)
+                        ctx.note (&FlpImportReport::approximated, "Session clip whose start marker is inside its loop (it starts at the loop start)");
+                }
+                body.on = false; // one pass: the grid's Loop repeats the clip
+                auto length = body.end - body.start;
+                if (clip.name() == "AudioClip" && ! clip.boolean ("IsWarped", true))
+                    length *= song.bpm / 60.0; // an unwarped clip's loop values are seconds [DATA]
+                if (length <= 1e-9)
+                    continue;
+                std::vector<Clip> made;
+                if (clip.name() == "MidiClip" && channelOf[i] >= 0)
+                    addMidiClip (ctx, clip, rowOf[i], channelOf[i], 0.0, length, &made, &body);
+                else if (clip.name() == "AudioClip")
+                    addAudioClip (ctx, clip, rowOf[i], insertOf[i], 0.0, length, song.mixer[(std::size_t) insertOf[i]].name, &made, &body);
+                if (made.empty())
+                    continue;
+                const auto id = launcher::setClip (song, rowOf[i], (int) s, made.front());
+                if (id < 0)
+                {
+                    ctx.note (&FlpImportReport::unsupported, "Session clips past LYNX's grid limits");
+                    continue;
+                }
+                auto& slot = song.clipGrid->slots[(std::size_t) id];
+                slot.name = clip.value ("Name");
+                slot.colour = alsColour ((int) clip.number ("Color", -1));
+                slot.mode = (LaunchMode) std::clamp ((int) clip.number ("LaunchMode", 0), 0, 3);
+                slot.quant = (LaunchQuant) std::clamp ((int) clip.number ("LaunchQuantisation", 0), 0, 14);
+                slot.legato = clip.boolean ("Legato", false);
+                slot.loop = own.on;
+                slot.follow = followOf (clip.child ("FollowAction"));
+                any = placed = true;
+                break; // one clip per slot
+            }
+            if (! placed && ! list[s].boolean ("HasStop", true))
+            {
+                launcher::ensureGrid (song);
+                launcher::setStopButton (song, rowOf[i], (int) s, false);
+            }
+        }
+    }
+    if (! any)
+    {
+        song.clipGrid.reset(); // only stop buttons, no clip: a set without Session clips adds no grid
+        return;
+    }
+    auto& grid = launcher::ensureGrid (song);
+    if (grid.scenes.size() < scenes.size())
+        grid.scenes.resize (std::min<std::size_t> (scenes.size(), (std::size_t) launcher::maxScenes));
+    for (std::size_t s = 0; s < scenes.size() && s < grid.scenes.size(); ++s)
+    {
+        auto& sc = grid.scenes[s];
+        sc.name = scenes[s].value ("Name");
+        sc.colour = alsColour ((int) scenes[s].number ("Color", -1));
+        if (scenes[s].boolean ("IsTempoEnabled", false))
+            sc.tempo = std::clamp (scenes[s].number ("Tempo", 120), 10.0, 999.0);
+        int n = 4, d = 4;
+        if (scenes[s].boolean ("IsTimeSignatureEnabled", false) && alsTimeSignature ((int) scenes[s].number ("TimeSignatureId", 201), n, d))
+        {
+            sc.beatsPerBar = n;
+            if (d != 4)
+                ctx.note (&FlpImportReport::approximated, "Scene time signatures other than n/4 (the numerator is kept)");
+        }
+        if (scenes[s].boolean ("FollowAction/FollowActionEnabled", false))
+            ctx.note (&FlpImportReport::unsupported, "Scene follow actions");
+    }
+    // the set-wide value has no Global entry: a clip's number is that + 1 [LIVE: 9 = 1/8 = clip 10]
+    grid.globalQuant = (LaunchQuant) std::clamp ((int) set.number ("GlobalQuantisation", 4) + 1, 1, 14);
 }
 } // namespace
 
@@ -1053,6 +1569,18 @@ std::optional<Song> importAlsXml (const xml::Document& doc, const AlsImportOptio
         }
     }
 
+    // Live's Pre / Post toggle of each return (LiveSet/SendsPre, one SendPreBool per return, in order): "Pre" taps every
+    // track's send to that return before the track's mixer, which is LYNX's pre-fader send (round 190aq)
+    {
+        const auto toggles = set.child ("SendsPre").children ("SendPreBool");
+        for (std::size_t k = 0; k < toggles.size() && k < returns.size(); ++k)
+            if (toggles[k].attr ("Value") == "true")
+                for (auto& m : song.mixer)
+                    for (auto& send : m.sends)
+                        if (send.target == returns[k])
+                            send.pre = true;
+    }
+
     // channels, devices and arrangement clips
     std::vector<int> channelOf (tracks.size(), -1);
     std::vector<std::vector<DrumPad>> drumPads (tracks.size());
@@ -1111,56 +1639,62 @@ std::optional<Song> importAlsXml (const xml::Document& doc, const AlsImportOptio
             ctx.note (&FlpImportReport::unsupported, "Take lanes (only the main lane is kept)");
     }
 
-    // Session clips: after the arrangement, one section per scene [the user's choice, 2026-11-06]
-    std::int64_t end = 0;
-    for (const auto& c : song.playlist)
-        end = std::max (end, c.end());
-    const auto bar = den == 4 ? (std::int64_t) song.beatsPerBar * ppq : (std::int64_t) num * ppq * 4 / den;
-    const auto roundUp = [bar] (std::int64_t t) { return bar > 0 ? (t + bar - 1) / bar * bar : t; };
-    auto cursor = roundUp (end);
+    // Session clips: in the clip grid (round 181c, the default: the user's choice of 2026-11-08), or on the Playlist
+    // after the arrangement, one section per scene (an option; the default before)
     const auto scenes = set.child ("Scenes").children ("Scene");
-    for (std::size_t s = 0; s < std::max<std::size_t> (scenes.size(), 1); ++s)
+    if (options.sessionOnPlaylist)
     {
-        double longest = 0;
-        struct Slot
+        std::int64_t end = 0;
+        for (const auto& c : song.playlist)
+            end = std::max (end, c.end());
+        const auto bar = den == 4 ? (std::int64_t) song.beatsPerBar * ppq : (std::int64_t) num * ppq * 4 / den;
+        const auto roundUp = [bar] (std::int64_t t) { return bar > 0 ? (t + bar - 1) / bar * bar : t; };
+        auto cursor = roundUp (end);
+        for (std::size_t s = 0; s < std::max<std::size_t> (scenes.size(), 1); ++s)
         {
-            std::size_t track;
-            Element clip;
-        };
-        std::vector<Slot> slots;
-        for (std::size_t i = 0; i < tracks.size(); ++i)
-        {
-            const auto list = tracks[i].path ("DeviceChain/MainSequencer/ClipSlotList").children ("ClipSlot");
-            if (s >= list.size())
+            double longest = 0;
+            struct Slot
+            {
+                std::size_t track;
+                Element clip;
+            };
+            std::vector<Slot> slots;
+            for (std::size_t i = 0; i < tracks.size(); ++i)
+            {
+                const auto list = tracks[i].path ("DeviceChain/MainSequencer/ClipSlotList").children ("ClipSlot");
+                if (s >= list.size())
+                    continue;
+                const auto value = list[s].path ("ClipSlot/Value");
+                for (const auto& clip : value.children())
+                    if (clip.name() == "MidiClip" || clip.name() == "AudioClip")
+                    {
+                        slots.push_back ({ i, clip });
+                        longest = std::max (longest, clip.number ("CurrentEnd", 0) - clip.number ("CurrentStart", 0));
+                    }
+            }
+            if (slots.empty())
                 continue;
-            const auto value = list[s].path ("ClipSlot/Value");
-            for (const auto& clip : value.children())
-                if (clip.name() == "MidiClip" || clip.name() == "AudioClip")
-                {
-                    slots.push_back ({ i, clip });
-                    longest = std::max (longest, clip.number ("CurrentEnd", 0) - clip.number ("CurrentStart", 0));
-                }
+            const auto at = (double) cursor / ppq;
+            for (const auto& [i, clip] : slots)
+            {
+                const auto length = clip.number ("CurrentEnd", 0) - clip.number ("CurrentStart", 0);
+                if (clip.name() == "MidiClip" && channelOf[i] >= 0)
+                    addMidiClip (ctx, clip, rowOf[i], channelOf[i], at, length);
+                else if (clip.name() == "AudioClip" && rowOf[i] >= 0)
+                    addAudioClip (ctx, clip, rowOf[i], insertOf[i], at, length, song.mixer[(std::size_t) insertOf[i]].name);
+            }
+            Marker m;
+            m.tick = cursor;
+            m.name = s < scenes.size() ? scenes[s].value ("Name") : std::string();
+            if (m.name.empty())
+                m.name = "Scene " + std::to_string (s + 1);
+            song.addMarker (m);
+            cursor = roundUp (cursor + std::max<std::int64_t> (bar, ticksOf (longest)));
+            ctx.note (&FlpImportReport::approximated, "Session clips (placed after the arrangement, one section per scene)");
         }
-        if (slots.empty())
-            continue;
-        const auto at = (double) cursor / ppq;
-        for (const auto& [i, clip] : slots)
-        {
-            const auto length = clip.number ("CurrentEnd", 0) - clip.number ("CurrentStart", 0);
-            if (clip.name() == "MidiClip" && channelOf[i] >= 0)
-                addMidiClip (ctx, clip, rowOf[i], channelOf[i], at, length);
-            else if (clip.name() == "AudioClip" && rowOf[i] >= 0)
-                addAudioClip (ctx, clip, rowOf[i], insertOf[i], at, length, song.mixer[(std::size_t) insertOf[i]].name);
-        }
-        Marker m;
-        m.tick = cursor;
-        m.name = s < scenes.size() ? scenes[s].value ("Name") : std::string();
-        if (m.name.empty())
-            m.name = "Scene " + std::to_string (s + 1);
-        song.addMarker (m);
-        cursor = roundUp (cursor + std::max<std::int64_t> (bar, ticksOf (longest)));
-        ctx.note (&FlpImportReport::approximated, "Session clips (placed after the arrangement, one section per scene)");
     }
+    else
+        sessionToGrid (ctx, set, tracks, rowOf, channelOf, insertOf, scenes);
 
     // drum racks: one sampler channel per pad (as an FL drum sampler); later channels shift, so from the last one
     for (std::size_t i = tracks.size(); i-- > 0;)
@@ -1196,6 +1730,12 @@ std::optional<Song> importAlsXml (const xml::Document& doc, const AlsImportOptio
         song.patterns.push_back (std::move (first));
     }
     song.currentPattern = 0;
+    // Live's Scale Mode → the project key (round 190o): the set's own scale when it is on (Live 12), else the scale of
+    // the first clip that has one on (Live 11 has clip scales only). LYNX has one key per project.
+    if (set.boolean ("InKey", false))
+        projectkey::set (song, liveScaleOf (set));
+    else if (ctx.clipKeySeen)
+        projectkey::set (song, ctx.clipKey);
     return std::move (ctx.song);
 }
 } // namespace lynx

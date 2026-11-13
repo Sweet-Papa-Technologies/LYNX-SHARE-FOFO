@@ -302,6 +302,18 @@ float mapVelocity (float velocity, VelocityCurve curve) noexcept
     return v;
 }
 
+float mapPluginVelocity (float velocity, int mode, int fixedVelocity, VelocityCurve global) noexcept
+{
+    mode = clampPluginVelocityMode (mode);
+    if (mode == pluginVelocityFollow)
+        return mapVelocity (velocity, global);
+    if (velocity <= 0.0f)
+        return 0.0f;
+    if (mode == pluginVelocityFixed)
+        return (float) clampFixedVelocity (fixedVelocity) / 127.0f;
+    return mapVelocity (velocity, (VelocityCurve) (mode - 1));
+}
+
 MidiInputPlan planMidiInputs (const MidiPrefs& prefs, const std::vector<MidiPort>& available,
                               const std::vector<std::string>& previous, const std::vector<std::string>& openIds)
 {
@@ -403,14 +415,25 @@ std::vector<std::string> split (const std::string& s, char sep, std::size_t maxP
 
 std::string MidiPrefs::toText() const
 {
-    std::string out = "velocity=" + std::string (curveName (velocity)) + "\npickup=" + (pickup ? "1" : "0") + "\n";
+    std::string out = "velocity=" + std::string (curveName (velocity)) + "\npickup=" + (pickup ? "1" : "0") + "\nfootPedal=" + (footPedalNoteOff ? "1" : "0") + "\n";
     if (songMarkerJumpChannel > 0)
         out += "songMarkerJump=" + std::to_string (songMarkerJumpChannel) + "\n";
     if (performanceChannel != 0)
         out += "performanceChannel=" + std::to_string (performanceChannel) + "\n";
+    if (gamepad)
+        out += "gamepad=1\n";
     // input=<enabled>|<midi channel>|<target>|<device name>
     for (const auto& i : inputs)
+    {
         out += "input=" + std::string (i.enabled ? "1" : "0") + "|" + std::to_string (i.midiChannel) + "|" + std::to_string (i.target) + "|" + i.name + "\n";
+        // inputmpe=<member channels>|<bend range>|<device name> (issue #108; its own line: older versions skip it)
+        if (i.mpe)
+            out += "inputmpe=" + std::to_string (i.mpeMembers) + "|" + std::to_string (i.mpeBendRange) + "|" + i.name + "\n";
+    }
+    // controller=<controller type>|<device name> (round 190aw; only the devices whose type is not "detect")
+    for (const auto& i : inputs)
+        if (! i.controller.empty())
+            out += "controller=" + i.controller + "|" + i.name + "\n";
     // output=<master sync>|<sync type>|<offset ms>|<all notes off>|<device name>
     for (const auto& o : outputs)
         out += "output=" + std::string (o.masterSync ? "1" : "0") + "|" + o.syncType + "|" + std::to_string (o.offsetMs) + "|"
@@ -448,10 +471,14 @@ MidiPrefs MidiPrefs::fromText (const std::string& text)
         }
         else if (key == "pickup")
             p.pickup = trim (value) == "1";
+        else if (key == "footPedal")
+            p.footPedalNoteOff = trim (value) != "0";
         else if (key == "songMarkerJump")
             p.songMarkerJumpChannel = std::clamp (std::atoi (trim (value).c_str()), 0, 16);
         else if (key == "performanceChannel")
             p.performanceChannel = std::clamp (std::atoi (trim (value).c_str()), 0, 16);
+        else if (key == "gamepad")
+            p.gamepad = trim (value) == "1";
         else if (key == "input")
         {
             const auto parts = split (value, '|', 4);
@@ -462,6 +489,28 @@ MidiPrefs MidiPrefs::fromText (const std::string& text)
             i.midiChannel = std::clamp (toInt (trim (parts[1]), 0), 0, 16);
             i.target = std::max (-1, toInt (trim (parts[2]), -1));
             i.name = parts[3];
+            i.controller = p.input (i.name).controller;
+            p.setInput (i);
+        }
+        else if (key == "controller")
+        {
+            const auto parts = split (value, '|', 2);
+            if (parts.size() != 2 || parts[1].empty())
+                continue;
+            auto i = p.input (parts[1]);
+            i.controller = trim (parts[0]);
+            p.setInput (i);
+        }
+        else if (key == "inputmpe") // (after the device's "input" line when it has one)
+        {
+            const auto parts = split (value, '|', 3);
+            if (parts.size() != 3 || parts[2].empty())
+                continue;
+            auto i = p.input (parts[2]);
+            i.name = parts[2];
+            i.mpe = true;
+            i.mpeMembers = std::clamp (toInt (trim (parts[0]), 15), 1, 15);
+            i.mpeBendRange = std::clamp (toInt (trim (parts[1]), 48), 1, 96);
             p.setInput (i);
         }
         else if (key == "output")

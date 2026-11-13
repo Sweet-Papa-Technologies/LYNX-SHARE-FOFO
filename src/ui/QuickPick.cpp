@@ -1,5 +1,7 @@
 #include "ui/QuickPick.h"
 
+#include "core/Rack.h"
+
 #include <algorithm>
 
 #include "core/ControlSurface.h"
@@ -9,16 +11,19 @@
 #include "core/SoundFont.h"
 #include "core/NativeEngines.h"
 #include "core/PluginCatalog.h"
+#include "core/PluginDbFolder.h"
 #include "core/Preferences.h"
 #include "core/ProjectContents.h"
 #include "core/VideoPlayer.h"
 #include "core/VoltageController.h"
 #include "core/Vfx.h"
 #include "engine/PluginHost.h"
+#include "platform/Paths.h"
 #include "ui/ChannelRackComponent.h"
 #include "ui/I18n.h"
 #include "ui/MixerComponent.h"
 #include "ui/PluginWindow.h"
+#include "ui/Theme.h"
 
 namespace lynx::quickpick
 {
@@ -74,6 +79,12 @@ std::vector<GeneratorEntry> generatorEntries (AudioEngine& engine, bool withUnav
     builtIn ("Fruity Video Player", "Fruity Video Player", 1, InstrumentKind::videoplayer,
              [] (ChannelDef& c) { c.pluginState = video::write (video::Settings {}); });
     builtIn ("Patcher", tr ("Patcher"), 2, InstrumentKind::patcher);
+    // round 183c: Live-style Instrument Rack (a Patcher in rack mode, core/Rack.h)
+    builtIn (TR_NOOP ("Instrument Rack"), tr ("Instrument Rack"), 2, InstrumentKind::patcher,
+             [] (ChannelDef& c) { c.patcher = rack::makeRack (RackDoc::Kind::instrument); });
+    // ...and a standalone MIDI Effect Rack: its chains' notes play its children (decision R1, like a Layer's)
+    builtIn (TR_NOOP ("MIDI Effect Rack"), tr ("MIDI Effect Rack"), 2, InstrumentKind::patcher,
+             [] (ChannelDef& c) { c.patcher = rack::makeRack (RackDoc::Kind::midiEffect); });
     add ("LYNX Soundfont", "LYNX Soundfont", tr ("built-in"), 0, 2, InstrumentKind::soundfont, [] { return std::optional<ChannelDef> (sf::makeChannel()); });
 
     // FL's own instrument engines (round 142)
@@ -130,6 +141,9 @@ std::vector<EffectEntry> effectEntries (AudioEngine& engine, bool withUnavailabl
             out.back().available = available;
             out.back().flPlugin = isFlEffect (kind);
         }
+    // round 183c: Live-style Audio Effect Rack (a Patcher in rack mode, core/Rack.h)
+    out.push_back ({ "lynx:fx:Audio Effect Rack", tr ("Audio Effect Rack"), tr ("built-in"), 0,
+                     [] { return std::optional<EffectSlot> (rack::makeRackSlot (RackDoc::Kind::audioEffect)); } });
 
     auto types = engine.getPluginHost().getKnownPlugins().getTypes();
     std::sort (types.begin(), types.end(), [] (const auto& a, const auto& b) { return a.name.compareIgnoreCase (b.name) < 0; });
@@ -162,6 +176,45 @@ plugincatalog::BuiltinPlugin builtinOf (const EffectEntry& e)
     return { e.key, name, e.flPlugin, e.flPlugin };
 }
 
+// The plugins as the database folder knows them (core/PluginDbFolder.h): the key, the own name (English for the
+// built-in ones, so the files do not change with the language), where it comes from and a built-in one's default folder
+template <typename Entry>
+void addDatabasePlugins (std::vector<plugindb::Plugin>& out, const std::vector<Entry>& entries, bool instruments)
+{
+    static const char* const formats[] { "LYNX", "FL engines", "VFX" };
+    for (const auto& e : entries)
+    {
+        plugindb::Plugin p;
+        p.key = e.key;
+        p.instrument = instruments;
+        p.builtin = e.folder != 3;
+        if (p.builtin)
+        {
+            const auto b = builtinOf (e);
+            p.name = b.name;
+            p.format = formats[juce::jlimit (0, 2, e.folder)];
+            const auto placed = plugincatalog::withDefaultCategories ({}, instruments, { b });
+            if (const auto it = placed.of.find (e.key); it != placed.of.end())
+                p.defaultFolder = it->second;
+        }
+        else
+        {
+            p.name = e.label.toStdString();
+            p.format = e.detail.fromLastOccurrenceOf (juce::String::fromUTF8 (" \xc2\xb7 "), false, false).toStdString();
+        }
+        out.push_back (std::move (p));
+    }
+}
+std::vector<plugindb::Plugin> databasePlugins (AudioEngine& engine)
+{
+    std::vector<plugindb::Plugin> out;
+    addDatabasePlugins (out, effectEntries (engine, true), false);
+    addDatabasePlugins (out, generatorEntries (engine, true), true);
+    return out;
+}
+juce::uint32 lastDatabaseRefresh = 0;
+bool databaseBusy = false;
+
 // FL's plugin menu (REA_rodada166f §1, round 170b): a heading per folder with its subfolders as submenus and its plugins
 // A-Z (Categories), every folder a submenu (Tree) or one A-Z list (Simple); `item` adds entry i to a menu.
 template <typename Entry>
@@ -176,10 +229,13 @@ bool categorizedItems (juce::PopupMenu& menu, AudioEngine& engine, const std::ve
         if (e.folder != 3) // (installed plugins only under a folder the user made)
             builtins.push_back (builtinOf (e));
     }
+    refreshPluginDatabase (engine); // (the folders as they are on disk now: issue #104)
     auto& host = engine.getPluginHost();
     const auto folders = plugincatalog::withDefaultCategories (host.databaseFolders(), instruments, builtins);
     const auto tree = plugincatalog::menuTree (folders, instruments, keys);
-    if (tree.empty()) return false;
+    // FL's root entries (round 190bf, fl190be Q3): plugins at the top of Effects / Generators, in no folder
+    const auto root = plugincatalog::rootItems (folders, instruments, keys);
+    if (tree.empty() && root.empty()) return false;
     const auto view = (plugincatalog::MenuView) host.databaseFolders().view;
     auto label = [&] (int i) { return shownName (engine, entries[(std::size_t) i].key, entries[(std::size_t) i].label); };
     auto addItems = [&] (juce::PopupMenu& m, std::vector<int> items) {
@@ -194,8 +250,16 @@ bool categorizedItems (juce::PopupMenu& menu, AudioEngine& engine, const std::ve
         return m;
     };
     if (view == plugincatalog::MenuView::simple)
-        addItems (menu, plugincatalog::allItems (tree));
+    {
+        auto all = plugincatalog::allItems (tree); // (one A-Z list, root entries among the rest)
+        all.insert (all.end(), root.begin(), root.end());
+        addItems (menu, all);
+    }
     else
+    {
+        // Categories: the root entries first, without a heading, then each folder under its own (FL's order)
+        if (view != plugincatalog::MenuView::tree)
+            addItems (menu, root);
         for (const auto& f : tree)
         {
             if (view == plugincatalog::MenuView::tree)
@@ -207,6 +271,10 @@ bool categorizedItems (juce::PopupMenu& menu, AudioEngine& engine, const std::ve
             for (const auto& sub : f.sub) menu.addSubMenu (juce::String::fromUTF8 (sub.name.c_str()), submenu (sub));
             addItems (menu, f.items);
         }
+        // Tree: the folders as submenus first, then the root entries
+        if (view == plugincatalog::MenuView::tree)
+            addItems (menu, root);
+    }
     menu.addSeparator();
     return true;
 }
@@ -216,6 +284,18 @@ void addGeneratorMenu (juce::PopupMenu& menu, AudioEngine& engine, std::function
                        std::function<void()> chooseSample, const ChannelDef* current, juce::Component* owner)
 {
     const auto entries = generatorEntries (engine, true);
+    // issue #130: the plugin list first (the user's own instruments are the ones they reach for most), then FL's
+    // generator categories below
+    juce::PopupMenu plugins;
+    addPluginItems (plugins, engine, true, [pick] (PluginRef ref) {
+        ChannelDef c;
+        c.name = ref.name;
+        c.instrument = InstrumentKind::plugin;
+        c.plugin = ref;
+        pick (std::move (c));
+    }, owner, pick);
+    menu.addSubMenu (tr ("Plugin (VST/VST3/CLAP)"), plugins);
+    menu.addSeparator();
     // FL's Add menu (round 170b): the generators under their categories, A-Z (FL's Plugin database folders, LYNX's own
     // first); the channel's own generator is ticked (only kinds with one entry: the VFX and FL engines share kinds / names)
     categorizedItems<GeneratorEntry> (menu, engine, entries, true, [&] (juce::PopupMenu& m, int i) {
@@ -231,15 +311,60 @@ void addGeneratorMenu (juce::PopupMenu& menu, AudioEngine& engine, std::function
     });
     if (chooseSample)
         menu.addItem (tr ("Sampler (choose file)..."), chooseSample);
-    juce::PopupMenu plugins;
-    addPluginItems (plugins, engine, true, [pick] (PluginRef ref) {
-        ChannelDef c;
-        c.name = ref.name;
-        c.instrument = InstrumentKind::plugin;
-        c.plugin = ref;
-        pick (std::move (c));
-    }, owner, pick);
-    menu.addSubMenu (tr ("Plugin (VST/VST3/CLAP)"), plugins);
+}
+
+juce::File pluginDatabaseFolder()
+{
+    return platform::documentsFolder().getChildFile ("LYNX").getChildFile ("Plugin database");
+}
+
+juce::File pluginDatabaseFolder (bool instruments, const std::string& userFolder)
+{
+    return juce::File (juce::String::fromUTF8 (plugindb::folderOnDisk (pluginDatabaseFolder().getFullPathName().toStdString(), instruments, userFolder).c_str()));
+}
+
+juce::File pluginDatabaseEntry (const std::string& key, bool instruments)
+{
+    const auto path = plugindb::entryFile (pluginDatabaseFolder().getFullPathName().toStdString(), key, instruments);
+    return path.empty() ? juce::File() : juce::File (juce::String::fromUTF8 (path.c_str()));
+}
+
+void markPluginDatabaseChanged()
+{
+    lastDatabaseRefresh = 0; // (the next menu, picker or Browser reads the folder again, without the two-second wait)
+}
+
+void refreshPluginDatabase (AudioEngine& engine, bool force)
+{
+    auto& host = engine.getPluginHost();
+    if (! host.isPersistent() || databaseBusy)
+        return;
+    const auto now = juce::Time::getMillisecondCounter();
+    if (! force && lastDatabaseRefresh != 0 && now - lastDatabaseRefresh < 2000)
+        return;
+    const juce::ScopedValueSetter<bool> busy (databaseBusy, true);
+    plugindb::State state { host.databaseFolders(), host.pluginNames() };
+    if (plugindb::refresh (pluginDatabaseFolder().getFullPathName().toStdString(), databasePlugins (engine), state).ok)
+        host.adoptDatabase (state.folders, state.names);
+    lastDatabaseRefresh = juce::Time::getMillisecondCounter();
+}
+
+void installPluginDatabase (AudioEngine& engine)
+{
+    auto& host = engine.getPluginHost();
+    if (! host.isPersistent())
+        return;
+    refreshPluginDatabase (engine, true);
+    host.onDatabaseEdited = [&engine] {
+        auto& h = engine.getPluginHost();
+        if (databaseBusy)
+            return;
+        {
+            const juce::ScopedValueSetter<bool> busy (databaseBusy, true);
+            plugindb::apply (pluginDatabaseFolder().getFullPathName().toStdString(), databasePlugins (engine), { h.databaseFolders(), h.pluginNames() });
+        }
+        refreshPluginDatabase (engine, true); // (the folder has the last word, e.g. on a folder name it cannot hold)
+    };
 }
 
 juce::String shownName (AudioEngine& engine, const std::string& key, const juce::String& original)
@@ -255,6 +380,8 @@ juce::String slotName (AudioEngine& engine, const EffectSlot& slot)
     const auto original = juce::String::fromUTF8 (projectcontents::effectSlotName (slot).c_str());
     if (slot.kind == EffectKind::plugin)
         return slot.plugin.id.empty() ? original : shownName (engine, slot.plugin.id, original);
+    if (slot.kind == EffectKind::patcher && slot.patcher.isRack()) // (round 183c: a rack: its name, else its kind's)
+        return slot.patcher.rack.front().name.empty() ? tr ("Audio Effect Rack") : juce::String::fromUTF8 (slot.patcher.rack.front().name.c_str());
     if (slot.isSubstitute() || original != juce::String (effectInfo (slot.kind).name)) // (a stand-in shows what it stands for)
         return original;
     return shownName (engine, std::string ("lynx:fx:") + effectInfo (slot.kind).name, original);
@@ -411,14 +538,35 @@ void addFolderViewItems (juce::PopupMenu& menu, AudioEngine& engine)
     const auto& folders = engine.getPluginHost().databaseFolders();
     // FL's view switch under the list (radio items): Categories / Simple / Tree
     menu.addSeparator();
+    // (one setting for every list: the Add menu, the Channel Rack's "+" menu and the mixer slots' menus)
     static const char* const names[] { TR_NOOP ("Categories"), TR_NOOP ("Simple"), TR_NOOP ("Tree") };
     for (int v = 0; v < 3; ++v)
-        menu.addItem (tr (names[v]), true, folders.view == v, [&engine, v] {
+        addRadioItem (menu, tr (names[v]), folders.view == v, [&engine, v] {
             auto& h = engine.getPluginHost();
             auto f = h.databaseFolders();
             f.view = v;
             h.setDatabaseFolders (f);
         });
+}
+
+void addRadioItem (juce::PopupMenu& menu, const juce::String& text, bool selected, std::function<void()> action)
+{
+    // FL's radio items (a dot, not a tick): a small circle drawn as the item's icon, filled when it is the one chosen
+    // (a picture at twice the size, so it stays sharp at the menu's 14 px)
+    constexpr int px = 28;
+    juce::Image picture (juce::Image::ARGB, px, px, true);
+    {
+        juce::Graphics g (picture);
+        g.setColour (selected ? theme::colour::accent : theme::colour::textSecondary);
+        g.drawEllipse (juce::Rectangle<float> (4.0f, 4.0f, px - 8.0f, px - 8.0f), 2.4f);
+        if (selected)
+            g.fillEllipse (juce::Rectangle<float> (px * 0.5f - 5.5f, px * 0.5f - 5.5f, 11.0f, 11.0f));
+    }
+    auto icon = std::make_unique<juce::DrawableImage> (picture);
+    juce::PopupMenu::Item item (text);
+    item.setImage (std::move (icon));
+    item.setAction (std::move (action));
+    menu.addItem (std::move (item));
 }
 
 bool inUserFolder (AudioEngine& engine, const std::string& key)

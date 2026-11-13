@@ -65,6 +65,11 @@
 #include "ui/VfxEditors.h"
 #include "ui/VideoPlayerView.h"
 #include "ui/WaveTravellerEditor.h"
+#include "ui/FpcEditor.h"
+#include "ui/FruitySlicerEditor.h"
+#include "ui/FlVoicePanel.h"
+#include "core/FruitySlicer.h"
+#include "ui/SlicexEditor.h"
 #include "ui/BrowserComponent.h"
 #include "engine/SampleLibrary.h"
 #include "core/SampleFiles.h"
@@ -503,6 +508,7 @@ public:
         morphine = def.instrument == InstrumentKind::morphine;
         autogun = def.instrument == InstrumentKind::autogun;
         transistorBass = def.instrument == InstrumentKind::transistorbass;
+        transistorBassMobile = transistorBass && transistorBassIsFlm (def);
         ogun = def.instrument == InstrumentKind::ogun || autogun; // Autogun: Ogun's parameter layout (REA_rodada57)
         miniSynth = def.instrument == InstrumentKind::minisynth;
         dx10 = def.instrument == InstrumentKind::dx10;
@@ -525,7 +531,7 @@ public:
         fruityDance = def.instrument == InstrumentKind::fruitydance;
         // round 168q: the engines that run FL's own files say so when this computer lacks them
         engineFilesMissing = ((kepler || keplerExo) && ! keplerDllUsable (def.samplePath))
-                          || (transistorBass && ! transistorBassDllUsable (def.samplePath))
+                          || (transistorBass && ! transistorBassIsFlm (def) && ! transistorBassDllUsable (def.samplePath)) // (FLM's build needs no file)
                           || (sawer && sawerReadTable (def.samplePath).empty());
         sytrus = def.instrument == InstrumentKind::sytrus;
         // DrumSynth Live: the patch on the key selected in FL's editor (raw FL values)
@@ -1129,7 +1135,8 @@ public:
 
         // FL's arrangement of the plugin's page (core/PluginLayout.cpp): the knobs at FL's places, faders and
         // switches drawn by the panel
-        layout = plugui::instrumentLayout (def.instrument);
+        // (a Transistor Bass from a .flm: FL Studio Mobile's build has no sequencer, delay or reverb)
+        layout = transistorBassMobile ? plugui::transistorBassFlmLayout() : plugui::instrumentLayout (def.instrument);
         if (layout != nullptr && plugui::hostedElsewhere) // (round 180b: the plate prints the plugin's name)
         {
             hostedName = def.name;
@@ -2148,6 +2155,7 @@ public:
                : harmor ? tr ("Harmor — FL's additive engine with its effects rack")
                : gms ? tr ("GMS — FL's engine (waves read from your FL installation)")
                : morphine ? tr ("Morphine — FL's additive engine (new settings restart the voices)")
+               : transistorBass && transistorBassMobile ? tr ("Transistor Bass — FL Studio Mobile's build of the engine")
                : transistorBass ? tr ("Transistor Bass — FL's engine with its sequencer and effects (oscillator cycles read from your FL installation)")
                : autogun ? tr ("Autogun — FL's engine with its effects and Magic Dust (SG.dat read from your FL installation)")
                : ogun ? tr ("Ogun — FL's engine with its effects (Seed 2 Random is a fixed draw per channel)")
@@ -2643,7 +2651,7 @@ private:
     skin::Style pageStyle = skin::Style::glow;     // the plugin page's automatic style (round 126)
     skin::Art pageArt = skin::Art::none;           // its own art (round 170j: Themed)
     std::unique_ptr<skin::ArtLayer> artLayer;      // the art's moving part (petals, a glowing trefoil...)
-    bool sakura = true, boobass = false, drumsynth = false, harmless = false, harmor = false, gms = false, morphine = false, ogun = false, autogun = false, transistorBass = false, miniSynth = false, dx10 = false, kepler = false, keplerExo = false, poizone = false,
+    bool sakura = true, boobass = false, drumsynth = false, harmless = false, harmor = false, gms = false, morphine = false, ogun = false, autogun = false, transistorBass = false, transistorBassMobile = false, miniSynth = false, dx10 = false, kepler = false, keplerExo = false, poizone = false,
          fruitkick = false, bassdrum = false, toxic = false, threeOsc = false, simSynth = false, wasp = false, plucked = false, beepMap = false,
          sawer = false, flKeys = false, granulizer = false, drumaxx = false, slayer = false, fruityDance = false, sytrus = false, wavesFound = false,
          engineFilesMissing = false;
@@ -2915,6 +2923,11 @@ public:
         // to round them to 0.25 and cap them at 64, and every other edit in this panel wrote the rounded value back
         stretch.setSkewFactorFromMidPoint (16.0);
         stretch.addMouseListener (&stretchMenu, false);
+        // round 190w: FL's Playback › START OFFSET ([DFM] SmpStartOfsWheel, Max 16384, default 0; hint "Sample start
+        // offset"): where notes start, a fraction of the region (.flp 0xD7 0x90, SamplerSettings::startOffset)
+        setup (startOffsetKnob, startOffsetLabel, TR_NOOP ("Start offset"), 0.0, 1.0, 1.0 / 16384.0, "");
+        startOffsetKnob.setNumDecimalPlacesToDisplay (3);
+        startOffsetKnob.setTooltip (tr ("Sample start offset"));
         setup (regionStart, regionStartLabel, TR_NOOP ("Start"), 0.0, 1.0, 0.001, "");
         setup (regionEnd, regionEndLabel, TR_NOOP ("End"), 0.0, 1.0, 0.001, "");
         setup (cutoff, cutoffLabel, TR_NOOP ("Cutoff"), 20.0, 20000.0, 1.0, " Hz");
@@ -2993,6 +3006,9 @@ public:
 
         wave.setEmptyText (tr ("No sample loaded"));
         wave.setTooltip (tr ("The sample: colours show where it is bass-heavy (warm) or bright (cool); outside Start/End is dimmed"));
+        // round 190w: FL 2026 previews the sample when its display is clicked (from the start offset, to its end) and shows
+        // the playback locator over it (What's New 21138; [SHOT] flgap190w burst n2 / o3)
+        wave.onClick = [this] { previewFromDisplay(); };
         addAndMakeVisible (wave);
 
         refresh();
@@ -3002,7 +3018,54 @@ public:
             startTimerHz (30); // the knobs follow their automation while the song plays (issue #12)
     }
 
-    ~SettingsPanel() override { engine.removeChangeListener (this); }
+    ~SettingsPanel() override
+    {
+        stopPreview();
+        engine.removeChangeListener (this);
+    }
+
+    // FL's sample display click: the channel's root note, the sample from its start offset; a second click stops it
+    void previewFromDisplay()
+    {
+        const auto* c = current();
+        if (c == nullptr || ref.index < 0)
+            return;
+        if (previewKey >= 0)
+        {
+            stopPreview();
+            return;
+        }
+        previewKey = juce::jlimit (0, 127, c->misc.rootNote);
+        previewSeen = false;
+        previewFrames = 0;
+        engine.sendLiveNote (ref.index, previewKey, 100.0f / 128.0f, true); // (FL's default velocity)
+    }
+
+    void stopPreview()
+    {
+        if (previewKey >= 0 && ref.index >= 0)
+            engine.sendLiveNote (ref.index, previewKey, 0.0f, false);
+        previewKey = -1;
+        wave.setLocator (-1.0f);
+    }
+
+    // the locator follows the preview's voice; the preview ends with it (or ~2 s after a note that never sounded)
+    void followPreview()
+    {
+        if (previewKey < 0)
+            return;
+        const auto instrument = engine.getChannelInstrument (ref.index);
+        const auto at = instrument != nullptr ? instrument->playPosition() : -1.0f;
+        ++previewFrames;
+        if (at >= 0.0f)
+            previewSeen = true;
+        if ((previewSeen && at < 0.0f) || (! previewSeen && previewFrames > 60))
+        {
+            stopPreview();
+            return;
+        }
+        wave.setLocator (at);
+    }
 
     void resized() override
     {
@@ -3047,7 +3110,7 @@ public:
 
         area.removeFromTop (8);
         area.removeFromTop (6);
-        place (area.removeFromTop (110), { { &regionStart, &regionStartLabel }, { &regionEnd, &regionEndLabel } });
+        place (area.removeFromTop (110), { { &startOffsetKnob, &startOffsetLabel }, { &regionStart, &regionStartLabel }, { &regionEnd, &regionEndLabel } });
         area.removeFromTop (6);
         {
             auto filterRow = area.removeFromTop (110);
@@ -3163,6 +3226,7 @@ private:
             stretchMethod.setSelectedId ((int) c->sampler.stretchMethod + 1, juce::dontSendNotification);
             stretchMethod.setEnabled (c->sampler.keepPitch);
             regionStart.setValue (c->sampler.regionStart, juce::dontSendNotification);
+            startOffsetKnob.setValue (c->sampler.startOffset, juce::dontSendNotification);
             regionEnd.setValue (c->sampler.regionEnd, juce::dontSendNotification);
             cutoff.setValue (c->sampler.cutoff, juce::dontSendNotification);
             resonance.setValue (c->sampler.resonance, juce::dontSendNotification);
@@ -3178,6 +3242,7 @@ private:
             wave.setFile (path, [&e = engine, path] { return e.getSampleLibrary().load (path); });
             wave.setRegion (c->sampler.regionStart, c->sampler.regionEnd);
             wave.setReversed (c->sampler.reverse);
+            wave.setStartOffset (c->sampler.startOffset); // round 190w (FL dims the region before it)
 
             if (auto* w = findParentComponentOfClass<juce::DocumentWindow>())
                 w->setName (tr ("Sampler settings - {0}", { juce::String::fromUTF8 (c->name.c_str()) })
@@ -3224,6 +3289,7 @@ private:
     {
         if (isShowing())
             showAutomation (false);
+        followPreview();
     }
 
     // the Song's value of `param` (a knob that shows its automation must not write the automated value back)
@@ -3265,6 +3331,8 @@ private:
             pitch.setValue (s.pitch, juce::dontSendNotification);
         s.regionStart = (float) regionStart.getValue();
         s.regionEnd = (float) regionEnd.getValue();
+        s.startOffset = (float) startOffsetKnob.getValue();
+        wave.setStartOffset (s.startOffset);
         s.release = (float) release.getValue();
         s.reverse = reverse.getToggleState();
         s.cut = cut.getToggleState();
@@ -3357,17 +3425,19 @@ private:
         }
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&stretch));
     }
-    MenuSlider attack, release, decay, sustain, regionStart, regionEnd, cutoff, resonance;
+    MenuSlider attack, release, decay, sustain, regionStart, regionEnd, cutoff, resonance, startOffsetKnob;
     std::vector<std::pair<MenuSlider*, int>> tweakTargets; // knob -> samplerparam
     std::vector<juce::Slider*> automatedShown;             // knobs showing their automation's value now
     std::uint32_t shownGeneration = 0;
     bool dropHighlight = false;
     juce::Label pitchLabel, gainLabel, attackLabel, releaseLabel, decayLabel, sustainLabel, stretchLabel, regionStartLabel, regionEndLabel,
-        cutoffLabel, resonanceLabel;
+        cutoffLabel, resonanceLabel, startOffsetLabel;
     juce::ToggleButton reverse, cut, keepPitch, porta;
     juce::ComboBox filterType, stretchMethod;
     juce::TextButton modulationButton, precomputeButton;
     ui::WaveformDisplay wave;
+    int previewKey = -1, previewFrames = 0; // round 190w: the display's preview note (-1 = none)
+    bool previewSeen = false;
 };
 
 // Built-in synth page: 3 oscillators, envelope and filter.
@@ -5128,6 +5198,34 @@ bool hasEnvelopeTab (InstrumentKind kind) noexcept
     return kind == InstrumentKind::synth || kind == InstrumentKind::sampler;
 }
 
+// The channel's Envelope / instrument settings page: LYNX's own for the synth and the sampler; FL's (the plugin voice
+// processor's block in the generator's state) for Fruity Slicer (issue #129)
+std::unique_ptr<juce::Component> makeEnvelopePage (AudioEngine& engine, const ChannelRef& ref, InstrumentKind kind)
+{
+    if (hasEnvelopeTab (kind))
+        return std::make_unique<ModulationPanel> (engine, ref);
+    if (kind != InstrumentKind::fruityslicer)
+        return nullptr;
+    return makeFlVoicePanel (
+        engine,
+        [&engine, ref] () -> std::optional<flvoice::Settings> {
+            const auto* def = ref.get (engine);
+            if (def == nullptr || def->instrument != InstrumentKind::fruityslicer)
+                return std::nullopt;
+            const auto state = fslicer::parse (def->pluginState);
+            return fslicer::voiceSettings (state ? *state : fslicer::State {});
+        },
+        [&engine, ref] (const flvoice::Settings& settings) {
+            ref.edit (engine, [settings] (ChannelDef& def) {
+                if (auto state = fslicer::parse (def.pluginState))
+                {
+                    fslicer::setVoiceSettings (*state, settings);
+                    def.pluginState = fslicer::write (*state);
+                }
+            });
+        });
+}
+
 void showModulationFor (juce::Component& from, AudioEngine& engine, int channel)
 {
     if (auto* frame = from.findParentComponentOfClass<ChannelFrame>(); frame != nullptr && frame->tabCount() >= 2)
@@ -5165,6 +5263,12 @@ std::unique_ptr<juce::Component> makeInstrumentPage (AudioEngine& engine, const 
         return makeVideoPlayerEditor (engine, ref.locate, ref.index); // round 165g
     if (kind == InstrumentKind::wavetraveller)
         return makeWaveTravellerEditor (engine, ref.locate, ref.index); // round 167f
+    if (kind == InstrumentKind::fruityslicer)
+        return makeFruitySlicerEditor (engine, ref.locate, ref.index); // round 180c
+    if (kind == InstrumentKind::slicex)
+        return makeSlicexEditor (engine, ref.locate, ref.index); // round 190r
+    if (kind == InstrumentKind::fpc)
+        return makeFpcEditor (engine, ref.locate, ref.index); // round 190q
     if (kind == InstrumentKind::synth)
         return std::make_unique<SynthPanel> (engine, ref);
     if (isModelKind (kind))
@@ -5216,6 +5320,7 @@ public:
             if (const auto& at = alignedChannelEditorPosition(); at.has_value())
                 setTopLeftPosition (*at); // "Align all channel editors" set every channel's place (round 169k)
         setVisible (true);
+        markLinkedWindow (*this, channel, -1); // FL's Auto select linked modules (round 187a)
         keepAboveMainWindow (*this);
     }
 
@@ -5353,6 +5458,9 @@ bool hasChannelSettings (InstrumentKind kind) noexcept
         case InstrumentKind::voltage:
         case InstrumentKind::vfx:
         case InstrumentKind::wavetraveller:
+        case InstrumentKind::fruityslicer:
+        case InstrumentKind::slicex:
+        case InstrumentKind::fpc:
             return true;
         default:
             return false;
@@ -5405,7 +5513,7 @@ std::unique_ptr<juce::Component> makeChannelFrame (AudioEngine& engine, int chan
 {
     const auto kind = engine.getSong().channels[(std::size_t) channel].instrument;
     auto frame = std::make_unique<ChannelFrame> (engine, ChannelRef::rack (channel), makeChannelSettingsPanel (engine, channel),
-                                                 hasEnvelopeTab (kind) ? std::make_unique<ModulationPanel> (engine, ChannelRef::rack (channel)) : nullptr);
+                                                 makeEnvelopePage (engine, ChannelRef::rack (channel), kind));
     frame->showTab (tab < 0 ? frame->tabCount() - 1 : tab);
     return frame;
 }
@@ -5438,6 +5546,18 @@ std::unique_ptr<juce::Component> makeChannelSettingsPanel (AudioEngine& engine, 
         return makeVideoPlayerEditor (engine, channel); // round 165g
     if (engine.getSong().channels[(std::size_t) channel].instrument == InstrumentKind::wavetraveller)
         return makeWaveTravellerEditor (engine, channel); // round 167f
+    if (engine.getSong().channels[(std::size_t) channel].instrument == InstrumentKind::fruityslicer)
+        return makeFruitySlicerEditor (engine, [channel] (Song& s) -> ChannelDef* {
+            return channel >= 0 && channel < (int) s.channels.size() ? &s.channels[(std::size_t) channel] : nullptr;
+        }, channel); // round 180c
+    if (engine.getSong().channels[(std::size_t) channel].instrument == InstrumentKind::slicex)
+        return makeSlicexEditor (engine, [channel] (Song& s) -> ChannelDef* {
+            return channel >= 0 && channel < (int) s.channels.size() ? &s.channels[(std::size_t) channel] : nullptr;
+        }, channel); // round 190r
+    if (engine.getSong().channels[(std::size_t) channel].instrument == InstrumentKind::fpc)
+        return makeFpcEditor (engine, [channel] (Song& s) -> ChannelDef* {
+            return channel >= 0 && channel < (int) s.channels.size() ? &s.channels[(std::size_t) channel] : nullptr;
+        }, channel); // round 190q
     if (const auto kind = engine.getSong().channels[(std::size_t) channel].instrument;
         kind == InstrumentKind::sakura || kind == InstrumentKind::drumpad || kind == InstrumentKind::boobass
                  || kind == InstrumentKind::drumsynth || kind == InstrumentKind::harmless || kind == InstrumentKind::harmor
@@ -5471,7 +5591,7 @@ std::unique_ptr<juce::Component> makeNodeChannelFrame (AudioEngine& engine, std:
     if (page == nullptr)
         return nullptr;
     const auto kind = def->instrument;
-    return std::make_unique<ChannelFrame> (engine, ref, std::move (page), hasEnvelopeTab (kind) ? std::make_unique<ModulationPanel> (engine, ref) : nullptr);
+    return std::make_unique<ChannelFrame> (engine, ref, std::move (page), makeEnvelopePage (engine, ref, kind));
 }
 std::function<void (int)>& openMixerInsertHandler()
 {

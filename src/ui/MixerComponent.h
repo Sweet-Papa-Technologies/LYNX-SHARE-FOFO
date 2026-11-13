@@ -91,6 +91,8 @@ namespace mixeroptions
 extern std::function<void()> changed;
 // Shows or hides the unused inserts in the mixer (the main window points it at its mixer).
 extern std::function<void (bool)> setShowUsedOnly;
+// Shows or hides the loudness panel beside the Master and starts or stops its measurement (round 190am).
+extern std::function<void (bool)> setShowLoudness;
 // Opens the Export window for these inserts only (FL's "Render armed / selected tracks to wave file(s)"; the main
 // window sets it, with the project's folder and name). `done` (optional) runs once the files are written.
 extern std::function<void (std::vector<int>, std::function<void (const std::vector<juce::File>&)> done)> renderTracks;
@@ -133,6 +135,13 @@ public:
     void setVisibleHeight (int height);
 
     int getSelectedTrack() const noexcept { return selected; }
+    // The level a track's meter shows now, 0..1 (side 0 left, 1 right; round 183a: the Device View reads it while the
+    // strips are on screen instead of taking the peaks they need).
+    float shownLevel (int track, int side) const noexcept
+    {
+        const auto i = (std::size_t) (track * 2 + side);
+        return track >= 0 && (side == 0 || side == 1) && i < levels.size() ? levels[i].level : 0.0f;
+    }
     void selectTrack (int track);
     std::function<void (int)> onSelectionChanged;
 
@@ -151,8 +160,13 @@ public:
     bool moveSelected (int delta);           // Alt+Left/Right
     void linkSelectedChannels (bool startingHere); // Ctrl+L / Ctrl+Shift+L
     void selectLinkedChannels();             // Alt+L
+    // FL's "Delete" (round 186c): the confirmation "Delete tracks" (with "Remember my choice"), then, when a Playlist
+    // audio / instrument track is linked to one of them, "Delete tracks and channels" / "Unlink tracks and channels"
+    void deleteTracks (std::vector<int> tracks);
+    void deleteSelectedTracks() { deleteTracks (selection); }
     // The insert's right-click menu (FL's mixer track menu, REA rounds 115/134/143); public for --snapshot and tests.
     juce::PopupMenu buildMenu (int track);
+    juce::PopupMenu buildSendMenu (int track); // the route arrow / send knob menu from the selected track to `track`
     // runs the selected track's menu item whose caption (before any "\t" key text) is `caption` (translated): the
     // Mixer's menu keys (round 167k: FL's F2, S, Alt+R, Shift+Alt+R) do exactly what the menu does. False when absent
     // or disabled.
@@ -160,7 +174,22 @@ public:
 
     // Mixer menu › "Show only used inserts" (round 163; ui-options.txt "mixerUsedOnly"): inserts nothing uses
     // (Song::insertInUse) take no room; "+" brings back the first unused insert before adding one.
+    // Round 190am: the selected inserts and any insert whose meter moves always show (mixerops::hiddenUnusedInserts).
     static inline bool showUsedOnly = false;
+    // Mixer menu › "Loudness meter beside the Master (LYNX)" (round 190am; ui-options.txt "mixerLoudness"; off = FL's
+    // mixer, and nothing is measured): a narrow panel right of the Master with the short-term and integrated loudness
+    // (LUFS) and the true peak (dBTP) of the Master's output, and a Reset button (core/MasterLoudness.h).
+    static inline bool showLoudness = false;
+    void setShowLoudness (bool on);
+    void resetLoudness();
+    void refreshLoudnessForSnapshot() { loudnessShown = engine.getMeters().loudness.read(); repaint(); } // (--snapshot: no frames run)
+    juce::Rectangle<int> loudnessArea() const noexcept; // the panel's plate; empty while it is off
+    // Mixer menu › "Keep links to deleted inserts, greyed (LYNX)" (round 186c, pain point 1; ui-options.txt
+    // "mixerKeepLostLinks"; off = FL): Delete keeps each send into a deleted insert as a greyed MixerTrack::lostSends link.
+    static inline bool keepLostLinks = false;
+    // Mixer menu › "Mixer groups follow the Playlist (LYNX)" (round 186c, pain point 4; ui-options.txt
+    // "mixerFollowPlaylist"; off by default): mixerops::followPlaylistGroups runs after every edit that changes them.
+    static inline bool followPlaylist = false;
     bool isHidden (int track) const noexcept { return track > 0 && track < (int) hidden.size() && hidden[(std::size_t) track]; }
 
     // FL's "Mixer layout" (issue #52, REA round 168h; ui-options.txt "mixerLayout", per user like FL's FXViewMode):
@@ -193,7 +222,18 @@ private:
     std::vector<int> stripXs;                                    // layout x (before pinning)
     std::vector<bool> hidden;                                    // per track: not shown (unused, "Show only used inserts")
     static constexpr int hiddenX = -100000;
-    std::set<int> revealed;                                      // unused inserts shown anyway (added with "+")
+    std::set<int> revealed;                                      // unused inserts shown anyway (added with "+", selected, or receiving audio)
+    void keepSelectionShown();                                   // "Show only used inserts": the selection never hides
+    // the loudness panel (round 190am): its layout x (hiddenX while off), what it shows now and its hover state
+    static constexpr int loudnessWidth = 58;
+    int loudnessX = hiddenX;
+    MasterLoudness::Reading loudnessShown;
+    bool loudnessResetHovered = false;
+    juce::Rectangle<int> loudnessResetArea() const noexcept;
+    juce::Rectangle<int> loudnessBarArea() const noexcept;
+    void paintLoudnessPanel (juce::Graphics& g) const;  // the plate, captions and scale (kept in the picture)
+    void paintLoudnessValues (juce::Graphics& g) const; // the numbers and the bar (drawn over the picture)
+    void showLoudnessMenu();
 public:
     void setShowUsedOnly (bool on)
     {
@@ -275,6 +315,7 @@ private:
     bool cachePainting = false;    // paint() is filling the picture: wells without levels
     int pictureInvalidations = 0, pictureRefills = 0; // what --uiperf reports (see cacheCountersForPerf)
     void paintMeterLevel (juce::Graphics& g, int track, int channel, juce::Rectangle<int> bar) const;
+    bool isSilenced (int track) const; // muted, or silenced by a solo / a muted VCA (issue #144)
     void paintMeterLevels (juce::Graphics& g) const; // every meter in the clip, over the picture
     juce::Rectangle<int> nameBars (int track) const; // the thin level bars beside a vertical name (Wide layouts)
     void paintNameBars (juce::Graphics& g, int track) const;
@@ -293,6 +334,9 @@ private:
     juce::Rectangle<int> inputArea (int track) const; // the input level bar (inserts with an input source)
     juce::Rectangle<int> stereoArea (int track) const;
     juce::Rectangle<int> meterArea (int track) const;
+    // round 177d: the gain-reduction meter beside the peak meters (only on strips with one of LYNX's own dynamics)
+    juce::Rectangle<int> grArea (int track) const;
+    float gainReduction (int track) const; // 0..1 over mixerops::gainReductionRangeDb, -1: no such effect on the strip
     juce::Rectangle<int> sendArea (int track) const;   // send level knob (routing lane)
     juce::Rectangle<int> headerArea (int track) const;
     juce::Rectangle<int> faderRail (int track) const;  // the fader without the meters
@@ -304,9 +348,12 @@ private:
     static constexpr int railNone = -1000000;
     int railStrip = railNone;
     int railMouseY = 0;
+    double railPressMs = 0.0; // when the rail press began (the steps are counted from it)
+    int railSteps = 0;
     juce::TimedCallback railRepeat { [this] { stepHeldRail(); } };
     void pressRail (int strip, int mouseY);
     float railTarget (int strip) const;
+    void stepRailOnce();
     juce::Rectangle<int> tipArea (Part part, int track) const;
     void setHover (Part part, int track);
     Part hoverPart = Part::none;
@@ -319,9 +366,11 @@ private:
     void dragSelectTo (int track);
     bool headerDragged = false;
     void showSendMenu (int track);
+    void addPreFaderItem (juce::PopupMenu& menu, int from, int track); // LYNX's pre-fader switch of a send (round 190aq)
     void routeSelection (int track, mixerops::RouteKind kind); // the selected inserts into `track` (FL's route arrow)
     void soloExclusive (int track);
     std::vector<int> selection { 0 };
+    bool followPending = false; // a followPlaylistGroups edit is on its way (round 186c)
     std::vector<std::pair<int, float>> groupStart; // (track, value) of the selection when a group drag starts
     float groupGrab = 0.0f;
     void showMenu (int track);
@@ -342,6 +391,7 @@ private:
 
     std::vector<meters::PeakHold> levels; // per track*2: bar, peak hold and clip latch
     std::vector<float> inputLevels;       // per track: input level (decaying)
+    std::vector<int> grShown;             // per track: the gain-reduction meter's drawn height (-1: none)
     ui::FrameTicker frames { *this, [this] (double ms) { return liveFrame (ms); } };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MixerStrips)
@@ -381,12 +431,29 @@ public:
     int getSelectedSlot() const noexcept { return selectedSlot; }
     juce::Rectangle<int> slotBoundsForCheck (int row) const { return slotBounds (row); } // --selftest (ui/MixerBasicsCheck.h)
     void deleteSlot (int slot); // removes the slot's effect (its menu's Delete, the Delete key)
+    void groupIntoRack (int slot, bool all); // round 183c: Live's Group, the slot (or the chain) into an Audio Effect Rack
     void selectSlot (int slot)
     {
         selectedSlot = slot;
         repaint();
     }
     void openSlotEditor (int slot) { openEditor (slot); }
+
+    // Round 183a: the Detail View's device cards use the slots' own menus and windows through these, so the Mixer and
+    // the Device View stay one code path. The menus open over `target` (nullptr: this panel, the Mixer's own case).
+    void setMenuTarget (juce::Component* target) noexcept { menuTarget = target; }
+    void showSlotMenuFor (int slot)
+    {
+        selectedSlot = slot;
+        showSlotMenu (slot);
+    }
+    void showAddMenuFor (int row) { showAddMenu (row); }
+    std::function<void (juce::PopupMenu&, int slot)> extendSlotMenu; // items put first in a slot's menu (nullptr: none)
+    // the knob of parameter `param` of effect `slot` (param -1: the slot's Mix), as the Mixer shows and sets it
+    ui::ValueSpec slotParamSpec (int param, int slot) const { return specFor (param < 0 ? mixParam : param, slot); }
+    double slotParamValue (int param, int slot) const { return valueOf (param < 0 ? mixParam : param, slot); }
+    void setSlotParam (int param, int slot, double value) { setValue (param < 0 ? mixParam : param, slot, value); }
+    void toggleSlotEditor (int slot) { toggleEditor (slot); }
 
     // Sizes the panel for a view of `viewWidth` x `viewHeight` (round 163): when the slots and the EQ don't both fit,
     // the EQ folds to its title bar (click it to unfold); when even that doesn't fit, the panel is taller than the
@@ -492,8 +559,11 @@ private:
     double wheelAccumulator = 0.0; // a trackpad's small wheel steps over a slot, added up
     int wheelSlot = -1;
     juce::uint32 wheelTime = 0;
-    // A/B compare: a spare state per (insert, slot), swapped with the live one on request (not saved)
-    std::map<std::pair<int, int>, EffectSlot> spare;
+    // A/B compare: a spare state per (insert, slot), swapped with the live one on request (not saved); shared by every
+    // panel (round 183a: the Device View's cards reach the same B as the Mixer)
+    static inline std::map<std::pair<int, int>, EffectSlot> spare;
+    juce::Component* menuTarget = nullptr; // (round 183a) where the slot menus open; nullptr = this panel
+    juce::Component* menuOwner() noexcept { return menuTarget != nullptr ? menuTarget : this; }
     std::unique_ptr<juce::FileChooser> sampleChooser; // Newtone / Newtime source sample
 
     AudioEngine& engine;
@@ -536,6 +606,9 @@ public:
     void selectTrack (int track); // also scrolls the strip into view
     void selectSlot (int slot) { effects.selectSlot (slot); }
     int getSelectedTrack() const noexcept { return strips.getSelectedTrack(); }
+    // Round 183a: the strips' meters run (they are on screen), and the level one shows.
+    bool metersShowing() const { return strips.isShowing(); }
+    float shownLevel (int track, int side) const noexcept { return strips.shownLevel (track, side); }
     // Selects the insert and slot and opens the effect's editor (the Browser's "Current project > Effects")
     void openSlotEditor (int track, int slot)
     {

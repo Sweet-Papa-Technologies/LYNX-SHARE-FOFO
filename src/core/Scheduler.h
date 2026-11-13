@@ -42,7 +42,12 @@ struct NoteEvent
     float clipElapsed = 0.0f, clipRemaining = 0.0f, fadeIn = 0.0f, fadeOut = 0.0f;
     // bit 0: the fade-in is a crossfade (FL's S curve, clipops::crossfadeCurve), bit 1: the fade-out (round 166e);
     // bit 2: the audio clip itself is reversed (FL 2026's clip reverse, round 167k)
-    std::uint8_t fadeShape = 0;
+    // bits 3 / 4: the fade-in / fade-out is an equal-power comp crossfade (Clip::fadeCurve, round 177c)
+    // bits 5 / 6 (round 189i, FL's per-clip edge declicker): no declick at the clip's start / end (FL's declicker choice
+    // Disabled, or Automatic where the clip joins its neighbour seamlessly); bits 7 / 8: the start / end is a manual fade
+    // (FL's fade flags bits 0 / 1: no declick there, a sharp cut when its fade is 0)
+    std::uint16_t fadeShape = 0;
+    float fadeInTension = 0.0f, fadeOutTension = 0.0f; // FL's raw fade tensions (clipops::fadeTensionCurve)
     // audio clips: FL 2026's clip pitch in semitones (keys 7/8): a pitch shift that keeps the length (round 167k)
     float clipPitch = 0.0f;
     // audio clips: FL 2026's clip stretch (the audio plays that many times longer; round 167l)
@@ -53,6 +58,9 @@ struct NoteEvent
     // else the velocity is scaled
     float gain = 1.0f;
     std::uint8_t prop = 0;  // voiceProp: the vfx::Prop
+    // a live note from an MPE controller (issue #108, core/Mpe.h): its "on" brings its own `cents`, `modX` and `modY`
+    // (the live queue ignores them otherwise), and a live voiceProp is that note's expression changing as it sounds
+    bool expression = false;
     std::int8_t colour = 0; // the note's colour group 0…15 (FL's note colours: VFX Color Mapper, round 164b)
     // A VFX channel (round 164b): −1 = an ordinary note; −2 = one its processor takes (it goes nowhere else); N ≥ 0 =
     // what the processor sent on MIDI port N (only the routes on that port take it)
@@ -167,7 +175,9 @@ void schedulePatternLoop (const Pattern& pattern,
                           float swing = 0.0f,
                           const std::vector<ChannelDef>* channels = nullptr,
                           bool chase = false,
-                          double linearOrigin = -1.0) noexcept;
+                          double linearOrigin = -1.0,
+                          std::uint32_t chanceSeed = 0) noexcept;
+// `chanceSeed` (round 187c): Song::chanceSeed, for the notes with Chance or a Velocity Range (core/NoteChance.h).
 // `linearOrigin` >= 0 (round 170e5, Loop record off in Pattern mode): the pattern plays once from that transport tick,
 // every note (also those past `patternLength`) and no repeat; before it nothing plays.
 // `chase` (both schedulers): playback starts at startTick and FL's Settings › Audio › "Play truncated notes on

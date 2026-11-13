@@ -11,12 +11,12 @@ namespace lynx::projectcontents
 bool playsSampleFile (InstrumentKind kind) noexcept
 {
     return kind == InstrumentKind::sampler || kind == InstrumentKind::audioClip || kind == InstrumentKind::granulizer
-           || kind == InstrumentKind::wavetraveller;
+           || kind == InstrumentKind::wavetraveller || kind == InstrumentKind::fruityslicer || kind == InstrumentKind::slicex;
 }
 
 bool pluginWindowTakesSample (InstrumentKind kind) noexcept
 {
-    return kind == InstrumentKind::granulizer || kind == InstrumentKind::wavetraveller;
+    return kind == InstrumentKind::granulizer || kind == InstrumentKind::wavetraveller || kind == InstrumentKind::fruityslicer;
 }
 
 std::string insertName (const Song& song, int track)
@@ -34,6 +34,8 @@ std::string effectSlotName (const EffectSlot& slot)
         return substituteOriginalName (slot);
     if (isSoundgoodizerApprox (slot)) // (approximated without FL's preset files)
         return "Soundgoodizer";
+    if (slot.kind == EffectKind::patcher && slot.patcher.isRack()) // (round 183c)
+        return "Audio Effect Rack";
     return effectInfo (slot.kind).name;
 }
 
