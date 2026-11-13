@@ -2803,6 +2803,7 @@ countries: br
 "Save new version" = "Salvar nova versão"
 "Save new version (Song_2, Song_3...)" = "Salvar nova versão (Música_2, Música_3...)"
 "Saved as a new version: {0}" = "Salvo como nova versão: {0}"
+"Saving..." = "Salvando..."
 "Revert to last backup..." = "Voltar ao último backup..."
 "Revert to last backup" = "Voltar ao último backup"
 "There is no backup of this project yet." = "Ainda não há backup deste projeto."

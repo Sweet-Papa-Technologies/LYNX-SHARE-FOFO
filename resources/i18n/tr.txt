@@ -2790,6 +2790,7 @@ countries: tr
 "Save new version" = "Yeni sürüm kaydet"
 "Save new version (Song_2, Song_3...)" = "Yeni sürüm kaydet (Song_2, Song_3...)"
 "Saved as a new version: {0}" = "Yeni sürüm olarak kaydedildi: {0}"
+"Saving..." = "Kaydediliyor..."
 "Revert to last backup..." = "Son yedeğe dön..."
 "Revert to last backup" = "Son yedeğe dön"
 "There is no backup of this project yet." = "Bu projenin henüz yedeği yok."

@@ -2790,6 +2790,7 @@ countries: ru by kz
 "Save new version" = "Сохранить новую версию"
 "Save new version (Song_2, Song_3...)" = "Сохранить новую версию (Song_2, Song_3...)"
 "Saved as a new version: {0}" = "Сохранено как новая версия: {0}"
+"Saving..." = "Сохранение..."
 "Revert to last backup..." = "Вернуться к последней резервной копии..."
 "Revert to last backup" = "Вернуться к последней резервной копии"
 "There is no backup of this project yet." = "Резервных копий этого проекта пока нет."

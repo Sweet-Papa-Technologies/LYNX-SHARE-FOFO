@@ -14,7 +14,7 @@ Contributor and agent guide for **LYNX-SHARE-FOFO** (`Sweet-Papa-Technologies/LY
 ## 2. Building
 
 ### JUCE-Free Core & Unit Tests (macOS / Linux / Git Bash / WSL)
-Compiles `src/core/`, `src/flp/`, `tools/flpdump`, `tools/renderwav`, `tools/comparewav`, and the 1.95M+ check test suite without JUCE:
+Compiles `src/core/`, `src/flp/`, `tools/flpdump`, `tools/renderwav`, `tools/comparewav`, and the 2.3M+ check test suite without JUCE:
 ```bash
 TMPDIR=/tmp PATH=/usr/bin:$PATH ./scripts/build-local.sh
 # Run a single test by substring:
@@ -62,6 +62,11 @@ LYNX_PROFILE_DIR=/tmp/lynx-profile LYNX_TEST_MODE=1 "$BIN" --export Demo.lynx ou
 
 # 4. Headless UI screenshots (Playlist, Channel Rack, Piano Roll, Mixer, Browser, plugins)
 LYNX_PROFILE_DIR=/tmp/lynx-profile LYNX_TEST_MODE=1 "$BIN" --snapshot /tmp/snap_prefix Demo.lynx
+
+# 5. File › Save (written on its own thread while the window keeps answering): timings, the "Saving..." toolbar
+#    picture (savetest-saving.png), edits and second saves made meanwhile, byte-identical project file.
+#    Optional last argument: seconds of Edison recording in the test project (default 60 = a 31 MB project file).
+LYNX_PROFILE_DIR=/tmp/lynx-profile LYNX_TEST_MODE=1 "$BIN" --savetest /tmp/savetest/savetest.txt
 ```
 
 ## 4. Source Layout

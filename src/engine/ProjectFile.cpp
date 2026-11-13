@@ -9,6 +9,9 @@
 #include "core/PlaylistOps.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cstring>
+#include <string_view>
 #include <tuple>
 #include <cmath>
 
@@ -24,6 +27,98 @@ namespace lynx::ProjectFile
 {
 namespace
 {
+// --- long encoded texts ------------------------------------------------------------------------------------------
+// A project keeps its recordings (Edison documents) and its plugins' states as long encoded texts (base64). JUCE's
+// JSON writer takes a string one character at a time and makes a juce::String for each (juce_JSON.cpp, writeString):
+// a minute of stereo recording is 31 MB of text, which took seconds on every save and every timed backup. These texts
+// need no escaping, so toJson has the writer write a short mark in their place and puts each text where its mark is
+// afterwards. The file is the same byte for byte: toJsonReference is the plain way, kept for that check (--savetest).
+struct LongTexts
+{
+    std::string mark; // unique to one toJson call: "@lynx-text-<random>-", followed by the text's index and '#'
+    std::vector<std::string> texts;
+};
+thread_local LongTexts* longTexts = nullptr; // set while toJson runs on this thread
+
+// True when a JSON writer would write `text` as it is (printable ASCII, no quote, no backslash).
+bool needsNoEscaping (std::string_view text) noexcept
+{
+    return std::all_of (text.begin(), text.end(), [] (char c) { return c >= 0x20 && c < 0x7f && c != '"' && c != '\\'; });
+}
+
+// A text property that may be long (a plugin's encoded state).
+juce::var longText (const std::string& text)
+{
+    if (longTexts == nullptr || text.size() < 256 || ! needsNoEscaping (text))
+        return juce::String::fromUTF8 (text.c_str());
+    longTexts->texts.push_back (text);
+    return juce::String (longTexts->mark + std::to_string (longTexts->texts.size() - 1) + "#");
+}
+
+// Bytes as base64 text (what juce::Base64::toBase64 gives, without going through an OutputStream four bytes at a time).
+juce::var base64Text (const void* bytes, std::size_t size)
+{
+    if (longTexts == nullptr)
+        return juce::Base64::toBase64 (bytes, size);
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto* in = static_cast<const std::uint8_t*> (bytes);
+    std::string text ((size + 2) / 3 * 4, '=');
+    auto* out = text.data();
+    for (; size >= 3; size -= 3, in += 3, out += 4)
+    {
+        const auto v = (std::uint32_t) (in[0] << 16 | in[1] << 8 | in[2]);
+        out[0] = table[v >> 18];
+        out[1] = table[(v >> 12) & 63];
+        out[2] = table[(v >> 6) & 63];
+        out[3] = table[v & 63];
+    }
+    if (size > 0) // one or two bytes left: padded with '='
+    {
+        const auto v = (std::uint32_t) (in[0] << 16 | (size > 1 ? in[1] << 8 : 0));
+        out[0] = table[v >> 18];
+        out[1] = table[(v >> 12) & 63];
+        if (size > 1)
+            out[2] = table[(v >> 6) & 63];
+    }
+    if (text.size() < 256)
+        return juce::String::fromUTF8 (text.c_str());
+    longTexts->texts.push_back (std::move (text));
+    return juce::String (longTexts->mark + std::to_string (longTexts->texts.size() - 1) + "#");
+}
+
+// The writer's text with every mark replaced by its long text (the quotes around a mark stay: they are the text's).
+std::string withLongTexts (const juce::String& json, const LongTexts& found)
+{
+    const std::string_view text (json.toRawUTF8(), json.getNumBytesAsUTF8());
+    auto size = text.size();
+    for (const auto& t : found.texts)
+        size += t.size();
+    std::string out;
+    out.reserve (size);
+    std::size_t at = 0;
+    for (;;)
+    {
+        const auto mark = text.find (found.mark, at);
+        if (mark == std::string_view::npos)
+            break;
+        const auto digits = mark + found.mark.size();
+        const auto end = text.find ('#', digits);
+        std::size_t index = 0;
+        if (end == std::string_view::npos || end == digits
+            || std::from_chars (text.data() + digits, text.data() + end, index).ptr != text.data() + end || index >= found.texts.size())
+        {
+            out.append (text.substr (at, digits - at)); // (not a mark of ours: left as it is)
+            at = digits;
+            continue;
+        }
+        out.append (text.substr (at, mark - at));
+        out.append (found.texts[index]);
+        at = end + 1;
+    }
+    out.append (text.substr (at));
+    return out;
+}
+
 // cutoff/pitch envelopes: [amount, attack, hold, decay, sustain, release(, shape)]; only the active ones
 void writeEnvelopes (juce::DynamicObject& o, const ModEnvelope& filter, const ModEnvelope& pitch)
 {
@@ -312,7 +407,7 @@ juce::var pluginToVar (const PluginRef& p)
     auto o = std::make_unique<juce::DynamicObject>();
     o->setProperty ("id", str (p.id));
     o->setProperty ("name", str (p.name));
-    o->setProperty ("state", str (p.state));
+    o->setProperty ("state", longText (p.state));
     // an .flp plugin reference not resolved here (kept by a LYNX substitute): every field, the state byte for byte
     if (p.foreign.format != ForeignPlugin::Format::none)
         o->setProperty ("foreign", str (foreignToText (p.foreign)));
@@ -464,7 +559,7 @@ juce::var flOriginToVar (const FlOrigin& origin)
     auto o = std::make_unique<juce::DynamicObject>();
     o->setProperty ("plugin", juce::String::fromUTF8 (origin.plugin.c_str()));
     if (! origin.state.empty())
-        o->setProperty ("state", juce::Base64::toBase64 (origin.state.data(), origin.state.size()));
+        o->setProperty ("state", base64Text (origin.state.data(), origin.state.size()));
     o->setProperty ("print", juce::String::toHexString ((juce::int64) origin.fingerprint));
     return juce::var (o.release());
 }
@@ -1097,7 +1192,7 @@ juce::var recorderDocToVar (const std::shared_ptr<const audioedit::Document>& do
     if (! doc.audio.empty())
     {
         const auto wav = audioedit::encodeWav (doc, audioedit::WavFormat::float32);
-        rec->setProperty ("wav", juce::Base64::toBase64 (wav.data(), wav.size()));
+        rec->setProperty ("wav", base64Text (wav.data(), wav.size()));
     }
     return juce::var (rec.release());
 }
@@ -1175,7 +1270,7 @@ juce::var effectToVar (const EffectSlot& slot)
     if (slot.sendTracks[1] > 0)
         e->setProperty ("sendSustain", slot.sendTracks[1]);
     if (! slot.state.empty()) // FL's raw state of an exact effect (Vocodex), base64
-        e->setProperty ("state", juce::Base64::toBase64 (slot.state.data(), slot.state.size()));
+        e->setProperty ("state", base64Text (slot.state.data(), slot.state.size()));
     if (! slot.samplePath.empty()) // Newtone / Newtime source sample
         e->setProperty ("sample", str (slot.samplePath));
     if (! slot.flOrigin.empty()) // the FL effect it was imported from (round 171e)
@@ -1706,9 +1801,9 @@ juce::var channelToVar (const ChannelDef& c)
         o->setProperty ("sample", str (c.samplePath));
 
     if (! c.controllerState.empty())
-        o->setProperty ("controllerState", juce::Base64::toBase64 (c.controllerState.data(), c.controllerState.size()));
+        o->setProperty ("controllerState", base64Text (c.controllerState.data(), c.controllerState.size()));
     if (! c.pluginState.empty())
-        o->setProperty ("pluginState", juce::Base64::toBase64 (c.pluginState.data(), c.pluginState.size()));
+        o->setProperty ("pluginState", base64Text (c.pluginState.data(), c.pluginState.size()));
     if (! c.modelParams.empty())
     {
         juce::StringArray values;
@@ -2523,7 +2618,7 @@ MixerTrack mixerTrackFromVar (const juce::var& t)
     return track;
 }
 
-juce::String toJson (const Song& song, bool stampVersion)
+juce::String toJsonReference (const Song& song, bool stampVersion)
 {
     auto root = std::make_unique<juce::DynamicObject>();
     root->setProperty ("format", "lynx-project");
@@ -3139,6 +3234,29 @@ juce::String toJson (const Song& song, bool stampVersion)
         root->setProperty ("session", juce::var (block.release()));
     }
     return juce::JSON::toString (juce::var (root.release()), false);
+}
+
+namespace
+{
+// The project as UTF-8 text: the writer's text, with the long encoded texts put in around the writer.
+std::string toJsonUtf8 (const Song& song, bool stampVersion = true)
+{
+    LongTexts texts;
+    texts.mark = ("@lynx-text-" + juce::String::toHexString (juce::Random().nextInt64()) + "-").toStdString();
+    struct Scope
+    {
+        explicit Scope (LongTexts& t) : before (longTexts) { longTexts = &t; }
+        ~Scope() { longTexts = before; }
+        LongTexts* before;
+    } scope (texts);
+    return withLongTexts (toJsonReference (song, stampVersion), texts);
+}
+} // namespace
+
+juce::String toJson (const Song& song, bool stampVersion)
+{
+    const auto text = toJsonUtf8 (song, stampVersion);
+    return juce::String::fromUTF8 (text.data(), (int) text.size());
 }
 
 std::optional<Song> fromJson (const juce::String& json, juce::String& error, juce::String* savedBy)
@@ -3798,16 +3916,18 @@ bool save (const Song& song, const juce::File& file, juce::String& error)
 {
     // Write to a temp file and swap, so a mid-write error doesn't destroy the previous project.
     juce::TemporaryFile temp (file);
-    const auto json = toJson (song);
+    const auto json = toJsonUtf8 (song);
 
-    if (! temp.getFile().replaceWithText (json, false, false, nullptr) || ! temp.overwriteTargetFileWithTemporary())
+    if (! temp.getFile().replaceWithData (json.data(), json.size()) || ! temp.overwriteTargetFileWithTemporary())
     {
         error = utf8 ("could not write ") + file.getFullPathName();
         return false;
     }
 
     // a save that "worked" on a full disk, a sync folder or a failing drive must not look like a save (D#92, round 180a)
-    if (file.loadFileAsString() != json)
+    // (the bytes themselves are compared: as two juce::Strings this was a character-by-character walk of a big file)
+    if (juce::MemoryBlock back; ! file.loadFileAsData (back) || back.getSize() != json.size()
+                                || std::memcmp (back.getData(), json.data(), json.size()) != 0)
     {
         error = utf8 ("the saved file could not be read back correctly: ") + file.getFullPathName();
         return false;

@@ -2790,6 +2790,7 @@ countries: jp
 "Save new version" = "新しいバージョンを保存"
 "Save new version (Song_2, Song_3...)" = "新しいバージョンを保存 (Song_2、Song_3...)"
 "Saved as a new version: {0}" = "新しいバージョンとして保存しました: {0}"
+"Saving..." = "保存中..."
 "Revert to last backup..." = "最新のバックアップに戻す..."
 "Revert to last backup" = "最新のバックアップに戻す"
 "There is no backup of this project yet." = "このプロジェクトのバックアップはまだありません。"

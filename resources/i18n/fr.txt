@@ -2790,6 +2790,7 @@ countries: fr be ch ca lu
 "Save new version" = "Enregistrer une nouvelle version"
 "Save new version (Song_2, Song_3...)" = "Enregistrer une nouvelle version (Song_2, Song_3...)"
 "Saved as a new version: {0}" = "Enregistré comme nouvelle version : {0}"
+"Saving..." = "Enregistrement..."
 "Revert to last backup..." = "Revenir à la dernière sauvegarde..."
 "Revert to last backup" = "Revenir à la dernière sauvegarde"
 "There is no backup of this project yet." = "Il n'existe encore aucune sauvegarde de ce projet."

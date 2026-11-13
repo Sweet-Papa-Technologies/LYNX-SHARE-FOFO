@@ -695,6 +695,12 @@ public:
     // Changes since the last save/open (for the "*" in the title and the "save changes?" prompt).
     bool isModified() const noexcept { return modified; }
     void markSaved() noexcept { modified = false; sendChangeMessage(); }
+    // A save that writes its file on another thread asks, once the file is there, what happened to the project
+    // meanwhile: `getEditCount` is + 1 at every change that marks the project modified (so the project stays modified
+    // when it was edited while its older state was being written), `getSongCount` + 1 at every setSong (another
+    // project was opened: the finished save is no longer this project's).
+    std::uint64_t getEditCount() const noexcept { return modified.edits; }
+    std::uint64_t getSongCount() const noexcept { return songCount; }
     void markModified() noexcept { modified = true; sendChangeMessage(); } // e.g. a backup was opened in place of the project
 
     bool canUndo() const noexcept { return sessionHistory ? ! sessionUndo.empty() : ! undoStack.empty(); }
@@ -1258,7 +1264,21 @@ private:
     Song song;
     int selectedChannel = 0;
     std::vector<int> selectedChannels { 0 };
-    bool modified = false;
+    // "changed since the last save or open", counting how many times it was set (getEditCount)
+    struct ModifiedFlag
+    {
+        ModifiedFlag& operator= (bool now) noexcept
+        {
+            value = now;
+            if (now)
+                ++edits;
+            return *this;
+        }
+        operator bool() const noexcept { return value; }
+        bool value = false;
+        std::uint64_t edits = 0;
+    } modified;
+    std::uint64_t songCount = 0;
     double workSince = 0.0; // wall clock (ms since 1970) when the working time was last added
     std::unique_ptr<StreamPrefetcher> prefetcher; // only with an audio device (playing live)
 
