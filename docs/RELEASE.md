@@ -34,8 +34,16 @@ Steps:
    the zip and `SHA256SUMS.txt` to `dist/`. NSIS: `makensis` on PATH, `$MAKENSIS`, or the NSIS zip release unpacked
    into `~/opt/nsis-<version>` (its `makensis.exe` runs through WSL interop). Quick installer check:
    `setup.exe /S /D=C:\some\test\folder`, then `C:\some\test\folder\Uninstall.exe /S`.
-4. `git tag vx.y.z-alpha && git push origin vx.y.z-alpha`; when the workflow finishes, edit the draft release notes
-   and publish it.
-5. Microsoft Store: with the `MSSTORE_*` secrets set, the workflow's *Microsoft Store submission* job has already sent
+4. Release notes: the workflow writes them (`scripts/release-notes.sh`), and the app's Update window shows the same
+   text under "What's new". They list every change on `main` since the previous release tag, sorted into **New**,
+   **Fixed** and **Other changes** by how its title starts (`feat:` / `Add ...` → New, `fix:` / `Fix ...` → Fixed), so a
+   pull request's title is its release note: write it for the person reading "What's new". Version bumps are left out.
+   - Preview before tagging: `scripts/release-notes.sh vx.y.z` (covers `HEAD` while the tag does not exist).
+   - Optional highlights: a hand-written `docs/release-notes/x.y.z.md` (Markdown: headings and bullets) is put above
+     the list as it is. Commit it before tagging.
+   - A release that already exists keeps its text (a re-run never overwrites notes edited on GitHub).
+5. `git tag vx.y.z && git push origin vx.y.z`; when the workflow finishes, read the release's notes on GitHub and
+   edit them there if something reads badly.
+6. Microsoft Store: with the `MSSTORE_*` secrets set, the workflow's *Microsoft Store submission* job has already sent
    `LYNX-x.y.z-alpha-store.msix` as a new submission (`docs/STORE.md` › *Automatic Store submission*); without them,
    upload it by hand (`docs/STORE.md` › *Updating the Store version*).
