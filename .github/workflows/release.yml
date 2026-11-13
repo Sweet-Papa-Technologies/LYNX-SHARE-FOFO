@@ -52,6 +52,9 @@ jobs:
       label: ${{ steps.version.outputs.label }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0       # the release notes list the changes since the previous tag
+          filter: blob:none    # (history only: file contents are fetched as the checkout needs them)
 
       - name: 'Version (single source is CMakeLists.txt)'
         id: version
@@ -69,6 +72,28 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "label=$label" >> "$GITHUB_OUTPUT"
           echo "LYNX $version (package label $label)"
+
+      # What changed since the previous release (scripts/release-notes.sh): the text of the GitHub release, which is
+      # also what the app's Update window shows under "What's new". Made once here, so that whichever job creates the
+      # release uses the same text. A release that already exists keeps its text (it may have been edited by hand).
+      - name: Release notes
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v${{ steps.version.outputs.label }}"
+          fi
+          export RELEASE_NOTES_FOOTER="Signed release build of **LYNX SHARE ${tag#v}** from commit \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
+          ./scripts/release-notes.sh "$tag" > release-notes.md
+          cat release-notes.md | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
 
   build:
     name: Build LYNX.exe
@@ -378,6 +403,13 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Download the release notes
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: release-notes
+
       - name: Publish signed Windows installer to GitHub Releases
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: bash
@@ -390,9 +422,8 @@ jobs:
           else
             tag="v$LABEL"
           fi
-          notes="Signed release build of **LYNX SHARE ${tag#v}** from commit \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
           if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes "$notes"
+            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes-file release-notes/release-notes.md
           fi
           gh release upload "$tag" dist/* --clobber
 
@@ -585,6 +616,13 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Download the release notes
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: release-notes
+
       - name: Publish to GitHub Releases
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
@@ -596,9 +634,8 @@ jobs:
           else
             tag="v$LABEL"
           fi
-          notes="Signed release build of **LYNX SHARE ${tag#v}** from commit \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
           if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes "$notes"
+            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes-file release-notes/release-notes.md
           fi
           gh release upload "$tag" dist/* --clobber
 
