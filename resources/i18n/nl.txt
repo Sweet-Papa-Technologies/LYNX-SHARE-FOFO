@@ -2786,6 +2786,7 @@ countries: nl be
 "Save new version" = "Nieuwe versie opslaan"
 "Save new version (Song_2, Song_3...)" = "Nieuwe versie opslaan (Song_2, Song_3...)"
 "Saved as a new version: {0}" = "Opgeslagen als nieuwe versie: {0}"
+"Saving..." = "Opslaan..."
 "Revert to last backup..." = "Terugzetten naar laatste back-up..."
 "Revert to last backup" = "Terugzetten naar laatste back-up"
 "There is no backup of this project yet." = "Er is nog geen back-up van dit project."

@@ -9,6 +9,7 @@
 #include "core/Patcher.h"
 #include "core/Patcherize.h"
 #include "core/Performance.h"
+#include "core/Templates.h"
 #include "core/VideoPlayer.h"
 #include "core/Effects.h"
 #include "core/MixSuite.h"
@@ -647,6 +648,16 @@ public:
             const auto i = args.indexOf ("--cachetest");
             juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
             runCacheTest (juce::File (args[i + 1].unquoted()), juce::File (args[i + 2].unquoted()));
+            return;
+        }
+
+        if (args.contains ("--savetest"))
+        {
+            // LYNX --savetest report.txt [seconds of recording]: File › Save while the window keeps answering (off screen)
+            const auto i = args.indexOf ("--savetest");
+            juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
+            runSaveTest (juce::File (args[i + 1].unquoted()),
+                         args.size() > i + 2 && ! args[i + 2].startsWith ("--") ? juce::jlimit (0.1, 1800.0, args[i + 2].getDoubleValue()) : 60.0);
             return;
         }
 
@@ -5339,6 +5350,204 @@ private:
         report.replaceWithText (text);
         setApplicationReturnValue (failures == 0 ? 0 : 1);
         quit();
+    }
+
+    // --savetest: File › Save writes the project file on a thread of its own (MainComponent::saveProjectTo). A project
+    // holding an Edison recording of `seconds` (60 s of stereo noise is a 31 MB project file) is saved as File › Save
+    // does, off screen, and the report says
+    //  - how long the old way took (ProjectFile::save on the message thread: the window was frozen that long), beside
+    //    how long the message thread is held now and the longest time between two turns of the message loop;
+    //  - that the toolbar shows "Saving..." meanwhile (picture next to the report), the saved file is the project and
+    //    the project is then unmodified;
+    //  - that an edit made while the file is written leaves the project modified and is not in that file;
+    //  - that a save asked for meanwhile waits and runs afterwards, with the edit;
+    //  - that the file a save replaces is kept in the backup folder.
+    void runSaveTest (const juce::File& report, double seconds)
+    {
+        struct Test final : juce::Timer
+        {
+            lynx::AudioEngine* engine = nullptr;
+            std::unique_ptr<lynx::MainComponent> ui;
+            juce::File report, project, second;
+            std::int64_t frames = 0;
+            juce::String text;
+            int failures = 0, turns = 0;
+            double started = 0.0, lastTurn = 0.0, longestGapMs = 0.0;
+            std::function<void (bool)> done;
+
+            static double now() { return juce::Time::getMillisecondCounterHiRes(); }
+            void check (const char* what, bool ok)
+            {
+                failures += ok ? 0 : 1;
+                text << what << ": " << (ok ? "ok" : "FAILED") << "\n";
+            }
+            void timerCallback() override // a turn of the message loop
+            {
+                if (ui != nullptr && ui->isSavingForTest())
+                {
+                    ++turns;
+                    longestGapMs = juce::jmax (longestGapMs, now() - lastTurn);
+                }
+                lastTurn = now();
+                if (now() - started > 300000.0)
+                {
+                    check ("finished within 5 minutes", false);
+                    finish();
+                }
+            }
+            std::optional<lynx::Song> load (const juce::File& file)
+            {
+                juce::String error;
+                auto song = lynx::ProjectFile::load (file, error);
+                if (! song)
+                    text << "  could not load " << file.getFileName() << ": " << error << "\n";
+                return song;
+            }
+
+            void first()
+            {
+                // 1. File › Save
+                engine->markModified();
+                started = lastTurn = now();
+                startTimer (5);
+                ui->saveForTest (project, [this] { firstSaved(); });
+                text << "message_thread_held_at_start_ms=" << juce::String (now() - started, 1) << "\n";
+                check ("the file is still being written when the call returns", ui->isSavingForTest());
+                check ("modified until the file is written", engine->isModified());
+                // the toolbar while saving ("Saving..." beside the project's name)
+                const auto picture = ui->createComponentSnapshot (ui->getToolbarBoundsForSnapshot());
+                if (juce::FileOutputStream out (report.getSiblingFile (report.getFileNameWithoutExtension() + "-saving.png")); out.openedOk())
+                {
+                    out.setPosition (0);
+                    out.truncate();
+                    juce::PNGImageFormat().writeImageToStream (picture, out);
+                }
+                lastTurn = now(); // (drawing that picture is this test's own time on the message thread)
+            }
+            void firstSaved()
+            {
+                text << "save_ms=" << juce::String (now() - started, 1) << "\n"
+                     << "message_loop_turns_while_saving=" << turns << "\n"
+                     << "longest_message_loop_gap_ms=" << juce::String (longestGapMs, 1) << "\n";
+                check ("the message loop turned while the file was written", turns >= 1);
+                check ("no longer saving", ! ui->isSavingForTest());
+                check ("saved: not modified", ! engine->isModified());
+                const auto loaded = load (project);
+                check ("the file is the project", loaded && loaded->bpm == 120.0 && loaded->recorderDocument != nullptr
+                                                      && loaded->recorderDocument->audio.frames() == frames);
+
+                // 2. an edit while the next save is written, and a third save asked for meanwhile
+                engine->editSong ([] (lynx::Song& s) { s.bpm = 125.0; }, true);
+                ui->saveForTest (project, [this] { secondSaved(); });
+                engine->editSong ([] (lynx::Song& s) { s.bpm = 133.0; }, true);
+                ui->saveForTest (second, [this] { thirdSaved(); });
+                check ("a save asked for meanwhile waits", ! second.existsAsFile());
+            }
+            void secondSaved()
+            {
+                check ("edited while the file was written: still modified", engine->isModified());
+                const auto loaded = load (project);
+                check ("the file has the project as it was when the save started", loaded && loaded->bpm == 125.0);
+                check ("the file the save replaced is in the backup folder",
+                       ! lynx::platform::settingsFile ("autosave").findChildFiles (juce::File::findFiles, false, "savetest (overwritten*").isEmpty());
+            }
+            void thirdSaved()
+            {
+                const auto loaded = load (second);
+                check ("the save that waited has the edit", loaded && loaded->bpm == 133.0);
+                check ("saved: not modified", ! engine->isModified());
+                finish();
+            }
+            void finish()
+            {
+                stopTimer();
+                // (not from inside the window's own callback)
+                juce::MessageManager::callAsync ([this] {
+                    text << "failures: " << failures << "\nresult=" << (failures == 0 ? "OK" : "FAIL") << "\n";
+                    report.replaceWithText (text);
+                    ui = nullptr;
+                    done (failures == 0);
+                });
+            }
+        };
+
+        engine = std::make_unique<lynx::AudioEngine>();
+        auto song = lynx::makeNewProject();
+        song.bpm = 120.0;
+        auto doc = std::make_shared<lynx::audioedit::Document>();
+        doc->title = "savetest";
+        doc->audio.sampleRate = 48000.0;
+        doc->audio.channels.assign (2, std::vector<float> ((std::size_t) (seconds * 48000.0)));
+        std::uint32_t seed = 12345; // noise: nothing in it repeats
+        for (auto& channel : doc->audio.channels)
+            for (auto& v : channel)
+            {
+                seed = seed * 1664525u + 1013904223u;
+                v = (float) (seed >> 8) / 8388608.0f - 1.0f;
+            }
+        const auto frames = doc->audio.frames();
+        song.recorderDocument = std::move (doc);
+        // encoded states as plugins leave them: a long text, one that needs escaping (it goes through the JSON writer
+        // as before), and raw bytes whose length is 0, 1 and 2 over a multiple of three (base64's padding)
+        if (song.channels.size() >= 3 && song.mixer.size() >= 2)
+        {
+            song.channels[0].instrument = lynx::InstrumentKind::plugin;
+            song.channels[0].plugin.name = "savetest";
+            song.channels[0].plugin.state = std::string (200000, 'k') + "+/=.";
+            song.channels[1].instrument = lynx::InstrumentKind::plugin;
+            song.channels[1].plugin.name = "savetest \"quoted\"";
+            song.channels[1].plugin.state = std::string (3000, 'q') + "\"\\\n" + std::string (3000, 'q');
+            for (std::size_t i = 0; i < 3; ++i)
+            {
+                auto& bytes = i == 0 ? song.channels[2].controllerState : i == 1 ? song.channels[2].pluginState : song.mixer[1].effects.emplace_back().state;
+                bytes.resize (3000 + i);
+                for (auto& b : bytes)
+                {
+                    seed = seed * 1664525u + 1013904223u;
+                    b = (std::uint8_t) (seed >> 24);
+                }
+            }
+        }
+        engine->setSong (std::move (song));
+
+        auto test = std::make_shared<Test>();
+        test->engine = engine.get();
+        test->report = report;
+        test->frames = frames;
+        test->project = report.getSiblingFile ("savetest.lynx");
+        test->second = report.getSiblingFile ("savetest-second.lynx");
+        const auto reference = report.getSiblingFile ("savetest-reference.lynx");
+        for (const auto& f : { test->project, test->second, reference })
+            f.deleteFile();
+        for (const auto& f : lynx::platform::settingsFile ("autosave").findChildFiles (juce::File::findFiles, false, "savetest (overwritten*"))
+            f.deleteFile();
+        test->ui = std::make_unique<lynx::MainComponent> (*engine, false);
+        test->ui->setSize (1280, 800);
+        test->done = [this, test] (bool ok) {
+            setApplicationReturnValue (ok ? 0 : 1);
+            quit();
+        };
+
+        // the old way, as ProjectFile::save was: every byte through the JSON writer, text out, text back, all of it on
+        // the message thread
+        auto start = Test::now();
+        const auto plain = lynx::ProjectFile::toJsonReference (engine->getSong());
+        const auto ok = reference.replaceWithText (plain, false, false, nullptr) && reference.loadFileAsString() == plain;
+        test->text << "recording_seconds=" << juce::String (seconds, 1) << "\n"
+                   << "project_file_mb=" << juce::String ((double) reference.getSize() / 1.0e6, 1) << "\n"
+                   << "old_save_on_the_message_thread_ms=" << juce::String (Test::now() - start, 1) << "\n";
+        test->check ("reference save", ok);
+        // the new way gives the same file, byte for byte
+        juce::String error;
+        start = Test::now();
+        const auto saved = lynx::ProjectFile::save (engine->getSong(), test->second, error);
+        test->text << "new_save_ms=" << juce::String (Test::now() - start, 1) << "\n";
+        test->check ("the same text as the JSON writer alone", lynx::ProjectFile::toJson (engine->getSong()) == plain);
+        juce::MemoryBlock a, b;
+        test->check ("the same file, byte for byte", saved && reference.loadFileAsData (a) && test->second.loadFileAsData (b) && a == b && a.getSize() > 0);
+        test->second.deleteFile();
+        // (once the new window's own start-up work is through the message loop: it is not the save's)
+        juce::Timer::callAfterDelay (1000, [test] { test->first(); });
     }
 
     // --cachetest (round 174f): PlaylistComponent::cacheSelfTest on the project, the Playlist off screen at 1466 x 930

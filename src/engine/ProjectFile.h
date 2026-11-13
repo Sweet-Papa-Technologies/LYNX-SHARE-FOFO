@@ -16,6 +16,9 @@ constexpr const char* extension = ".lynx";
 constexpr int currentVersion = 1;
 
 juce::String toJson (const Song& song);
+// The same text with every byte written by JUCE's JSON writer: how toJson worked before it put the long encoded texts
+// (recordings, plugin states) in around the writer. Slow on those; kept for the check that both give the same text.
+juce::String toJsonReference (const Song& song);
 std::optional<Song> fromJson (const juce::String& json, juce::String& error);
 
 // Atomic (temporary file + rename), then read back: false, with `error`, unless the file on disk is what was written.

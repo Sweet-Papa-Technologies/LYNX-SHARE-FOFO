@@ -2786,6 +2786,7 @@ countries: es mx ar co cl pe ve
 "Save new version" = "Guardar nueva versión"
 "Save new version (Song_2, Song_3...)" = "Guardar nueva versión (Song_2, Song_3...)"
 "Saved as a new version: {0}" = "Guardado como nueva versión: {0}"
+"Saving..." = "Guardando..."
 "Revert to last backup..." = "Revertir a la última copia de seguridad..."
 "Revert to last backup" = "Revertir a la última copia de seguridad"
 "There is no backup of this project yet." = "Aún no hay ninguna copia de seguridad de este proyecto."

@@ -62,6 +62,11 @@ LYNX_PROFILE_DIR=/tmp/lynx-profile LYNX_TEST_MODE=1 "$BIN" --export Demo.lynx ou
 
 # 4. Headless UI screenshots (Playlist, Channel Rack, Piano Roll, Mixer, Browser, plugins)
 LYNX_PROFILE_DIR=/tmp/lynx-profile LYNX_TEST_MODE=1 "$BIN" --snapshot /tmp/snap_prefix Demo.lynx
+
+# 5. File › Save (written on its own thread while the window keeps answering): timings, the "Saving..." toolbar
+#    picture (savetest-saving.png), edits and second saves made meanwhile, byte-identical project file.
+#    Optional last argument: seconds of Edison recording in the test project (default 60 = a 31 MB project file).
+LYNX_PROFILE_DIR=/tmp/lynx-profile LYNX_TEST_MODE=1 "$BIN" --savetest /tmp/savetest/savetest.txt
 ```
 
 ## 4. Source Layout

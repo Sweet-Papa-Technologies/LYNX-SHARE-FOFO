@@ -2786,6 +2786,7 @@ countries: cn sg
 "Save new version" = "保存新版本"
 "Save new version (Song_2, Song_3...)" = "保存新版本（Song_2、Song_3...）"
 "Saved as a new version: {0}" = "已另存为新版本：{0}"
+"Saving..." = "正在保存..."
 "Revert to last backup..." = "恢复到上一个备份..."
 "Revert to last backup" = "恢复到上一个备份"
 "There is no backup of this project yet." = "此工程尚无备份。"

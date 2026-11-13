@@ -2464,6 +2464,7 @@ void AudioEngine::setSong (Song newSong)
     selectedChannel = 0;
     selectedChannels = { 0 };
     modified = false;
+    ++songCount;
     checkHardwareInserts = true; // (a project measured on another setup: the notice, round 165c)
 
     // arming isn't saved: a new project starts disarmed; its inserts' audio inputs open the device input

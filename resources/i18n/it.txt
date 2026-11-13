@@ -2786,6 +2786,7 @@ countries: it ch sm
 "Save new version" = "Salva nuova versione"
 "Save new version (Song_2, Song_3...)" = "Salva nuova versione (Song_2, Song_3...)"
 "Saved as a new version: {0}" = "Salvato come nuova versione: {0}"
+"Saving..." = "Salvataggio..."
 "Revert to last backup..." = "Ripristina l'ultimo backup..."
 "Revert to last backup" = "Ripristina l'ultimo backup"
 "There is no backup of this project yet." = "Non esiste ancora un backup di questo progetto."
