@@ -11,10 +11,19 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <typeinfo>
 #include <vector>
+#include <signal.h>
+
+#if ! defined(_MSC_VER) && __has_include(<cxxabi.h>)
+ #include <cxxabi.h>
+ #define LYNX_CXXABI 1 // Itanium C++ ABI (GCC, Clang, Zig's MinGW target): the thrown type, __cxa_pure_virtual
+#endif
 
 #if defined(_WIN32)
  #define WIN32_LEAN_AND_MEAN
@@ -771,6 +780,224 @@ void setUnwalkableFaultHandler (void (*handler) (void*)) noexcept
         AddVectoredExceptionHandler (0, firstChance); // (last in the chain: a plugin's own hooks added first run first)
 #else
     (void) handler;
+#endif
+}
+
+namespace
+{
+void (*fatalHandler) (const char*) = nullptr;
+std::terminate_handler previousTerminate = nullptr;
+#if ! defined(_WIN32)
+struct sigaction previousAbort {};
+#endif
+
+// The report goes to the handler with this thread's frames (the handlers' own first: they are on the failing thread)
+void reportFatal (const std::string& what) noexcept
+{
+    if (fatalHandler == nullptr)
+        return;
+    try
+    {
+        const auto text = "fatal: " + what + "\n" + moduleBacktrace (1);
+        fatalHandler (text.c_str());
+    }
+    catch (...) {}
+}
+
+// The exception being handled by std::terminate (or by abort() right after it) as "type: what()"; "" when none
+std::string currentException()
+{
+    const auto exception = std::current_exception();
+    if (exception == nullptr)
+        return {};
+    std::string type;
+#if defined(LYNX_CXXABI)
+    if (const auto* info = abi::__cxa_current_exception_type())
+    {
+        int status = -1;
+        char* readable = abi::__cxa_demangle (info->name(), nullptr, nullptr, &status);
+        type = status == 0 && readable != nullptr ? readable : info->name();
+        std::free (readable);
+    }
+#endif
+    try
+    {
+        std::rethrow_exception (exception);
+    }
+    catch (const std::exception& e)
+    {
+        return (type.empty() ? std::string (typeid (e).name()) : type) + ": " + e.what();
+    }
+    catch (...) {}
+    return type.empty() ? std::string ("an exception that is not a std::exception") : type;
+}
+
+// GCC / Clang: a pure (or deleted) virtual call goes through __cxa_pure_virtual, which ends in std::terminate
+// (libstdc++) or abort() (libc++abi). Its own frame on this thread's stack tells it apart (the address range works with
+// the runtime linked statically too, where no symbol names it).
+bool pureVirtualOnStack() noexcept
+{
+#if defined(LYNX_CXXABI) && (defined(_WIN32) || defined(LYNX_EXECINFO))
+    void* frames[64] = {};
+ #if defined(_WIN32)
+    const int n = RtlCaptureStackBackTrace (0, 64, frames, nullptr);
+ #else
+    const int n = backtrace (frames, 64);
+ #endif
+    for (const auto entry : { reinterpret_cast<std::uintptr_t> (&abi::__cxa_pure_virtual), reinterpret_cast<std::uintptr_t> (&abi::__cxa_deleted_virtual) })
+        for (int i = 0; i < n; ++i)
+            if (const auto at = reinterpret_cast<std::uintptr_t> (frames[i]); at > entry && at - entry < 256)
+                return true;
+#endif
+    return false;
+}
+
+void onTerminate()
+{
+    if (pureVirtualOnStack())
+        reportFatal ("pure virtual function call");
+    else if (const auto exception = currentException(); ! exception.empty())
+        reportFatal ("std::terminate: uncaught exception " + exception);
+    else
+        reportFatal ("std::terminate called without an active exception");
+    // as before (libstdc++'s handler prints the exception to stderr, then aborts)
+    if (previousTerminate != nullptr && previousTerminate != onTerminate)
+        previousTerminate();
+    std::abort();
+}
+
+void onAbortSignal (int sig)
+{
+    if (pureVirtualOnStack())
+        reportFatal ("pure virtual function call");
+    else if (const auto exception = currentException(); ! exception.empty())
+        reportFatal ("abort() with the uncaught exception " + exception);
+    else
+        reportFatal ("abort() called (SIGABRT)");
+#if defined(_WIN32)
+    // Returning lets abort() go on as before: the CRT resets SIGABRT and fast-fails (0xC0000409; Windows Error
+    // Reporting still writes its dump) or exits with 3.
+    (void) sig;
+#else
+    // then as before: JUCE's crash handler (onCrash finds the report written, then SIGKILL), else the default action
+    if ((previousAbort.sa_flags & SA_SIGINFO) == 0 && previousAbort.sa_handler != SIG_DFL && previousAbort.sa_handler != SIG_IGN
+        && previousAbort.sa_handler != onAbortSignal)
+        previousAbort.sa_handler (sig);
+    ::signal (SIGABRT, SIG_DFL);
+    ::raise (SIGABRT); // (blocked while this handler runs: ends the process when it returns, also after a plain raise)
+#endif
+}
+
+#if defined(_WIN32)
+[[noreturn]] void failFast (std::uint32_t code) noexcept
+{
+    // a fail-fast like the CRT's own (Windows Error Reporting writes its dump); TerminateProcess where it is missing
+    using RaiseFailFastFn = void (WINAPI*) (PEXCEPTION_RECORD, PCONTEXT, DWORD);
+    if (auto* kernel = GetModuleHandleW (L"kernel32.dll"))
+        if (auto* raiseFailFast = reinterpret_cast<RaiseFailFastFn> (reinterpret_cast<void*> (GetProcAddress (kernel, "RaiseFailFastException"))))
+            raiseFailFast (nullptr, nullptr, 0);
+    TerminateProcess (GetCurrentProcess(), (UINT) code);
+    std::_Exit (3);
+}
+
+void onInvalidParameter (const wchar_t* expression, const wchar_t* function, const wchar_t* file, unsigned int line, std::uintptr_t)
+{
+    // (a release CRT passes no names)
+    std::string what = "invalid parameter passed to a C runtime function";
+    if (function != nullptr)
+        what += " in " + narrow (function);
+    if (file != nullptr)
+        what += " (" + narrow (file) + ":" + std::to_string (line) + ")";
+    if (expression != nullptr)
+        what += ": " + narrow (expression);
+    reportFatal (what);
+    failFast (0xC0000417u); // never back into the CRT function: the default handler ends the process too
+}
+
+ #if defined(_MSC_VER)
+void __cdecl onPureCall()
+{
+    reportFatal ("pure virtual function call");
+    // returning: the CRT aborts as before
+}
+ #endif
+#endif
+
+// --fataltest
+[[noreturn]] void throwForTest()
+{
+    throw std::runtime_error ("fataltest: an exception nobody catches");
+}
+void (*volatile thrower)() = throwForTest; // (opaque: no compiler sees the throw inside a noexcept function)
+
+struct ThrowsInDestructor
+{
+    ~ThrowsInDestructor() { thrower(); } // (destructors are noexcept)
+};
+
+} // namespace
+
+// (external linkage: with the class hierarchy closed in an unnamed namespace, GCC calls PureDerived::pure directly)
+namespace fataltest
+{
+struct PureBase
+{
+    PureBase()
+    {
+        PureBase* volatile self = this; // (opaque: the call goes through the vtable)
+        self->pure();                   // the vtable is still PureBase's: the pure slot
+    }
+    virtual ~PureBase() = default;
+    virtual void pure() = 0;
+};
+struct PureDerived : PureBase
+{
+    void pure() override {}
+};
+} // namespace fataltest
+
+void setFatalErrorHandler (void (*handler) (const char*)) noexcept
+{
+    static std::atomic<bool> installed { false };
+    fatalHandler = handler;
+    if (handler == nullptr || installed.exchange (true))
+        return;
+    // (MSVC keeps a terminate handler per thread: there an exception escaping another thread reaches abort() unnamed)
+    previousTerminate = std::set_terminate (onTerminate);
+#if defined(_WIN32)
+    ::signal (SIGABRT, onAbortSignal);
+    _set_invalid_parameter_handler (onInvalidParameter);
+ #if defined(_MSC_VER)
+    _set_purecall_handler (onPureCall);
+ #endif
+#else
+    struct sigaction action {};
+    action.sa_handler = onAbortSignal;
+    sigemptyset (&action.sa_mask);
+    sigaction (SIGABRT, &action, &previousAbort);
+#endif
+}
+
+void fatalForTest (const std::string& kind) noexcept
+{
+    if (kind == "thread")
+        std::thread (thrower).join();
+    else if (kind == "noexcept")
+        [] () noexcept { thrower(); }();
+    else if (kind == "destructor")
+        ThrowsInDestructor();
+    else if (kind == "terminate")
+        std::terminate();
+    else if (kind == "abort")
+        std::abort();
+    else if (kind == "purecall")
+        fataltest::PureDerived();
+#if defined(_WIN32)
+    else if (kind == "invalidparam")
+    {
+        std::FILE* volatile none = nullptr;
+        std::fclose (none); // the CRT validates its argument: the invalid-parameter handler
+    }
 #endif
 }
 
