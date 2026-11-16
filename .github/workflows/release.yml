@@ -427,7 +427,10 @@ jobs:
             tag="v$LABEL"
           fi
           if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes-file release-notes/release-notes.md
+            # a tag with a pre-release part (v0.1.28-beta.20261117, the nightly) is a GitHub pre-release:
+            # never "Latest", and only offered by the in-app updater on the Beta channel
+            pre=(); [[ "${tag#v}" == *-* ]] && pre=(--prerelease)
+            gh release create "$tag" "${pre[@]}" --title "LYNX SHARE ${tag#v}" --notes-file release-notes/release-notes.md
           fi
           gh release upload "$tag" dist/* --clobber
 
@@ -643,7 +646,10 @@ jobs:
             tag="v$LABEL"
           fi
           if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --title "LYNX SHARE ${tag#v}" --notes-file release-notes/release-notes.md
+            # a tag with a pre-release part (v0.1.28-beta.20261117, the nightly) is a GitHub pre-release:
+            # never "Latest", and only offered by the in-app updater on the Beta channel
+            pre=(); [[ "${tag#v}" == *-* ]] && pre=(--prerelease)
+            gh release create "$tag" "${pre[@]}" --title "LYNX SHARE ${tag#v}" --notes-file release-notes/release-notes.md
           fi
           gh release upload "$tag" dist/* --clobber
 

@@ -1,0 +1,61 @@
+# Nightly beta: every night that `main` has changed and its required checks passed, tag the newest commit
+# `v<version>-beta.<YYYYMMDD>` and start the Release workflow on that tag (a GitHub pre-release).
+#
+# Publishing is off until the repository variable NIGHTLY_PUBLISH is 'true'. Without it the job only reports what it
+# would tag, so nothing reaches users before the in-app updater can keep betas away from stable users (issue #9).
+#
+# A tag pushed with the workflow's own token starts no workflow, so the Release workflow is dispatched on the tag
+# instead (workflow_dispatch is the exception GitHub allows); release.yml then builds it exactly like a pushed tag.
+name: Nightly beta
+
+on:
+  schedule:
+    - cron: '17 10 * * *'   # 10:17 UTC, about 2 a.m. in California
+  workflow_dispatch:
+    inputs:
+      ignore_checks:
+        description: 'Tag even if a required check on main is not green (e.g. a macOS runner never started)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # push the tag
+  actions: write    # dispatch release.yml
+  checks: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: Tag nightly beta
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IGNORE_CHECKS: ${{ inputs.ignore_checks || false }}
+          PUBLISH: ${{ vars.NIGHTLY_PUBLISH == 'true' }}
+        run: scripts/release-cadence.sh nightly
+
+      - name: Tag and start the release
+        if: steps.decide.outputs.tag != '' && vars.NIGHTLY_PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.decide.outputs.tag }}
+          SHA: ${{ steps.decide.outputs.sha }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" "$SHA" -m "Nightly beta $TAG"
+          git push origin "refs/tags/$TAG"
+          gh workflow run release.yml --ref "$TAG"
+          echo "Started the Release workflow for $TAG ($SHA)." >> "$GITHUB_STEP_SUMMARY"
