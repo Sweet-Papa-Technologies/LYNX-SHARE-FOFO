@@ -70,7 +70,7 @@ case "$mode" in
     out next "$major.$minor.$((patch + 1))"
     say "## Proposed release: $tag at \`${sha::9}\`"
     say "Commits since ${final:-the beginning}: $(git rev-list --count ${final:+$final..}"$sha")."
-    say "Approve the **release** job to tag and publish it; then merge the version bump pull request it opens."
+    say "Approve the **release** job to tag and publish it; then open and merge the version bump pull request it links."
     git checkout -q "$sha"
     if [[ -x scripts/release-notes.sh ]]; then
       say ""

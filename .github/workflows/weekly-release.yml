@@ -1,7 +1,8 @@
 # Sunday release: proposes `v<version>` at the newest `main` commit whose required checks passed, waits for the
 # board's approval (the `production` environment's required reviewer), then tags it, starts the Release workflow on
-# the tag, and opens the pull request that moves `main` to the next patch version (so the next nightlies are betas
-# of that version).
+# the tag, and pushes the branch that moves `main` to the next patch version (so the next nightlies are betas of that
+# version); its summary links the pull request to open. (Opening it from here would need the repository setting that
+# also lets workflows approve pull requests, which stays off.)
 #
 # The `prepare` job's summary shows the commit and the release notes that would ship; approving the `release` job
 # ships exactly that commit, even if `main` moved while the approval waited.
@@ -57,7 +58,6 @@ jobs:
     permissions:
       contents: write        # the tag and the version-bump branch
       actions: write         # dispatch release.yml
-      pull-requests: write   # the version-bump pull request
     steps:
       - uses: actions/checkout@v5
         with:
@@ -76,7 +76,7 @@ jobs:
           git push origin "refs/tags/$TAG"
           gh workflow run release.yml --ref "$TAG"
           echo "Tagged $TAG at $SHA and started the Release workflow." >> "$GITHUB_STEP_SUMMARY"
-      - name: Open the version bump pull request
+      - name: Push the version bump branch
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
@@ -88,6 +88,8 @@ jobs:
           grep -q "project(LYNX VERSION $NEXT " CMakeLists.txt
           git commit -am "chore: bump version to $NEXT"
           git push origin "$branch"
-          gh pr create --base main --head "$branch" --title "chore: bump version to $NEXT" --body \
-            "Opened by the Sunday release after ${TAG}. Nightlies tag \`v$NEXT-beta.<date>\` once this is merged (until then they skip: ${TAG#v} is already released). Created with the workflow token, so the Tests workflow does not run on it; it changes only the version line in CMakeLists.txt."
-          echo "Opened the version bump pull request ($NEXT)." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Next: merge the version bump"
+            echo "Open the pull request: https://github.com/$GITHUB_REPOSITORY/compare/main...$branch?expand=1"
+            echo "Nightlies tag \`v$NEXT-beta.<date>\` once it is merged; until then they skip (${TAG#v} is released)."
+          } >> "$GITHUB_STEP_SUMMARY"
