@@ -4124,6 +4124,57 @@ private:
                                      + "/" + juce::String ((juce::int64) doc2.audio.frames()) + " " + slotSaveErr;
                 }
             }
+
+            // GH #7: a take recorded after a finished one goes after it (the automatic selection on the first take
+            // must not make the second record in front of it), also after reopening; a selection the user makes
+            // still decides where the take goes
+            if (loopTakeResult == "OK")
+            {
+                recEngine.editSong ([] (lynx::Song& s) {
+                    if (s.mixer.size() < 4)
+                        s.mixer.resize (4);
+                    s.mixer[3].effects = { lynx::makeEffectSlot (lynx::EffectKind::edison) };
+                }, false);
+                cb.audioDeviceAboutToStart (&standIn);
+                const auto recordTake = [&] (juce::Component& ed, float value) {
+                    lynx::startAudioEditorLoopRecordForTest (ed, lynx::AudioCapture::input);
+                    std::fill (inL.begin(), inL.end(), value);
+                    std::fill (inR.begin(), inR.end(), -value);
+                    cb.audioDeviceIOCallbackWithContext (ins, 2, outs, 2, 500, context);
+                    lynx::drainAudioEditorRecordForTest (ed);
+                    lynx::stopAudioEditorRecordForTest (ed);
+                };
+                // the take at `frame` (+10, past any edge) carries `value`
+                const auto takeAt = [] (const lynx::audioedit::Document& d, std::int64_t frame, float value) {
+                    return frame + 10 < d.audio.frames() && std::abs (d.audio.channels[0][(std::size_t) (frame + 10)] - value) < 1.0e-5f;
+                };
+                {
+                    auto ed = lynx::makeAudioEditorForInsertForTest (recEngine, 3, 0);
+                    recordTake (*ed, 0.1f);
+                    recordTake (*ed, 0.2f);
+                    const auto d = lynx::getAudioEditorDocumentForTest (*ed);
+                    if (d.audio.frames() != 1000 || ! takeAt (d, 0, 0.1f) || ! takeAt (d, 500, 0.2f))
+                        loopTakeResult = "ERROR take order: the second take is not after the first";
+                }
+                if (loopTakeResult == "OK")
+                {
+                    auto ed = lynx::makeAudioEditorForInsertForTest (recEngine, 3, 0); // reopened
+                    recordTake (*ed, 0.3f);
+                    auto d = lynx::getAudioEditorDocumentForTest (*ed);
+                    if (d.audio.frames() != 1500 || ! takeAt (d, 0, 0.1f) || ! takeAt (d, 500, 0.2f) || ! takeAt (d, 1000, 0.3f))
+                        loopTakeResult = "ERROR take order after reopening";
+                    else
+                    {
+                        lynx::selectAudioEditorRangeForTest (*ed, { 500, 1000 }); // the user selects the second take
+                        recordTake (*ed, 0.4f);
+                        d = lynx::getAudioEditorDocumentForTest (*ed);
+                        if (d.audio.frames() != 2000 || ! takeAt (d, 0, 0.1f) || ! takeAt (d, 500, 0.4f)
+                            || ! takeAt (d, 1000, 0.2f) || ! takeAt (d, 1500, 0.3f))
+                            loopTakeResult = "ERROR take order: a user selection no longer sets where the take goes";
+                    }
+                }
+                cb.audioDeviceStopped();
+            }
         }
 
         // round 190ap: the Versions panel's list of files, and its labels on disk beside them

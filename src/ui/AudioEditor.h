@@ -53,4 +53,6 @@ audioedit::Document getAudioEditorDocumentForTest (const juce::Component& editor
 audioedit::Range getAudioEditorSelectionForTest (const juce::Component& editor);
 // Simulates clicking marker `markerIndex` (>= 0) or a frame position (`markerIndex < 0`) in the ruler to select a take.
 audioedit::Range clickAudioEditorTakeForTest (juce::Component& editor, int markerIndex, std::int64_t frame = 0);
+// Simulates the user selecting `range` (dragging over the waveform): the cursor goes to its start.
+void selectAudioEditorRangeForTest (juce::Component& editor, audioedit::Range range);
 } // namespace lynx
