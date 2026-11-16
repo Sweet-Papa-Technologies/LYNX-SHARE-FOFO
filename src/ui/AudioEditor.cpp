@@ -394,6 +394,7 @@ public:
                 doc = *lastSyncedDoc;
                 history.reset (doc, tr ("Open").toStdString());
                 documentChanged();
+                placeNextTake (doc.audio.frames());
                 zoomToFit();
             }
             else
@@ -466,6 +467,7 @@ public:
         modified = false;
         syncToSong (false);
         documentChanged();
+        placeNextTake (doc.audio.frames());
         zoomToFit();
         updateTitle();
     }
@@ -1878,6 +1880,7 @@ private:
 
     void commit (const juce::String& label)
     {
+        nextTakeAt = -1; // an edit: the cursor and selection decide again
         history.commit (doc, label.toStdString());
         modified = true;
         syncToSong (true);
@@ -2686,9 +2689,7 @@ private:
         recR.clear();
         recWraps.clear();
         beforeRecording = doc;
-        recordAt = selection.empty() ? cursor : selection.start;
-        if (doc.audio.empty())
-            recordAt = 0;
+        recordAt = takePosition();
         engine.getMeters().capture.setSource (captureStream, recordSource);
         recState = recordMode == RecordMode::now ? RecState::recording : RecState::waiting;
         recordButton.setToggleState (true, juce::dontSendNotification);
@@ -2699,6 +2700,25 @@ private:
         else
             setStatus (tr ("Recording from {0}", { sourceName (recordSource) }), false);
         repaint();
+    }
+
+    // the next take records at `at` until the user moves the cursor or changes the selection (see nextTakeAt)
+    void placeNextTake (std::int64_t at)
+    {
+        nextTakeAt = at;
+        nextTakeCursor = cursor;
+        nextTakeSelection = selection;
+    }
+
+    // where a recording starts: the start of the user's selection, else the cursor; after a take (or on opening a
+    // document) the end of it, so a second take lands after the first, as in FL (GH #7)
+    std::int64_t takePosition() const
+    {
+        if (doc.audio.empty())
+            return 0;
+        if (nextTakeAt >= 0 && cursor == nextTakeCursor && selection == nextTakeSelection)
+            return juce::jlimit<std::int64_t> (0, doc.audio.frames(), nextTakeAt);
+        return selection.empty() ? cursor : selection.start;
     }
 
     void drainRecording()
@@ -2805,6 +2825,7 @@ private:
         {
             showRecording();
             commit (tr ("Record"));
+            placeNextTake (cursor);
             setStatus (tr ("Recorded {0}", { formatTime ((std::int64_t) recL.size()) }) + (dropped > 0 ? "  (" + tr ("{0} frames lost", { juce::String (dropped) }) + ")" : ""), dropped > 0);
         }
         else
@@ -3298,6 +3319,7 @@ private:
                 doc = songDoc != nullptr ? *songDoc : ae::Document {};
                 history.reset (doc, tr ("Open").toStdString());
                 documentChanged();
+                placeNextTake (doc.audio.frames());
             }
         }
         if (recState != RecState::idle)
@@ -3690,6 +3712,11 @@ private:
     std::vector<std::int64_t> recWraps;
     ae::Document beforeRecording;
     std::int64_t recordAt = 0;
+    // where the next take goes when the editor, not the user, placed the cursor and selection (GH #7): the end of an
+    // opened document, or the end of the take just recorded (whose automatic selection is not the user's). -1: none.
+    // Kept only while the cursor and selection stay where the editor put them; a click or selection wins again.
+    std::int64_t nextTakeAt = -1, nextTakeCursor = 0;
+    ae::Range nextTakeSelection;
     double recordRate = 44100.0;
     bool recordStereo = true;
     int recordTicks = 0;
@@ -3736,9 +3763,7 @@ public:
         recR.clear();
         recWraps.clear();
         beforeRecording = doc;
-        recordAt = selection.empty() ? cursor : selection.start;
-        if (doc.audio.empty())
-            recordAt = 0;
+        recordAt = takePosition();
         engine.getMeters().capture.setSource (captureStream, recordSource);
         recState = RecState::recording;
         recordButton.setToggleState (true, juce::dontSendNotification);
@@ -4284,5 +4309,11 @@ audioedit::Range clickAudioEditorTakeForTest (juce::Component& editor, int marke
         return e->toolSelection();
     }
     return {};
+}
+
+void selectAudioEditorRangeForTest (juce::Component& editor, audioedit::Range range)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+        e->selectForSnapshot (range, false);
 }
 } // namespace lynx
