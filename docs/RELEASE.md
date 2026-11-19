@@ -25,6 +25,27 @@ settings folders keep "LYNX" so existing installs, links and AppImage updates ke
 `workflow_dispatch` (Actions → Release → Run workflow, or `gh workflow run release.yml --ref <branch>`) builds and
 checks everything without a tag and keeps the files as workflow artifacts only.
 
+## Release cadence (nightly betas, Sunday releases)
+
+Two workflows create every `v*` tag; nobody tags by hand:
+
+- **Nightly beta** (`.github/workflows/nightly.yml`, 10:17 UTC daily): when `main` has something new and its required
+  checks (Server limits, App ubuntu, App macOS) passed, it tags the newest such commit
+  `v<version>-beta.<YYYYMMDD>` and dispatches `release.yml` on it, which publishes a GitHub **pre-release**.
+  Publishing is off until the repository variable `NIGHTLY_PUBLISH` is `true`; until then each run's summary says
+  what it would have tagged. Turn it on once the in-app updater has a Beta channel (issue #9): today it offers
+  pre-releases to everyone.
+- **Sunday release** (`.github/workflows/weekly-release.yml`, Sunday 18:00 UTC): the `prepare` job proposes
+  `v<version>` at the newest green commit, with a release-notes preview in its summary. The `release` job waits for the
+  **production** environment's reviewer (the board). Approving it tags exactly the proposed commit, dispatches
+  `release.yml`, and pushes `chore/bump-<next>`. Open and merge that pull request (its summary links it): until
+  `main` carries the next version, nightlies skip, because `v<version>` is already released.
+- Both can be run by hand (Actions → Run workflow), with *ignore_checks* when a macOS runner never started.
+  Preview the decision locally with `scripts/release-cadence.sh nightly` or `weekly`.
+- A tag pushed with a workflow's own token starts no workflow, so both dispatch `release.yml` on the tag
+  (`gh workflow run release.yml --ref <tag>`); it then builds exactly as for a pushed tag.
+- `<version>` is `CMakeLists.txt`'s. Step 1 and step 5 below are what these workflows now do for you.
+
 Steps:
 1. Bump the version in `CMakeLists.txt` (`project(LYNX VERSION x.y.z)`, the single source) and the download badge in
    `README.md`.

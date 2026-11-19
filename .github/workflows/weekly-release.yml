@@ -1,0 +1,95 @@
+# Sunday release: proposes `v<version>` at the newest `main` commit whose required checks passed, waits for the
+# board's approval (the `production` environment's required reviewer), then tags it, starts the Release workflow on
+# the tag, and pushes the branch that moves `main` to the next patch version (so the next nightlies are betas of that
+# version); its summary links the pull request to open. (Opening it from here would need the repository setting that
+# also lets workflows approve pull requests, which stays off.)
+#
+# The `prepare` job's summary shows the commit and the release notes that would ship; approving the `release` job
+# ships exactly that commit, even if `main` moved while the approval waited.
+name: Sunday release
+
+on:
+  schedule:
+    - cron: '0 18 * * 0'   # Sunday 18:00 UTC (10 a.m. in California)
+  workflow_dispatch:
+    inputs:
+      ignore_checks:
+        description: 'Propose the release even if a required check on main is not green'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Propose the release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      sha: ${{ steps.decide.outputs.sha }}
+      next: ${{ steps.decide.outputs.next }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          filter: blob:none
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IGNORE_CHECKS: ${{ inputs.ignore_checks || false }}
+        run: scripts/release-cadence.sh weekly
+
+  release:
+    name: Release (needs the board's approval)
+    needs: prepare
+    if: needs.prepare.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: write        # the tag and the version-bump branch
+      actions: write         # dispatch release.yml
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          filter: blob:none
+      - name: Tag and start the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" "$SHA" -m "LYNX SHARE ${TAG#v}"
+          git push origin "refs/tags/$TAG"
+          gh workflow run release.yml --ref "$TAG"
+          echo "Tagged $TAG at $SHA and started the Release workflow." >> "$GITHUB_STEP_SUMMARY"
+      - name: Push the version bump branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          NEXT: ${{ needs.prepare.outputs.next }}
+        run: |
+          branch="chore/bump-$NEXT"
+          git checkout -b "$branch" origin/main
+          sed -i -E "s/^project\(LYNX VERSION [0-9]+\.[0-9]+\.[0-9]+/project(LYNX VERSION $NEXT/" CMakeLists.txt
+          grep -q "project(LYNX VERSION $NEXT " CMakeLists.txt
+          git commit -am "chore: bump version to $NEXT"
+          git push origin "$branch"
+          {
+            echo "### Next: merge the version bump"
+            echo "Open the pull request: https://github.com/$GITHUB_REPOSITORY/compare/main...$branch?expand=1"
+            echo "Nightlies tag \`v$NEXT-beta.<date>\` once it is merged; until then they skip (${TAG#v} is released)."
+          } >> "$GITHUB_STEP_SUMMARY"
