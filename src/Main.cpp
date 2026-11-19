@@ -204,22 +204,27 @@ struct StartupTrace
 StartupTrace startupTrace;
 void startupMarkHook (const char* step) { startupTrace.mark (step); }
 
-juce::File crashFolderForTest; // --faulttest: where the crash file goes instead of the settings' autosave folder
-// Crashed: try to save the project and write the backtrace (like FL's "emergency save").
-void onCrash (void* exceptionPointers)
+juce::File crashFolderForTest; // --faulttest / --fataltest: where the crash file goes instead of the settings' autosave folder
+// (round 190ci: once. The hook for stacks Windows cannot walk, crashguard::setUnwalkableFaultHandler, may have run the
+// crash handler before the top-level filter does; SWE-3: a fatal error's handler before abort() reaches it)
+std::atomic<bool> crashReported { false };
+
+// Crashed: try to save the project and write the backtrace (like FL's "emergency save"). `frames`: the failing thread's
+void writeCrashFile (const std::string& frames)
 {
-    // (round 190ci: once. The hook for stacks Windows cannot walk, crashguard::setUnwalkableFaultHandler, may have run
-    // this before the top-level filter does)
-    static std::atomic<bool> reported { false };
-    if (reported.exchange (true))
-        return;
     const auto folder = crashFolderForTest != juce::File() ? crashFolderForTest : lynx::platform::settingsFile ("autosave");
     folder.createDirectory();
     const auto stamp = juce::Time::getCurrentTime().formatted ("%Y-%m-%d %H-%M-%S");
+    // the failing thread (SWE-3)
+    auto thread = "thread 0x" + juce::String::toHexString ((juce::pointer_sized_int) juce::Thread::getCurrentThreadId());
+    if (auto* mm = juce::MessageManager::getInstanceWithoutCreating(); mm != nullptr && mm->isThisTheMessageThread())
+        thread << " (message thread)";
+    else if (auto* t = juce::Thread::getCurrentThread())
+        thread << " (\"" << t->getThreadName() << "\")";
     // JUCE's backtrace (named frames only), then every frame of the faulting thread as module+offset (round 157a: a
     // release LYNX.exe has no symbols, so its own frames were missing from the file)
-    folder.getChildFile ("crash " + stamp + ".txt").replaceWithText (juce::SystemStats::getStackBacktrace() + "\n--- frames (module+offset)\n"
-                                                                    + juce::String::fromUTF8 (lynx::crashguard::exceptionBacktrace (exceptionPointers).c_str()));
+    folder.getChildFile ("crash " + stamp + ".txt").replaceWithText (juce::SystemStats::getStackBacktrace() + "\n" + thread + "\n--- frames (module+offset)\n"
+                                                                    + juce::String::fromUTF8 (frames.c_str()));
     lynx::crashguard::note (("crashed: backtrace in autosave\\crash " + stamp + ".txt").toStdString());
 
     if (crashEngine != nullptr)
@@ -227,6 +232,20 @@ void onCrash (void* exceptionPointers)
         juce::String error;
         lynx::ProjectFile::save (crashEngine->getSong(), folder.getChildFile ("recovered " + stamp + lynx::ProjectFile::extension), error);
     }
+}
+
+// A processor fault (JUCE's crash handler; macOS / Linux: a signal)
+void onCrash (void* exceptionPointers)
+{
+    if (! crashReported.exchange (true))
+        writeCrashFile (lynx::crashguard::exceptionBacktrace (exceptionPointers));
+}
+
+// std::terminate, abort(), a pure virtual call, an invalid CRT parameter (SWE-3, crashguard::setFatalErrorHandler)
+void onFatalError (const char* report)
+{
+    if (! crashReported.exchange (true))
+        writeCrashFile (report);
 }
 juce::File sessionsFolder()
 {
@@ -534,6 +553,20 @@ public:
             crashFolderForTest = juce::File (args[i + 2].unquoted());
             lynx::crashguard::quietCrashReports();
             lynx::crashguard::faultForTest (args[i + 1] == "unwalkable");
+        }
+        // SWE-3: std::terminate, abort() / SIGABRT, pure virtual calls and invalid CRT parameters write the same crash
+        // file and session step (they never reach the handler above; on Windows abort() fast-fails past it)
+        lynx::crashguard::setFatalErrorHandler (onFatalError);
+        if (const auto args = juce::StringArray::fromTokens (commandLine, true); args.contains ("--fataltest"))
+        {
+            // LYNX.exe --fataltest <kind> <folder>: ends by that failure on purpose (crashguard::fatalForTest), so that
+            // --selftest can check the crash file in <folder> and the session step in <folder>/session.txt
+            const auto i = args.indexOf ("--fataltest");
+            crashFolderForTest = juce::File (args[i + 2].unquoted());
+            lynx::crashguard::quietCrashReports();
+            lynx::crashguard::beginSession (crashFolderForTest.getChildFile ("session.txt").getFullPathName().toStdString(), "LYNX fatal test\n");
+            lynx::crashguard::fatalForTest (args[i + 1].toStdString());
+            lynx::crashguard::exitNow (2); // (an unknown kind, or none on this system)
         }
         lynx::crashguard::hardenSignals(); // issue #115: stack overflows and SIGTERM / SIGHUP leave a trace (Linux / macOS)
 
@@ -2563,13 +2596,52 @@ private:
     // --selftest (round 190ci): two more copies of LYNX end by a fault on purpose (--faulttest), one on a normal stack
     // (the top-level filter) and one on a stack Windows cannot walk (the first-chance hook); each must leave
     // "crash <time>.txt" with the access violation in the folder it is given.
+    // SWE-3: more copies end by each fatal C++ runtime failure (--fataltest); each must leave a crash file that says what
+    // happened, names its thread and has frames, and the "crashed: backtrace in ..." session step (crash-history.log's).
     static juce::String faultReportSelfTest()
     {
-       #if JUCE_WINDOWS && (defined (_M_X64) || defined (__x86_64__))
         const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile);
         const auto root = juce::File::getSpecialLocation (juce::File::tempDirectory)
                               .getChildFile ("lynx-faulttest-" + juce::String::toHexString (juce::Random::getSystemRandom().nextInt64()));
         juce::StringArray problems;
+        struct Fatal { const char* kind; const char* expect; };
+        const Fatal fatals[] = { { "thread", "fataltest: an exception nobody catches" }, { "noexcept", "fataltest: an exception nobody catches" },
+                                 { "destructor", "fataltest: an exception nobody catches" }, { "terminate", "terminate" },
+                                 { "abort", "abort" }, { "purecall", "pure virtual" },
+                                #if JUCE_WINDOWS
+                                 { "invalidparam", "invalid parameter" },
+                                #endif
+                               };
+        for (const auto& fatal : fatals)
+        {
+            const auto folder = root.getChildFile (juce::String ("fatal-") + fatal.kind);
+            folder.createDirectory();
+            juce::ChildProcess child;
+            const auto started = child.start (juce::StringArray { exe.getFullPathName(), "--fataltest", fatal.kind, folder.getFullPathName() }, 0);
+            if (! started || ! child.waitForProcessToFinish (60000))
+            {
+                child.kill();
+                problems.add (juce::String (fatal.kind) + ": " + (started ? "did not end" : "did not start"));
+                continue;
+            }
+            juce::String text;
+            for (const auto& file : folder.findChildFiles (juce::File::findFiles, false, "crash *.txt"))
+                text = file.loadFileAsString();
+            const auto frames = text.fromFirstOccurrenceOf ("--- frames", false, false);
+            const auto session = folder.getChildFile ("session.txt").loadFileAsString();
+            juce::String problem;
+            if (text.isEmpty())
+                problem = "no crash file";
+            else if (! text.containsIgnoreCase (fatal.expect) && ! (juce::String (fatal.kind) == "purecall" && text.contains ("__cxa_pure_virtual")))
+                problem = juce::String ("a crash file without \"") + fatal.expect + "\"";
+            else if (! text.contains ("\nthread 0x") || ! frames.contains ("0: "))
+                problem = "a crash file without its thread or frames";
+            else if (! session.contains ("crashed: backtrace in autosave\\crash "))
+                problem = "no \"crashed\" session step";
+            if (problem.isNotEmpty())
+                problems.add (juce::String (fatal.kind) + ": " + problem + " (exit code 0x" + juce::String::toHexString ((juce::int64) child.getExitCode()) + ")");
+        }
+       #if JUCE_WINDOWS && (defined (_M_X64) || defined (__x86_64__))
         for (const auto* kind : { "plain", "unwalkable" })
         {
             const auto folder = root.getChildFile (kind);
@@ -2589,11 +2661,9 @@ private:
                 problems.add (juce::String (kind) + ": " + (text.isEmpty() ? "no crash file" : "a crash file without the access violation")
                               + " (exit code 0x" + juce::String::toHexString ((juce::int64) child.getExitCode()) + ")");
         }
+       #endif
         root.deleteRecursively();
         return problems.isEmpty() ? juce::String ("OK") : "ERROR " + problems.joinIntoString ("; ");
-       #else
-        return "SKIPPED (Windows x64 only)";
-       #endif
     }
 
     void runSelfTest (const juce::String& reportPath, const juce::String& demoProjectPath)

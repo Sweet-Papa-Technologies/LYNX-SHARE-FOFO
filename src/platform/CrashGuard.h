@@ -65,7 +65,8 @@ void quietCrashReports() noexcept;
 [[noreturn]] void exitNow (int code) noexcept;
 
 // Session breadcrumb (round 111). A fail-fast (0xC0000409, e.g. a GPU driver aborting inside a plugin's editor) ends
-// the process without running any crash handler, so nothing tells what happened. While the UI runs, a small file
+// the process without running any crash handler, so nothing tells what happened (LYNX's own abort() / std::terminate /
+// pure call / invalid CRT parameter do leave a crash file since SWE-3: setFatalErrorHandler). While the UI runs, a small file
 // (%APPDATA%\LYNX\sessions\session-<pid>.txt) holds a header and the last few steps (plugin being loaded, editor being
 // opened, project being opened...). A clean exit removes it; the next start finds the file of a session whose process
 // is gone and reports it (Main.cpp). Steps are written synchronously (the file survives the process dying right after);
@@ -115,6 +116,22 @@ void setUnwalkableFaultHandler (void (*handler) (void* exceptionPointers)) noexc
 // `unwalkable` = with the thread's stack above the fault overwritten first, so that it cannot be walked (Windows x64;
 // elsewhere a plain fault).
 [[noreturn]] void faultForTest (bool unwalkable) noexcept;
+// Fatal C++ runtime failures (issue SWE-3 / GH #7). These end the process without a processor fault, so neither the
+// crash handler nor the first-chance hook above ever saw them: on Windows the CRT's abort() fast-fails (0xC0000409)
+// past every handler. Installs, once:
+// - std::set_terminate: an exception escaping a thread, a noexcept function or a destructor, or a bare terminate. The
+//   report names the exception's type and what() (Itanium ABI: any type; MSVC: std::exception and its subclasses);
+//   a pure virtual call (GCC / Clang: __cxa_pure_virtual ends in std::terminate) is told apart by its frame;
+// - Windows: a SIGABRT handler (abort() raises it before fast-failing), _set_purecall_handler and
+//   _set_invalid_parameter_handler. macOS / Linux: SIGABRT already reaches the crash handler (JUCE's signal handler).
+// `handler` gets the report ("fatal: <what happened>\n" + this thread's frames, as moduleBacktrace) on the failing
+// thread; then the process ends as it did before (abort / the CRT's own fast-fail, so Windows Error Reporting still
+// gets its dump). Not for the audio thread's normal work: these run only when the process is already ending.
+void setFatalErrorHandler (void (*handler) (const char* report)) noexcept;
+// --fataltest (SWE-3): ends the process by one of those failures on purpose, for the test of the handler above.
+// kind: "thread" (an exception escaping a std::thread), "noexcept", "destructor", "terminate" (no exception),
+// "abort", "purecall", "invalidparam" (Windows only; elsewhere returns). Returns only for an unknown kind.
+void fatalForTest (const std::string& kind) noexcept;
 // "module+0xoffset" of one code address ("" when unknown)
 std::string describeAddress (const void* address);
 
