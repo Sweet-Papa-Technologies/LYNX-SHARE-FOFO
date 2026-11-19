@@ -132,7 +132,7 @@ public:
                                                                  &typingPiano, &keepEditors, &rememberSeek, &clipsLoop, &autoClipsAtPlayback, &firstChannel, &monoPaint, &autoSelectLinked, &noTypingPriority, &hoverValues, &editInLabel, &editInBox, &undoLabel,
                                                                  &undoBox, &alternateUndo, &hintsTitle, &manageMessages, &messagesNote, &autosaveLabel, &autosaveBox, &keepLabel, &keepBox, &openBackups, &backupQuiet, &longestWaitLabel, &longestWaitBox, &unusedTakes, &detachNew,
                                                                  &sandbox, &sandboxNote, &substitutes, &substitutesNote, &limitEditors, &managePlugins, &manageShortcuts, &shortcutsNote,
-                                                                 &reportsTitle, &crashLabel, &crashBox, &crashNote, &updatesTitle, &checkUpdates, &checkNow, &updatesNote })
+                                                                 &reportsTitle, &crashLabel, &crashBox, &crashNote, &updatesTitle, &checkUpdates, &channelBox, &checkNow, &updatesNote })
             add (*c);
 
         setupFontRow();
@@ -422,13 +422,18 @@ public:
 
         // round 166b: the update check (ui/Updater.h); the Store build has none (the Store updates it)
         toggle (checkUpdates, tr ("Check for updates automatically"), options.checkUpdates, [this] (bool on) { options.checkUpdates = on; });
+        channelBox.addItem (tr ("Stable"), 1);
+        channelBox.addItem (tr ("Beta (nightly)"), 2);
+        channelBox.setSelectedId (options.betaUpdates ? 2 : 1, juce::dontSendNotification);
+        channelBox.onChange = [this] { change ([&] { options.betaUpdates = channelBox.getSelectedId() == 2; }); };
+        channelBox.setTooltip (tr ("Stable offers the weekly releases only; Beta the nightly beta builds too"));
         checkNow.onClick = [] { updater::checkNow(); };
         styleNote (updatesNote, tr ("At start-up LYNX SHARE asks GitHub for the newest version number (nothing about you is sent) and shows a bar "
                                     "when a new version is out. Help > Check for updates... asks at any time."));
-        for (auto* c : std::initializer_list<juce::Component*> { &updatesTitle, &checkUpdates, &checkNow, &updatesNote })
+        for (auto* c : std::initializer_list<juce::Component*> { &updatesTitle, &checkUpdates, &channelBox, &checkNow, &updatesNote })
             c->setVisible (updater::offered());
 
-        for (auto* b : { &templateBox, &startupProjectBox, &longestWaitBox, &languageBox, &fontBox, &scaleBox, &menuBox, &wavesBox, &noteNamesBox, &blackNotesBox, &pluginStyleBox, &animationBox, &editInBox, &undoBox, &longestWaitBox, &autosaveBox, &keepBox, &crashBox })
+        for (auto* b : { &templateBox, &startupProjectBox, &longestWaitBox, &languageBox, &fontBox, &scaleBox, &menuBox, &wavesBox, &noteNamesBox, &blackNotesBox, &pluginStyleBox, &animationBox, &editInBox, &undoBox, &longestWaitBox, &autosaveBox, &keepBox, &crashBox, &channelBox })
             styleCombo (*b);
         juce::ignoreUnused (engine, persistent);
     }
@@ -534,6 +539,8 @@ private:
             r.section (updatesTitle);
             auto row = r.full (24);
             checkNow.setBounds (row.removeFromRight (juce::jmin (row.getWidth() / 3, 150)));
+            row.removeFromRight (8);
+            channelBox.setBounds (row.removeFromRight (juce::jmin (row.getWidth() / 3, 140)));
             checkUpdates.setBounds (row.withTrimmedRight (8));
             updatesNote.setBounds (r.full (32).translated (0, -1));
         }
@@ -650,7 +657,7 @@ private:
     juce::TextButton fontReset { tr ("Reset to default") };
     juce::StringArray fontNames;
     juce::HyperlinkButton translationLink;
-    juce::ComboBox animationBox, crashBox, languageBox, scaleBox, menuBox, wavesBox, noteNamesBox, blackNotesBox, pluginStyleBox, editInBox, undoBox, autosaveBox, keepBox, longestWaitBox;
+    juce::ComboBox animationBox, crashBox, channelBox, languageBox, scaleBox, menuBox, wavesBox, noteNamesBox, blackNotesBox, pluginStyleBox, editInBox, undoBox, autosaveBox, keepBox, longestWaitBox;
     juce::ToggleButton detachNew, stereoWaves, everyKeyNames, rackColumn, rackStepColour, artMotion, reducedEffects, uiAnimations, gpuRendering, splash, startupSound, scanAtStart, menuEntry, typingPiano, keepEditors, rememberSeek, clipsLoop, autoClipsAtPlayback, firstChannel, monoPaint, hoverValues, alternateUndo, sandbox, substitutes, limitEditors, backupQuiet, unusedTakes, checkUpdates, noTypingPriority, autoSelectLinked;
     juce::TextButton openBackups { tr ("Open backup folder") }, managePlugins { tr ("Plugin manager...") }, manageShortcuts { tr ("Manage shortcuts...") },
         checkNow { tr ("Check now") }, manageMessages { tr ("Manage messages") };

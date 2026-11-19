@@ -478,13 +478,44 @@ std::vector<Release> parseReleases (const std::string& json, std::string* error)
     return releases;
 }
 
-int newestIndex (const std::vector<Release>& releases, const Version& running)
+Channel defaultChannel (const Version& running)
 {
+    return running.valid && ! running.pre.empty() ? Channel::beta : Channel::stable;
+}
+
+const char* channelId (Channel c)
+{
+    switch (c)
+    {
+        case Channel::stable: return "stable";
+        case Channel::beta: return "beta";
+        case Channel::byVersion: break;
+    }
+    return "";
+}
+
+Channel channelFromId (const std::string& id)
+{
+    if (id == "stable")
+        return Channel::stable;
+    if (id == "beta")
+        return Channel::beta;
+    return Channel::byVersion;
+}
+
+bool isPrerelease (const Release& r) { return r.prerelease || ! r.version.pre.empty(); }
+
+int newestIndex (const std::vector<Release>& releases, const Version& running, Channel channel)
+{
+    if (channel == Channel::byVersion)
+        channel = defaultChannel (running);
     int best = -1;
     for (int i = 0; i < (int) releases.size(); ++i)
     {
         const auto& r = releases[(std::size_t) i];
         if (r.draft || ! r.version.valid || compare (r.version, running) <= 0)
+            continue;
+        if (channel == Channel::stable && isPrerelease (r))
             continue;
         if (best < 0 || compare (r.version, releases[(std::size_t) best].version) > 0)
             best = i;
@@ -923,6 +954,8 @@ Settings parseSettings (const std::string& text)
         const auto key = trim (line.substr (0, eq)), value = trim (line.substr (eq + 1));
         if (key == "automatic")
             s.automatic = ! (value == "0" || value == "false" || value == "no" || value == "off");
+        else if (key == "channel")
+            s.channel = channelFromId (value);
         else if (key == "skipped")
             s.skipped = parseVersion (value).valid ? value : std::string();
         else if (key == "lastCheck")
@@ -934,11 +967,18 @@ Settings parseSettings (const std::string& text)
 std::string formatSettings (const Settings& s)
 {
     std::string out = "automatic=" + std::string (s.automatic ? "1" : "0") + "\n";
+    if (s.channel != Channel::byVersion)
+        out += "channel=" + std::string (channelId (s.channel)) + "\n";
     if (! s.skipped.empty())
         out += "skipped=" + s.skipped + "\n";
     if (s.lastCheckMs > 0)
         out += "lastCheck=" + std::to_string (s.lastCheckMs) + "\n";
     return out;
+}
+
+Channel channelFor (const Settings& s, const Version& running)
+{
+    return s.channel != Channel::byVersion ? s.channel : defaultChannel (running);
 }
 
 bool shouldShow (const Release& release, const Settings& settings, bool manual)

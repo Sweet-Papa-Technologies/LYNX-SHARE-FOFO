@@ -62,6 +62,7 @@ struct GeneralOptions
     bool limitEditors = true; // FL's "Limit the number of open plugin editors" (round 189o, core/EditorLimit.h; on as FL)
     int crashReports = 2;          // crashreport::Consent: 0 ask, 1 always send, 2 never (default: never)
     bool checkUpdates = true;      // "Check for updates automatically" (ui/Updater.h, round 166b)
+    bool betaUpdates = false;      // the update channel: Beta (nightly prereleases too) or Stable (ui/Updater.h)
     bool reducedEffects = false;
     bool uiAnimations = true;      // round 179a: panel fades, hover fades, wheel glide (ui/Motion.h)
     bool artMotion = true;         // round 170j: the Themed plugins' art moves (falling petals, glows...)
