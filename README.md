@@ -8,18 +8,23 @@
 Channel Rack, Piano Roll, Playlist and Mixer, plus a clip grid with scenes and a Simple workflow for a first song, in C++20 + JUCE 8, built to run well on any PC.<br>
 Opens FL Studio, Ableton Live and FL Studio Mobile projects (`.flp`, `.als`, `.flm`). Windows, macOS and Linux.</p>
 
+<p align="center"><em>This is <strong>LYNX-SHARE-FOFO</strong>, Sweet Papa Technologies' fork of
+<a href="https://github.com/Ka1-S/LYNX-SHARE">Ka1-S/LYNX-SHARE</a>, the original LYNX SHARE by Ka1-S.<br>
+Downloads, releases and issues below are this fork's; the original project lives at
+<a href="https://github.com/Ka1-S/LYNX-SHARE">github.com/Ka1-S/LYNX-SHARE</a> and <a href="https://lynx-share.com">lynx-share.com</a>.</em></p>
+
 <p align="center">
-  <a href="https://github.com/Ka1-S/LYNX-SHARE/releases"><img src="https://img.shields.io/badge/Download-0.1.26%20alpha-d9534f?style=for-the-badge" alt="Download LYNX SHARE"></a>
+  <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/latest"><img src="https://img.shields.io/github/v/release/Sweet-Papa-Technologies/LYNX-SHARE-FOFO?style=for-the-badge&label=Download&color=d9534f" alt="Download LYNX SHARE"></a>
   <a href="https://apps.microsoft.com/detail/9NQRFBFDCX6N"><img src="https://get.microsoft.com/images/en-us%20dark.svg" height="28" alt="Get it from Microsoft"></a>
-  <a href="https://github.com/Ka1-S/LYNX-SHARE/releases"><img src="https://img.shields.io/github/downloads/Ka1-S/LYNX-SHARE/total?style=for-the-badge&label=downloads&color=24292f" alt="Total downloads"></a>
-  <a href="https://github.com/Ka1-S/LYNX-SHARE/stargazers"><img src="https://img.shields.io/github/stars/Ka1-S/LYNX-SHARE?style=for-the-badge&color=24292f" alt="GitHub stars"></a>
+  <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases"><img src="https://img.shields.io/github/downloads/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/total?style=for-the-badge&label=downloads&color=24292f" alt="Total downloads"></a>
+  <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/stargazers"><img src="https://img.shields.io/github/stars/Sweet-Papa-Technologies/LYNX-SHARE-FOFO?style=for-the-badge&color=24292f" alt="GitHub stars"></a>
   <a href="https://discord.gg/XHKkbtbkY"><img src="https://img.shields.io/badge/Discord-join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the LYNX SHARE Discord"></a>
 </p>
 
 <p align="center">
-  <a href="https://lynx-share.com"><strong>Website</strong></a> ·
+  <a href="https://lynx-share.com"><strong>Original project website</strong></a> ·
   <a href="https://discord.gg/XHKkbtbkY"><strong>Discord</strong></a> ·
-  <a href="https://github.com/Ka1-S/LYNX-SHARE/releases"><strong>Download</strong></a> ·
+  <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/latest"><strong>Download</strong></a> ·
   <a href="#features"><strong>Features</strong></a> ·
   <a href="#opens-your-projects">Your projects</a> ·
   <a href="docs/USER_GUIDE.md">User guide</a> ·
@@ -30,7 +35,7 @@ Opens FL Studio, Ableton Live and FL Studio Mobile projects (`.flp`, `.als`, `.f
 </p>
 
 <p align="center">
-  <a href="https://github.com/Ka1-S/LYNX-SHARE/actions/workflows/tests.yml"><img src="https://github.com/Ka1-S/LYNX-SHARE/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/actions/workflows/tests.yml"><img src="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/C%2B%2B-20-ef7b22" alt="C++20">
   <img src="https://img.shields.io/badge/JUCE-8-8a8a8a" alt="JUCE 8">
   <img src="https://img.shields.io/badge/Windows-10%20%C2%B7%2011-24292f" alt="Windows 10 and 11">
@@ -308,7 +313,7 @@ instruments play LYNX's built-in synth for now, and anything not converted is li
 
 ## Download
 
-Every release on the [latest release page](https://github.com/Ka1-S/LYNX-SHARE/releases) has builds for all three
+Every release on the [latest release page](https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/latest) has builds for all three
 platforms (`<v>` is the version, e.g. `0.1.10-alpha`):
 
 | OS | Download | Notes |
@@ -536,11 +541,13 @@ Developer ID, not notarized); Linux packages are not signed.
 **Privacy:** This program will not transfer any information to other networked systems unless specifically
 requested by the user or the person installing or operating it. See [`PRIVACY.md`](PRIVACY.md).
 
-**Crash reports (opt-in):** after a crash or freeze LYNX SHARE asks before sending a report to lynx-share.com (*Send* /
-*Show what will be sent* / *Don't send*, or *Report on GitHub instead*); Settings › General › Crash reports sets *Ask*
-(default), *Always send* or *Never send*, and Help › Report a problem… sends one by hand. A report has the LYNX SHARE
-version, OS, CPU, graphics card and driver, audio device, the crash or freeze file, the last steps and the loaded
-third-party plugins — no audio, projects, file names, user or machine name, and the server stores no IP address.
+**Crash reports (off by default):** in this fork crash reports are never uploaded unless whoever runs LYNX SHARE
+sets the `LYNX_CRASH_ENDPOINT` environment variable to a server of their own; nothing is sent to upstream's
+lynx-share.com. Settings › General › Crash reports defaults to *Never send* (crash and freeze files stay on your
+computer); *Report on GitHub instead* opens a prefilled issue on [`Sweet-Papa-Technologies/LYNX-SHARE-FOFO`](https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues),
+where you see and edit everything before posting. A report has the LYNX SHARE version, OS, CPU, graphics card and
+driver, audio device, the crash or freeze file, the last steps and the loaded third-party plugins — no audio,
+projects, file names, user or machine name.
 Details and how to have a report deleted: [`PRIVACY.md`](PRIVACY.md#crash-reports-opt-in).
 
 ## License
@@ -550,7 +557,7 @@ redistribute it; anyone who distributes a modified version (including as a netwo
 code under the same license.
 
 <p align="center">
-  <a href="https://star-history.com/#Ka1-S/LYNX-SHARE&Date">
-    <img src="https://api.star-history.com/svg?repos=Ka1-S/LYNX-SHARE&type=Date" alt="Star history" width="600">
+  <a href="https://star-history.com/#Sweet-Papa-Technologies/LYNX-SHARE-FOFO&Date">
+    <img src="https://api.star-history.com/svg?repos=Sweet-Papa-Technologies/LYNX-SHARE-FOFO&type=Date" alt="Star history" width="600">
   </a>
 </p>
