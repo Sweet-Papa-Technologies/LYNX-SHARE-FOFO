@@ -137,6 +137,7 @@ SampleRef readSample (Bytes body)
 {
     SampleRef s;
     const std::size_t start = isMagic (body, 0, "LS") ? 4 : 0;
+    bool haveStr1 = false;
     for (const auto& c : chunksOf (body, start))
     {
         Reader r { c.body };
@@ -145,6 +146,41 @@ SampleRef readSample (Bytes body)
             r.u32();
             r.f64();
             s.name = r.fixed (512);
+            r.fixed (512); // folder
+            if (r.has (15))
+            {
+                s.reverse = r.u8() != 0;
+                const auto shift = r.f64();
+                r.f32();
+                s.cutGroup = r.u8();
+                s.polyphonic = r.u8() != 0;
+                s.timeShift = std::isfinite (shift) ? shift : 0.0;
+            }
+        }
+        else if (c.tag == "LINk")
+        {
+            s.slotId = r.i32 (-1);
+            r.i32 (-1);
+            r.u16();
+            s.outputChannel = r.has (4) ? r.i32 (-1) : -1;
+        }
+        else if (c.tag == "PATH") // the legacy fixed path (FLM still reads it; drum templates and old kits)
+        {
+            if (auto path = r.fixed (2048); s.savedPath.empty() && ! path.empty())
+                s.savedPath = std::move (path);
+        }
+        else if (c.tag == "STRC") // the legacy stretch: mode, ratio, pitch as a ratio (STR1 wins when both are there)
+        {
+            const auto mode = r.u8();
+            const auto stretch = r.f64 (1.0);
+            const auto ratio = r.f64 (1.0);
+            if (r.ok && ! haveStr1)
+            {
+                s.stretchMode = mode;
+                s.stretch = stretch;
+                s.pitch = ratio > 0.0 && std::isfinite (ratio) ? 12.0 * std::log2 (ratio) : 0.0;
+                s.legacyStretch = true;
+            }
         }
         else if (c.tag == "PTH1")
         {
@@ -166,13 +202,16 @@ SampleRef readSample (Bytes body)
         }
         else if (c.tag == "STR1")
         {
-            s.stretchMode = r.u8();
+            const auto mode1 = r.u8();
             const auto stretch = r.f64 (1.0);
             const auto pitch = r.f64 (0.0);
             if (r.ok)
             {
+                s.stretchMode = mode1;
                 s.stretch = stretch;
                 s.pitch = pitch;
+                s.legacyStretch = false;
+                haveStr1 = true;
             }
         }
         else if (c.tag == "PRMS")
@@ -241,6 +280,18 @@ Rack readRack (Bytes body)
         }
         else if (c.tag == "RMOd" || c.tag == "RMOD")
             rack.modules.push_back (readModule (c.body));
+        else if (c.tag == "CCLK") // round 190dw item 4: (cc, module instance, parameter) triples
+        {
+            Reader f { c.body };
+            while (f.has (12))
+            {
+                Rack::CcLink link;
+                link.cc = f.i32();
+                link.module = f.i32();
+                link.param = f.i32();
+                rack.ccLinks.push_back (link);
+            }
+        }
     }
     return rack;
 }
@@ -331,7 +382,7 @@ Channel readChannel (Bytes body)
             ch.order = f.f64 (ch.order);
             if (! f.has (1084 - f.pos))
                 continue; // (an older channel header ends here)
-            f.f32();
+            ch.hue = f.f32 (-1.0f); // (round 190fn: the channel's colour as a hue, PROVEN-REA FLM 5.0.3 CSeqChannel::SetState)
             f.f64();
             f.f64();
             f.u32();
@@ -367,8 +418,8 @@ void readHead (Bytes body, Project& p)
     r.pos += 4 * 8 + 16;     // view state and the project GUID
     if (! r.has (8))
         return;
+    p.root = r.u32(); // (round 190ds: +344 is the root 0..11, +348 the scale index; every file on disk agrees)
     p.scale = r.u32();
-    p.root = r.u32();
     r.u8();
     r.u8();
     r.u32(); // the channel-id counter
@@ -380,11 +431,11 @@ void readMeta (Bytes body, Project& p)
 {
     Reader r { body };
     p.created = r.fixed (256);
-    r.f64();
+    p.editSeconds = r.f64(); // (round 190fn: the time spent on the song)
     p.author = r.fixed (256);
     p.originalName = r.fixed (256);
     r.u8();
-    r.pos += 2048; // notes
+    p.notes = r.fixed (2048); // (round 190fn: the song's notes / description)
     p.saved = r.fixed (256);
 }
 
@@ -467,6 +518,27 @@ ModuleCategory moduleCategory (std::uint32_t type) noexcept
     return r != nullptr ? r->category : ModuleCategory::unknown;
 }
 
+std::uint32_t channelColour (float hue) noexcept
+{
+    // CSeqChannel::MakeChannelColor: HSL with the hue 0.73·h + 0.83 (one wrap), saturation 0.9, lightness 0.63;
+    // CColor::SetHSL is the usual HSL → RGB with each channel clamped to 0…1
+    const auto h0 = std::clamp (std::isfinite (hue) ? hue : 0.0f, 0.0f, 1.0f) * 0.73f + 0.83f;
+    const float s = 0.9f, l = 0.63f;
+    const auto q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
+    const auto p = 2.0f * l - q;
+    const auto channel = [p, q] (float t) {
+        if (t < 0.0f)
+            t += 1.0f;
+        if (t > 1.0f)
+            t -= 1.0f;
+        float v = t < 1.0f / 6.0f ? p + (q - p) * 6.0f * t : t < 0.5f ? q : t < 2.0f / 3.0f ? p + (q - p) * (4.0f - 6.0f * t) : p;
+        v = std::clamp (v, 0.0f, 1.0f);
+        return (std::uint32_t) std::lround (v * 255.0f);
+    };
+    const auto r = channel (h0 + 1.0f / 3.0f), g = channel (h0), b = channel (h0 - 1.0f / 3.0f);
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
 bool isFlmData (const std::uint8_t* data, std::size_t size) noexcept
 {
     if (data == nullptr || size < 12 || std::memcmp (data, "10LF", 4) != 0)
@@ -479,7 +551,7 @@ bool isFlmData (const std::uint8_t* data, std::size_t size) noexcept
     return (std::size_t) first <= size - 12;
 }
 
-std::optional<Project> parse (Bytes bytes, std::string* error)
+std::optional<Project> parse (Bytes bytes, std::string* error, bool racksOnly)
 {
     const auto fail = [error] (const char* why) -> std::optional<Project> {
         if (error != nullptr)
@@ -521,7 +593,7 @@ std::optional<Project> parse (Bytes bytes, std::string* error)
         else
             ++p.unknownChunks;
     }
-    if (p.channels.empty())
+    if (p.channels.empty() && ! racksOnly)
         return fail ("the project has no channels");
     return p;
 }

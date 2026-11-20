@@ -1,9 +1,13 @@
+#include "ui/TypeAhead.h"
 #include "ui/PluginPresetMenu.h"
+#include "ui/ExternalDrag.h"
+#include "ui/GeneratorPresetMenu.h"
 #include "ui/FileChoosers.h"
 #include "ui/QuickPick.h"
 #include "engine/FlStudio.h"
 #include "ui/BrowserComponent.h"
 
+#include "core/UserFolders.h"
 #include "core/PluginDbFolder.h"
 
 #include "ui/AudioClipboard.h"
@@ -11,9 +15,18 @@
 #include "ui/UiTrace.h"
 
 #include "core/ControlSurface.h"
+#include "core/EffectPresets.h"
+#include "core/FlEffects.h"
+#include "core/PresetCycle.h"
+#include "ui/PluginHeader.h"
+#include "core/NativeEngines.h"
 #include "core/VoltageController.h"
 #include "core/FlpImport.h"
 #include "core/ProjectContents.h"
+#include "core/FactoryContent.h"
+#include "core/FactoryLoops.h" // (rollup 0.1.30 step 6: LYNX content in the Loop Browser)
+#include "core/LayoutStyle.h"
+#include "core/SoundLibrary.h"
 #include "core/SearchIndex.h"
 #include "core/SearchQuery.h"
 #include "core/SearchService.h"
@@ -23,15 +36,42 @@
 #include "core/ValueMath.h"
 #include "core/Vfx.h"
 #include "platform/Paths.h"
+#include "platform/CrashGuard.h"
+#include "core/FolderWatcher.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <thread>
+
+#if JUCE_WINDOWS
+ #ifndef NOMINMAX
+  #define NOMINMAX
+ #endif
+ #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+ #endif
+ #include <windows.h>
+#else
+ #include <sys/resource.h>
+ #include <unistd.h>
+ #if JUCE_LINUX
+  #include <sys/syscall.h>
+ #endif
+#endif
+
+#include <deque>
 #include <mutex>
+#include <unordered_map>
 #include "engine/PluginHost.h"
 #include "engine/Text.h"
 #include "ui/HintBar.h"
+#include "ui/PluginWindow.h" // round 190iz (the focused plugin window)
 #include "ui/I18n.h"
 #include "ui/Icons.h"
 #include "ui/PlaylistComponent.h"
 #include "ui/Theme.h"
+#include "ui/LabelFont.h"
 #include "ui/ValueControl.h"
 #include "ui/WaveformView.h"
 #include "ui/AudioEditor.h"
@@ -39,10 +79,14 @@
 #include "ui/ChannelRackComponent.h"
 #include "ui/MixerComponent.h"
 #include "ui/SoundFontEditor.h"
+#include "ui/SamplerImportUi.h"
 #include "ui/ToolWindow.h"
+#include "ui/WorkflowExtras.h" // round 190iu (issue #191.6)
+#include "ui/LoopInfo.h" // round 190kx
 
 namespace lynx
 {
+juce::ChangeBroadcaster& loopLengthsRead(); // (round 190mf, ui/LoopBrowserParts.inc: the Simple loop rows' lengths read)
 namespace
 {
 bool isAudio (const juce::File& f)
@@ -52,10 +96,11 @@ bool isAudio (const juce::File& f)
 
 bool isListed (const juce::File& f)
 {
-    return f.hasFileExtension ("wav;flac;ogg;mp3;aif;aiff;wv;mid;midi;lynx;flp;als;flm;fst;sf2;sf3;sfz");
+    return f.hasFileExtension ("wav;flac;ogg;mp3;aif;aiff;wv;ncw;mid;midi;lynx;flp;als;flm;fst;sf2;sf3;sfz;dwp;dwb;gig");
 }
 
 constexpr int maxResults = 500;
+constexpr int maxLoops = 20000; // round gaps190kf: the files the Loop Browser describes at most
 constexpr int maxSimilar = 100; // "Find similar samples" lists the nearest 100
 
 juce::Array<juce::File> childrenOf (const juce::File& folder)
@@ -125,7 +170,7 @@ Icon iconFor (const juce::File& f, bool folder)
         return Icon::pianoRoll;
     if (f.hasFileExtension ("lynx;flp;als;flm"))
         return Icon::project;
-    if (f.hasFileExtension ("fst;sf2;sf3;sfz;lynxpreset;fxp;fxb;vstpreset"))
+    if (f.hasFileExtension ("fst;sf2;sf3;sfz;lynxpreset;fxp;fxb;vstpreset;adv;adg;dwp;dwb;gig")) // (round 190hr: Live device / rack presets; round 190ii: sampler instruments)
         return Icon::preset;
     return Icon::file;
 }
@@ -146,12 +191,17 @@ juce::String rowHint (const juce::File& f, bool folder, bool expanded)
         return tr ("Mixer preset: [2xLMB] load it onto the selected mixer tracks  drag onto a mixer track (onto the empty mixer space: a new track)");
     if (f.hasFileExtension ("fst"))
         return tr ("Preset: [2xLMB] new channel with it (FL synth presets)  drag onto a mixer insert: effect preset");
+    if (f.hasFileExtension ("lynxpreset") && f.isAChildOf (genpresetui::root()))
+        return tr ("Generator preset: [2xLMB] new channel with it");
     if (f.hasFileExtension ("lynxpreset;fxp;fxb;vstpreset"))
         return tr ("Plugin preset: [2xLMB] load it into its plugin (an open plugin window, or the selected channel's plugin)");
     if (f.hasFileExtension ("sfz"))
         return tr ("SFZ instrument: [LMB] preview  [2xLMB] new LYNX Soundfont channel (or into the selected one)  drag to the Channel Rack");
     if (f.hasFileExtension ("sf2;sf3;sfz"))
         return tr ("SoundFont: [LMB] preview its first preset  [2xLMB] new LYNX Soundfont channel (or into the selected one)  drag to the Channel Rack");
+    if (isSamplerInstrumentFile (f))
+        return tr ("Sampler instrument (DirectWave, GigaStudio): [2xLMB] new DirectWave channel  [Enter] into the selected DirectWave channel  "
+                   "drag to the Channel Rack");
     return {};
 }
 
@@ -248,6 +298,235 @@ DraggedPlugin& draggedPlugin()
 
 // --- search: the process's search worker ------------------------------------------------------------
 
+// Round 190hd: the indexer process (REA 190hc action 5, parts 2-3, after Live's Indexer: "StartIndex" runs the library
+// indexer as a separate process at a low priority and rescans on file-system events). The Browser's index of its
+// folders (core/SearchIndex.h) is kept up to date by `LYNX --browser-indexer <pid> <roots file>`: a child at the
+// lowest priority (Windows: idle class + background mode, so its disk reads are low priority too; elsewhere nice 19
+// and, on Linux, the idle I/O class) that walks the folders whose times changed, writes the index file, tells this
+// process, and then sleeps on the system's change notifications for those trees (core/FolderWatcher.h) until the
+// next change. It never shares a thread, a lock or a frame with the UI; it ends with its parent. This process then
+// saves nothing and only takes in what the child wrote (search::Service::setExternalIndexer / reload). A child that
+// cannot start or ends: the in-process pass as before.
+namespace
+{
+juce::File indexFile() { return platform::settingsFile ("browser-index.txt"); }
+juce::File indexRootsFile() { return platform::settingsFile ("browser-index-roots.txt"); }
+
+std::string loadIndexText()
+{
+    const auto f = indexFile();
+    juce::MemoryBlock data;
+    if (! f.existsAsFile() || f.getSize() > 256 * 1024 * 1024 || ! f.loadFileAsData (data))
+        return std::string();
+    return std::string (static_cast<const char*> (data.getData()), data.getSize());
+}
+
+void saveIndexText (const std::string& text)
+{
+    const auto f = indexFile();
+    const auto temp = f.getSiblingFile (f.getFileName() + ".tmp");
+    if (temp.replaceWithData (text.data(), text.size()))
+        temp.moveFileTo (f);
+}
+
+#if JUCE_WINDOWS
+juce::String indexerSignalName (juce::int64 parentPid) { return "Local\\LYNX-browser-index-" + juce::String (parentPid); }
+#endif
+
+juce::int64 thisProcessId()
+{
+#if JUCE_WINDOWS
+    return (juce::int64) GetCurrentProcessId();
+#else
+    return (juce::int64) getpid();
+#endif
+}
+
+class IndexerProcess
+{
+public:
+    explicit IndexerProcess (search::Service& s) : service (s) {}
+    ~IndexerProcess() { stop(); }
+
+    // starts the child for these folders (once; again when they change); false: it could not start
+    bool start (const std::vector<std::string>& folders)
+    {
+        if (watcher.joinable() && folders == roots && child.isRunning())
+            return true;
+        stop();
+        roots = folders;
+        juce::StringArray lines;
+        for (const auto& r : roots)
+            lines.add (juce::String::fromUTF8 (r.c_str()));
+        if (! indexRootsFile().replaceWithText (lines.joinIntoString ("\n") + "\n"))
+            return false;
+       #if JUCE_WINDOWS
+        signal = CreateEventW (nullptr, FALSE, FALSE, indexerSignalName (thisProcessId()).toWideCharPointer());
+        if (signal == nullptr)
+            return false;
+       #endif
+        const juce::StringArray args { juce::File::getSpecialLocation (juce::File::currentExecutableFile).getFullPathName(), "--browser-indexer",
+                                       juce::String (thisProcessId()), indexRootsFile().getFullPathName() };
+       #if JUCE_WINDOWS
+        const auto started = child.start (args, 0);
+       #else
+        const auto started = child.start (args, juce::ChildProcess::wantStdOut);
+       #endif
+        if (! started)
+        {
+            closeSignal();
+            return false;
+        }
+        service.setExternalIndexer (true);
+        stopping = false;
+        watcher = std::thread ([this] { watch(); });
+        return true;
+    }
+
+    void stop()
+    {
+        stopping = true;
+        if (child.isRunning())
+            child.kill(); // (our own child; a write it was making is a temporary file, replaced by the next)
+       #if JUCE_WINDOWS
+        if (signal != nullptr)
+            SetEvent (signal);
+       #endif
+        if (watcher.joinable())
+            watcher.join();
+        closeSignal();
+        service.setExternalIndexer (false);
+    }
+
+private:
+    // (its own thread) the child's news: the index file was written
+    void watch()
+    {
+        for (;;)
+        {
+           #if JUCE_WINDOWS
+            const auto woken = WaitForSingleObject (signal, 2000) == WAIT_OBJECT_0;
+            if (stopping)
+                return;
+            if (woken)
+                service.reload();
+            if (child.isRunning())
+                continue;
+           #else
+            char c = 0;
+            if (child.readProcessOutput (&c, 1) == 1) // (blocks; one byte at a time: a line is a write)
+            {
+                if (c == '\n')
+                    service.reload();
+                continue;
+            }
+            if (stopping)
+                return;
+           #endif
+            // the child ended on its own (a crash): this process indexes again, as before
+            service.setExternalIndexer (false);
+            service.refresh (roots);
+            return;
+        }
+    }
+
+    void closeSignal()
+    {
+       #if JUCE_WINDOWS
+        if (signal != nullptr)
+            CloseHandle (signal);
+        signal = nullptr;
+       #endif
+    }
+
+    search::Service& service;
+    juce::ChildProcess child;
+    std::vector<std::string> roots;
+    std::atomic<bool> stopping { false };
+   #if JUCE_WINDOWS
+    HANDLE signal = nullptr;
+   #endif
+    std::thread watcher;
+};
+
+// (the child) the lowest priority for the CPU and the disk
+void lowerIndexerPriority()
+{
+#if JUCE_WINDOWS
+    // background mode first (low disk and memory priority), then the idle class (the order: setting background mode
+    // left the class at Normal, measured)
+    SetPriorityClass (GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN);
+    SetPriorityClass (GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+#else
+    setpriority (PRIO_PROCESS, 0, 19);
+ #if JUCE_LINUX
+    syscall (SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, 3 << 13 /* IOPRIO_CLASS_IDLE */);
+ #endif
+#endif
+}
+
+// (the child) returns when the parent process has ended
+void waitForParentEnd (juce::int64 parentPid)
+{
+#if JUCE_WINDOWS
+    if (const auto parent = OpenProcess (SYNCHRONIZE, FALSE, (DWORD) parentPid))
+    {
+        WaitForSingleObject (parent, INFINITE);
+        CloseHandle (parent);
+    }
+#else
+    while (getppid() == (pid_t) parentPid)
+        std::this_thread::sleep_for (std::chrono::seconds (2));
+#endif
+}
+} // namespace
+
+int BrowserComponent::runIndexerProcess (const juce::StringArray& args)
+{
+    const auto i = args.indexOf ("--browser-indexer");
+    const auto parentPid = args[i + 1].getLargeIntValue();
+    const juce::File rootsFile (args[i + 2].unquoted());
+    lowerIndexerPriority();
+    std::thread ([parentPid] {
+        waitForParentEnd (parentPid);
+        crashguard::exitNow (0);
+    }).detach();
+
+    std::vector<std::string> roots;
+    juce::StringArray lines;
+    lines.addLines (rootsFile.loadFileAsString());
+    for (const auto& line : lines)
+        if (line.isNotEmpty() && juce::File::isAbsolutePath (line) && juce::File (line).isDirectory())
+            roots.push_back (line.toStdString());
+
+#if JUCE_WINDOWS
+    const auto signal = OpenEventW (EVENT_MODIFY_STATE, FALSE, indexerSignalName (parentPid).toWideCharPointer());
+#endif
+    search::Service::Callbacks cb;
+    cb.load = loadIndexText;
+    cb.save = saveIndexText;
+    cb.indexChanged = [&] { // (the file is written by then)
+#if JUCE_WINDOWS
+        if (signal != nullptr)
+            SetEvent (signal);
+#else
+        std::fputs ("changed\n", stdout);
+        std::fflush (stdout);
+#endif
+    };
+    search::Service service (diskFileSystem(), std::move (cb));
+    if (! roots.empty())
+        service.refresh (roots);
+    // then a pass after each change in those trees (a copy of a whole library: once it has been quiet for 2 s)
+    folderwatch::Options options;
+    options.quietMs = 2000;
+    options.maxDelayMs = 10000;
+    options.pollMs = 30000; // (where there are no notifications: a tree's folder times, every 30 s)
+    folderwatch::Watcher watcher (roots, [&service, roots] { service.refresh (roots); }, options);
+    for (;;)
+        std::this_thread::sleep_for (std::chrono::hours (1)); // (ends with the parent: waitForParentEnd)
+}
+
 // The Browser's search index and its worker (core/SearchService.h, round 162): one per process while a Browser exists,
 // the index kept in the settings folder between sessions. Its news reach the Browsers through two broadcasters (they
 // are thread-safe and coalesce); the worker is joined (never killed) before they go.
@@ -255,10 +534,28 @@ struct BrowserComponent::SearchShared
 {
     juce::ChangeBroadcaster statusChanged, indexChanged;
     std::unique_ptr<search::Service> service; // (last: goes first)
+    std::unique_ptr<IndexerProcess> indexer;  // (round 190hd; before the service)
 
-    ~SearchShared() { service.reset(); }
+    ~SearchShared()
+    {
+        indexer.reset();
+        service.reset();
+    }
 
-    static juce::File file() { return platform::settingsFile ("browser-index.txt"); }
+    static juce::File file() { return indexFile(); }
+
+    // the background pass over these folders: by the indexer process where it may run, else here (round 190hd)
+    void refreshInBackground (std::vector<std::string> roots)
+    {
+        if (allowIndexerProcess && juce::SystemStats::getEnvironmentVariable ("LYNX_INDEXER_PROCESS", {}) != "0")
+        {
+            if (indexer == nullptr)
+                indexer = std::make_unique<IndexerProcess> (*service);
+            if (indexer->start (roots))
+                return;
+        }
+        service->refresh (std::move (roots));
+    }
 
     static std::shared_ptr<SearchShared> get()
     {
@@ -267,19 +564,8 @@ struct BrowserComponent::SearchShared
             return s;
         auto s = std::make_shared<SearchShared>();
         search::Service::Callbacks cb;
-        cb.load = [] {
-            const auto f = file();
-            juce::MemoryBlock data;
-            if (! f.existsAsFile() || f.getSize() > 256 * 1024 * 1024 || ! f.loadFileAsData (data))
-                return std::string();
-            return std::string (static_cast<const char*> (data.getData()), data.getSize());
-        };
-        cb.save = [] (const std::string& text) {
-            const auto f = file();
-            const auto temp = f.getSiblingFile (f.getFileName() + ".tmp");
-            if (temp.replaceWithData (text.data(), text.size()))
-                temp.moveFileTo (f);
-        };
+        cb.load = loadIndexText;
+        cb.save = saveIndexText;
         cb.statusChanged = [raw = s.get()] { raw->statusChanged.sendChangeMessage(); };
         cb.indexChanged = [raw = s.get()] { raw->indexChanged.sendChangeMessage(); };
         s->service = std::make_unique<search::Service> (diskFileSystem(), std::move (cb));
@@ -378,12 +664,35 @@ private:
 
 // --- the tree (and, flat, the search results) ---------------------------------------------------------
 
+// round 190iz: the tab icons, the row star, the TAGS button, the tags panel, the Live sidebar
+#include "ui/BrowserTagsLive.inc"
+#include "ui/LoopBrowserPanel.inc" // round gaps190kf
+
 class BrowserComponent::FileTree final : public juce::Component,
                                          public ui::HintSource,
                                          public juce::FileDragAndDropTarget
 {
 public:
-    static constexpr int rowHeight = 22;
+    // FL layout: 24 px rows (design slice FM-S7 / finding FM-9: FL's tree rows are 23 px with a larger face than LYNX's
+    // 22 px ones); the Clip-launch layout's Live-style list: 19 px (Live's row pitch, CL-22). Round 190iz.
+    static constexpr int flRowHeight = 24, liveRowHeight = 19;
+    int rowHeight = flRowHeight;
+    void setLiveRows (bool live)
+    {
+        const auto h = live ? liveRowHeight : flRowHeight;
+        if (h == rowHeight)
+            return;
+        rowHeight = h;
+        updateSize();
+        repaint();
+    }
+    // the hover star's box on a row (FL: "the star that appears at the end of the content"); empty: none there
+    juce::Rectangle<int> starBox (int row) const
+    {
+        if (! juce::isPositiveAndBelow (row, (int) rows.size()) || itemOf (*rows[(std::size_t) row]).empty())
+            return {};
+        return { getWidth() - 20, row * rowHeight, 16, rowHeight };
+    }
 
     FileTree (BrowserComponent& b, bool isFlat) : browser (b), flat (isFlat)
     {
@@ -399,7 +708,9 @@ public:
         category, // one of its sections
         item,     // something of the project (pattern, sample, generator, effect, automation clip, undo step)
         plugins,  // the Plugin database and its folders (round 142): built-in, FL engines, installed plugins
-        plugin    // one of its plugins (double-click adds it)
+        plugin,   // one of its plugins (double-click adds it)
+        collection, // a collection's heading in the STARRED tab (round 190ce): its items are its children
+        factory     // round 190ke: "LYNX content" and its folders (the Simple layout): LYNX's own sounds, beats, chains
     };
 
     struct Node
@@ -413,6 +724,8 @@ public:
         std::vector<std::unique_ptr<Node>> children;
 
         juce::String label, detail; // display name (empty: the file's) and the dimmed detail after it
+        juce::String loopText; // round 190kx: a loop's bars, tempo and key (the Simple layout's rows; empty: not known)
+        bool loopKnown = false; // (the worker answered for this file)
         juce::Colour colour;        // transparent: the default
         Icon icon = Icon::none;     // none: by file type
         Category category = Category::samples;
@@ -433,7 +746,189 @@ public:
         // entries ("LYNX", "FL engines", "VFX"; "" = Installed itself), core/PluginDbFolder.h groupFolder()
         std::string group;
         bool isGroup = false;
+        int collection = -1; // kind == collection: which one (0 = Starred)
     };
+
+    // What a row is to the collections (core/BrowserCollections.h): a file's or folder's path, a Plugin database
+    // entry's key; empty = a row that can't be in one (the project's items, headings).
+    static std::string itemOf (const Node& n)
+    {
+        if (n.kind == Kind::plugin)
+            return n.pluginKey.empty() ? std::string() : collections::pluginItem (n.pluginKey);
+        if ((n.kind == Kind::file || n.kind == Kind::fsFolder) && n.file != juce::File())
+            return n.file.getFullPathName().toStdString();
+        return {};
+    }
+    std::string selectedItem() const { return juce::isPositiveAndBelow (selected, (int) rows.size()) ? itemOf (*rows[(std::size_t) selected]) : std::string(); }
+    const Node* selectedNode() const { return juce::isPositiveAndBelow (selected, (int) rows.size()) ? rows[(std::size_t) selected] : nullptr; }
+    juce::String selectedLabel() const
+    {
+        const auto* n = selectedNode();
+        return n == nullptr ? juce::String() : n->label.isNotEmpty() ? n->label : n->file.getFileName();
+    }
+    static std::unique_ptr<Node> makeCollection (int collection, int itemCount, bool open)
+    {
+        auto n = std::make_unique<Node>();
+        n->kind = Kind::collection;
+        n->collection = collection;
+        n->folder = n->loaded = true;
+        n->expanded = open;
+        n->label = BrowserComponent::collectionName (collection);
+        n->detail = juce::String (itemCount);
+        n->colour = BrowserComponent::collectionColour (collection);
+        return n;
+    }
+    // A Plugin database entry outside the database's tree (a collection's item): the same row, double-click and drag.
+    static std::unique_ptr<Node> makePluginItem (BrowserComponent& browser, const std::string& key)
+    {
+        if (factorycontent::isKey (key)) // (round 190ke: LYNX's own content in a collection or a tag search)
+            return makeFactoryItem (browser, key);
+        auto safe = juce::Component::SafePointer<BrowserComponent> (&browser);
+        for (int generators = 1; generators >= 0; --generators)
+        {
+            auto n = std::make_unique<Node>();
+            n->kind = Kind::plugin;
+            n->pluginKey = key;
+            if (generators == 1)
+            {
+                for (auto& e : quickpick::generatorEntries (browser.engine))
+                    if (e.key == key)
+                    {
+                        n->label = quickpick::shownName (browser.engine, e.key, e.label);
+                        n->original = e.label;
+                        n->detail = e.detail;
+                        n->icon = e.folder == 3 ? Icon::plugin : Icon::keyboard;
+                        n->generator = e.make;
+                        n->activate = [safe, make = e.make] {
+                            if (auto c = make(); c && safe != nullptr && safe->onAddInstrument)
+                                safe->onAddInstrument (std::move (*c));
+                        };
+                        return n;
+                    }
+            }
+            else
+                for (auto& e : quickpick::effectEntries (browser.engine))
+                    if (e.key == key)
+                    {
+                        n->label = quickpick::shownName (browser.engine, e.key, e.label);
+                        n->original = e.label;
+                        n->detail = e.detail;
+                        n->icon = e.folder == 3 ? Icon::plugin : Icon::mixer;
+                        n->effect = e.make;
+                        n->activate = [safe, make = e.make] {
+                            if (auto fx = make(); fx && safe != nullptr && safe->onAddEffect)
+                                safe->onAddEffect (std::move (*fx));
+                        };
+                        return n;
+                    }
+        }
+        return nullptr; // (the plugin is not installed any more: the collection leaves it out)
+    }
+
+    // Round 190ke (owner decision D2): one item of LYNX's own content, a plugin-like row (double-click / Enter: add it;
+    // drag a sound onto the Channel Rack) whose key the collections and the tags store; nullptr for an unknown key
+    static std::unique_ptr<Node> makeFactoryItem (BrowserComponent& browser, const std::string& key)
+    {
+        const auto* item = factorycontent::find (key);
+        if (item == nullptr)
+            return nullptr;
+        auto safe = juce::Component::SafePointer<BrowserComponent> (&browser);
+        auto n = std::make_unique<Node>();
+        n->kind = Kind::plugin;
+        n->pluginKey = key;
+        n->label = n->original = juce::String::fromUTF8 (item->name.c_str());
+        n->detail = juce::String::fromUTF8 (item->detail.c_str());
+        if (item->kind == factorycontent::Kind::sound)
+        {
+            n->icon = Icon::keyboard;
+            const auto index = item->index;
+            n->generator = [index]() -> std::optional<ChannelDef> {
+                const auto& sounds = soundlib::builtIn();
+                return index >= 0 && index < (int) sounds.size() ? soundlib::channelFor (sounds[(std::size_t) index]) : std::nullopt;
+            };
+            n->activate = [safe, make = n->generator, key] {
+                if (safe != nullptr && safe->onFactoryItem) // (the Simple layout: a new instrument track)
+                    safe->onFactoryItem (key);
+                else if (auto c = make(); c && safe != nullptr && safe->onAddInstrument)
+                    safe->onAddInstrument (std::move (*c));
+            };
+        }
+        else
+        {
+            n->icon = item->kind == factorycontent::Kind::beat ? Icon::note : Icon::mixer;
+            n->activate = [safe, key] {
+                if (safe != nullptr && safe->onFactoryItem)
+                    safe->onFactoryItem (key);
+            };
+        }
+        return n;
+    }
+    // "LYNX content" with its three folders, each by category / genre (built open or closed as `open` remembers)
+    static std::unique_ptr<Node> makeFactoryRoot (BrowserComponent& browser, const std::set<juce::String>& open)
+    {
+        auto folder = [&open] (Node* parent, const juce::String& label, const juce::String& path) {
+            auto n = std::make_unique<Node>();
+            n->kind = Kind::factory;
+            n->folder = n->loaded = true;
+            n->label = label;
+            n->icon = Icon::folder;
+            n->parent = parent;
+            n->depth = parent != nullptr ? parent->depth + 1 : 0;
+            n->userFolder = path.toStdString(); // (the key `open` remembers it by)
+            n->expanded = open.count (path) > 0;
+            return n;
+        };
+        auto root = folder (nullptr, tr ("LYNX content"), "lynx-content");
+        root->colour = theme::colour::accent;
+        const std::tuple<factorycontent::Kind, const char*, juce::String> kinds[] { { factorycontent::Kind::sound, "Sounds", tr ("Sounds") },
+                                                                                    { factorycontent::Kind::beat, "Beats", tr ("Beats") },
+                                                                                    { factorycontent::Kind::chain, "Effect chains", tr ("Effect chains") } };
+        int total = 0;
+        for (const auto& [kind, id, title] : kinds)
+        {
+            const auto kindPath = juce::String ("lynx-content/") + id;
+            auto group = folder (root.get(), title, kindPath);
+            std::map<std::string, std::unique_ptr<Node>> byFolder;
+            std::vector<std::string> order;
+            for (const auto& item : factorycontent::items())
+            {
+                if (item.kind != kind)
+                    continue;
+                auto& sub = byFolder[item.folder];
+                if (sub == nullptr)
+                {
+                    const auto& f = item.folder; // (the words that mean something else elsewhere get their context, as the Simple dock's)
+                    const auto shown = f == "Keys" ? trc ("@sound category: Keys") : f == "Bass" ? trc ("@instrument: Bass") : f == "Lead" ? trc ("@sound category: Lead")
+                                     : f == "Effects" ? trc ("@sound category: Effects") : tr (juce::String::fromUTF8 (f.c_str()));
+                    sub = folder (group.get(), shown, kindPath + "/" + juce::String::fromUTF8 (f.c_str()));
+                    order.push_back (item.folder);
+                }
+                if (auto leaf = makeFactoryItem (browser, item.key))
+                {
+                    leaf->parent = sub.get();
+                    leaf->depth = sub->depth + 1;
+                    sub->children.push_back (std::move (leaf));
+                }
+            }
+            int count = 0;
+            for (const auto& f : order)
+            {
+                auto& sub = byFolder[f];
+                sub->detail = juce::String ((int) sub->children.size());
+                count += (int) sub->children.size();
+                group->children.push_back (std::move (sub));
+            }
+            group->detail = juce::String (count);
+            total += count;
+            root->children.push_back (std::move (group));
+        }
+        root->detail = juce::String (total);
+        return root;
+    }
+
+    // round 190iz: a collection's items (STARRED tab, Live's Collections) and Live's plugin categories as lists
+    static std::vector<std::unique_ptr<Node>> collectionNodes (BrowserComponent& browser, int collection);
+    static std::vector<std::unique_ptr<Node>> livePluginNodes (BrowserComponent& browser, browserplaces::Category category);
 
     // tree mode: the given top-level nodes
     void setTopLevel (std::vector<std::unique_ptr<Node>> nodes)
@@ -446,6 +941,12 @@ public:
         {
             n->parent = root.get();
             n->depth = 0;
+            if (n->kind == Kind::collection) // (its items came with it)
+                for (auto& c : n->children)
+                {
+                    c->parent = n.get();
+                    c->depth = 1;
+                }
             if (n->expanded)
                 load (*n);
             root->children.push_back (std::move (n));
@@ -679,6 +1180,16 @@ public:
         rebuild();
     }
 
+    // round 190mf: flat mode: changes some rows' dimmed detail in place (the Simple loop list's lengths as they are read)
+    void updateDetails (const std::function<bool (Node&)>& change)
+    {
+        bool any = false;
+        for (auto& n : flatNodes)
+            any = change (*n) || any;
+        if (any)
+            repaint();
+    }
+
     void setStatus (const juce::String& text)
     {
         status = text;
@@ -739,8 +1250,26 @@ public:
         return {};
     }
 
+    // the name a row shows (issue #182's type-to-jump matches it)
+    juce::String rowName (int row) const
+    {
+        if (! juce::isPositiveAndBelow (row, (int) rows.size()))
+            return {};
+        const auto& n = *rows[(std::size_t) row];
+        return n.label.isNotEmpty() ? n.label : n.folder || ! isAudio (n.file) ? n.file.getFileName() : n.file.getFileNameWithoutExtension();
+    }
+
     bool selectedIsFolder() const { return juce::isPositiveAndBelow (selected, (int) rows.size()) && rows[(std::size_t) selected]->folder; }
     int numRows() const { return (int) rows.size(); }
+    const Node* nodeAt (int row) const { return juce::isPositiveAndBelow (row, (int) rows.size()) ? rows[(std::size_t) row] : nullptr; } // (round 190kx)
+    // round 190ke (--simplegb190keshot): the rows' names as shown
+    juce::StringArray rowLabels() const
+    {
+        juce::StringArray out;
+        for (const auto* n : rows)
+            out.add (n->label.isNotEmpty() ? n->label : n->file.getFileName());
+        return out;
+    }
     int getSelectedRow() const { return selected; }
 
     void select (int row, bool preview)
@@ -799,7 +1328,7 @@ public:
     {
         n.expanded = true;
         load (n);
-        if (n.kind == Kind::project || n.kind == Kind::category)
+        if (n.kind == Kind::project || n.kind == Kind::category || n.kind == Kind::factory)
             for (auto& c : n.children)
                 if (c->folder && c->kind != Kind::fsFolder)
                     expandAll (*c);
@@ -815,6 +1344,42 @@ public:
             for (auto& c : root->children)
                 if (c->kind == Kind::fsFolder && c->file == f)
                     expandFolder (*c, depth);
+    }
+
+    // Opens the folders down to `file` (a file or folder under one of the top-level folders) and returns its row, or
+    // -1 when no folder shown here holds it (round 190ce: hot-swap shows the linked sample, "Show in its folder").
+    int revealFile (const juce::File& file)
+    {
+        if (root == nullptr || flat)
+            return -1;
+        for (auto& top : root->children)
+        {
+            if (top->kind != Kind::fsFolder)
+                continue;
+            juce::Array<juce::File> bases { top->file };
+            bases.addArray (top->also);
+            const auto holds = [&file] (const juce::File& folder) { return folder.isDirectory() && (file == folder || file.isAChildOf (folder)); };
+            if (std::none_of (bases.begin(), bases.end(), holds))
+                continue;
+            auto* node = top.get();
+            for (int guard = 0; guard < 64 && node != nullptr; ++guard)
+            {
+                node->expanded = true;
+                load (*node);
+                Node* next = nullptr;
+                for (auto& c : node->children)
+                    if (c->file == file)
+                    {
+                        rebuild();
+                        return rowOfFile (file);
+                    }
+                    else if (c->folder && file.isAChildOf (c->file))
+                        next = c.get();
+                node = next;
+            }
+            rebuild();
+        }
+        return -1;
     }
 
     void expandFolder (Node& n, int depth)
@@ -837,17 +1402,57 @@ public:
                 rows.push_back (n.get());
         else if (root != nullptr)
             addRows (*root);
+        if (! flat && browser.showsLoopRowInfo())
+            askLoopInfo();
 
         updateSize();
         repaint();
+    }
+
+    // round 190kx: the Simple layout's rows of audio files show their bars, tempo and key (BandLab's loop rows): the
+    // listed files are analysed once (ui/LoopInfo's worker, cached per file), answers fill the rows as they come
+    void askLoopInfo()
+    {
+        std::vector<std::string> wanted;
+        for (const auto* n : rows)
+            if (n->kind == Kind::file && ! n->folder && ! n->loopKnown && isAudio (n->file))
+                if (wanted.size() < 1000)
+                    wanted.push_back (n->file.getFullPathName().toStdString());
+        if (wanted.empty())
+            return;
+        auto& shared = browser.loopInfoShared();
+        refreshLoopTexts();
+        shared.request (wanted);
+    }
+
+    void refreshLoopTexts()
+    {
+        if (browser.loopInfo == nullptr)
+            return;
+        const auto meter = browser.engine.getSong().meter();
+        bool changed = false;
+        for (auto* n : rows)
+            if (n->kind == Kind::file && ! n->folder && ! n->loopKnown)
+                if (const auto r = browser.loopInfo->known (n->file.getFullPathName().toStdString()))
+                {
+                    n->loopKnown = true;
+                    n->loopText = loopinfo::rowText (*r, meter);
+                    changed = true;
+                }
+        if (changed)
+            repaint();
     }
 
     void updateSize()
     {
         if (auto* parent = getParentComponent())
         {
-            const auto width = parent->getWidth();
+            auto width = parent->getWidth();
             const auto viewHeight = parent->getParentComponent() != nullptr ? parent->getParentComponent()->getHeight() : parent->getHeight();
+            // round gaps190kf: the Loop Browser's list keeps its Tempo / Key column and stars clear of the scroll bar
+            if (auto* view = dynamic_cast<juce::Viewport*> (parent->getParentComponent());
+                view != nullptr && flat && browser.isLoopsShown() && (int) rows.size() * rowHeight > viewHeight)
+                width = view->getWidth() - view->getScrollBarThickness();
             setSize (width, juce::jmax (viewHeight, (int) rows.size() * rowHeight));
         }
     }
@@ -911,11 +1516,16 @@ public:
         const auto clip = g.getClipBounds();
         const auto first = juce::jmax (0, clip.getY() / rowHeight), last = juce::jmin ((int) rows.size() - 1, clip.getBottom() / rowHeight);
         const auto previewing = browser.isPreviewPlaying() ? browser.previewedFile : juce::File();
+        const auto live = rowHeight == liveRowHeight; // (round 190iz: the Clip-launch layout's Live-style list)
+        const auto loopRows = ! flat && browser.showsLoopRowInfo(); // (round 190kx: the Simple layout's loop rows)
+        juce::RectangleList<int> guides;              // (round 190iz: FL's dotted tree guides, filled at once below)
 
         for (int i = first; i <= last; ++i)
         {
             const auto& n = *rows[(std::size_t) i];
             auto r = juce::Rectangle<int> (0, i * rowHeight, getWidth(), rowHeight);
+            if (! flat && ! live && n.depth > 0)
+                addGuides (guides, n, r);
 
             // an open project section sits on a slightly raised band (FL draws its open folders on a band)
             if ((n.kind == Kind::project || n.kind == Kind::category) && n.expanded)
@@ -960,10 +1570,43 @@ public:
             if (n.missing)
                 iconColour = meterClip;
             const auto icon = n.icon != Icon::none ? n.icon : iconFor (n.file, n.folder);
-            icons::draw (g, icon, juce::Rectangle<float> (x, (float) r.getY() + 3.0f, 16.0f, 16.0f), iconColour);
+            if (n.kind == Kind::collection) // a collection's heading: its colour as a square
+            {
+                g.setColour (n.colour);
+                g.fillRoundedRectangle (juce::Rectangle<float> (x + 3.0f, (float) r.getY() + 6.0f, 10.0f, 10.0f), 2.0f);
+            }
+            else
+                icons::draw (g, icon, juce::Rectangle<float> (x, (float) r.getY() + 3.0f, 16.0f, 16.0f), iconColour);
             x += 21.0f;
 
             auto text = r.withLeft ((int) x).withTrimmedRight (6);
+
+            // round 190iz (FL, REA_rodada115 #5): the favourite star at the row's end, on the hovered row and on the
+            // starred ones (filled); the Clip-launch layout keeps Live's colour squares only
+            const auto rowItem = itemOf (n);
+            const auto starred = ! rowItem.empty() && BrowserComponent::collectionStore().has (rowItem, 0);
+            if (! live && ! rowItem.empty() && (starred || i == hovered))
+            {
+                const auto box = starBox (i).toFloat().withSizeKeepingCentre (12.0f, 12.0f);
+                const auto overStar = i == hovered && starBox (i).contains (getMouseXYRelative());
+                browsertabicons::drawRowStar (g, box, starred, starred ? warning : overStar ? textPrimary : textSecondary);
+                text.setRight (starBox (i).getX() - 2);
+            }
+
+            // the collections the row is in: one small square per colour at the right edge (round 190ce; round 190iz:
+            // Starred is the star in the FL layout)
+            if (const auto item = rowItem; ! item.empty())
+                if (const auto bits = (std::uint8_t) (BrowserComponent::collectionStore().mask (item) & (live ? 0x7f : 0x7e)); bits != 0)
+                {
+                    for (int c = collections::count - 1; c >= 0; --c)
+                        if ((bits >> c & 1) != 0)
+                        {
+                            const auto chip = text.removeFromRight (9).withSizeKeepingCentre (7, 7);
+                            g.setColour (BrowserComponent::collectionColour (c));
+                            g.fillRoundedRectangle (chip.toFloat(), 1.5f);
+                        }
+                    text.removeFromRight (3);
+                }
 
             const auto flatDetail = flat && n.kind == Kind::file && n.detail.isNotEmpty(); // "87%" of a similar sample
             if (flat && n.kind == Kind::file) // the folder it lives in, on the right (similar samples: how similar)
@@ -975,11 +1618,22 @@ public:
                 g.drawText (where, text.removeFromRight (w), juce::Justification::centredRight, true);
             }
 
+            // round 190kx: a loop's bars, tempo and key on the right (the Simple layout, BandLab's loop rows)
+            if (n.loopText.isNotEmpty() && loopRows)
+            {
+                g.setFont (theme::font (theme::type::caption));
+                g.setColour (textDisabled);
+                const auto w = juce::jmin (text.getWidth() / 2, juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), n.loopText) + 6);
+                g.drawText (n.loopText, text.removeFromRight (w), juce::Justification::centredRight, true);
+            }
+
             const auto name = n.label.isNotEmpty() ? n.label
                               : n.folder || ! isAudio (n.file) ? n.file.getFileName()
                                                                : n.file.getFileNameWithoutExtension();
             const auto bold = (n.folder && n.expanded) || n.current || n.kind == Kind::project;
-            const juce::Font font (theme::font (theme::type::body, bold));
+            // round 190iz: FL's tree face one step larger (FM-9); Live's list a step smaller. Round 190je: the FL tree is
+            // condensed with FL-style labels on (theme::labelFont = theme::font while the option is off)
+            const juce::Font font (live ? theme::font (theme::type::small, bold) : theme::labelFont (theme::type::body + 1.0f, bold));
             g.setFont (font);
 
             auto nameColour = playing ? accentHover : n.folder || i == hovered || i == selected ? textPrimary : textPrimary.withAlpha (0.86f);
@@ -1007,6 +1661,12 @@ public:
             }
         }
 
+        if (! guides.isEmpty())
+        {
+            g.setColour (border.brighter (0.25f));
+            g.fillRectList (guides);
+        }
+
         if (juce::isPositiveAndBelow (dropRow, (int) rows.size())) // files from the system would go here
         {
             g.setColour (accent);
@@ -1019,6 +1679,31 @@ public:
             g.setFont (theme::font (theme::type::small));
             g.drawFittedText (status, getLocalBounds().reduced (10).withHeight (60), juce::Justification::centredTop, 3);
         }
+    }
+
+    // FL's tree guides (round 190iz, FM-9: "a dotted tree connector"): 1 px dots every 2 px from each open parent down
+    // its children, and a short dotted tick into each child row
+    void addGuides (juce::RectangleList<int>& out, const Node& n, juce::Rectangle<int> r) const
+    {
+        const auto column = [] (int depth) { return 6 + depth * 14 + 5; }; // a parent's chevron centre
+        const auto mid = r.getCentreY();
+        auto vertical = [&out] (int x, int y0, int y1) {
+            for (int y = y0 + (y0 & 1); y < y1; y += 2)
+                out.addWithoutMerging ({ x, y, 1, 1 });
+        };
+        const auto* parent = n.parent;
+        if (parent == nullptr || parent->depth < 0)
+            return;
+        const auto isLast = [] (const Node& c) { return c.parent == nullptr || c.parent->children.empty() || c.parent->children.back().get() == &c; };
+        // the row's own branch: down to its middle (to the bottom when more siblings follow), then across
+        const auto x = column (n.depth - 1);
+        vertical (x, r.getY(), isLast (n) ? mid + 1 : r.getBottom());
+        for (int xx = x + 2; xx < x + 9; xx += 2)
+            out.addWithoutMerging ({ xx, mid, 1, 1 });
+        // the lines of the ancestors that still have children below this row
+        for (const auto* a = parent; a != nullptr && a->depth > 0; a = a->parent)
+            if (! isLast (*a))
+                vertical (column (a->depth - 1), r.getY(), r.getBottom());
     }
 
     int rowAt (int y) const
@@ -1046,6 +1731,7 @@ public:
     bool isInterestedInFileDrag (const juce::StringArray& files) override
     {
         // the files the Browser lists (samples, MIDI, projects, presets): an other file would not show in the folder
+        // (issue #200: folders alone go to the Browser itself, which adds them to its list)
         return ! flat && std::any_of (files.begin(), files.end(), [] (const juce::String& f) {
             const juce::File file (f);
             return file.existsAsFile() && isListed (file);
@@ -1071,6 +1757,13 @@ public:
     {
         dropRow = -1;
         repaint();
+        // issue #200 (round 190ll): folders dropped with the files join the Browser's folder list (FL)
+        juce::StringArray folders;
+        for (const auto& path : files)
+            if (juce::File (path).isDirectory())
+                folders.add (path);
+        if (! folders.isEmpty() && browser.addUserFolders (folders) > 0)
+            return; // (the tree was built again: its rows are gone; the files stay where they are)
         const auto row = dropFolderRow (y);
         if (row < 0)
         {
@@ -1118,8 +1811,30 @@ public:
                                       : tr ("Copied {0} files to {1}", { juce::String (copied), folder.getFileName() }));
     }
 
-    void mouseMove (const juce::MouseEvent& e) override { setHovered (rowAt (e.y)); }
-    void mouseExit (const juce::MouseEvent&) override { setHovered (-1); }
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        setHovered (rowAt (e.y));
+        // round 190iz: the hover star lights under the mouse (only its box repaints)
+        if (const auto over = starBox (hovered).contains (e.getPosition()); over != overStar)
+        {
+            overStar = over;
+            repaint (starBox (hovered));
+        }
+    }
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        setHovered (-1);
+        overStar = false;
+    }
+
+    // FL's middle-click / "Send to selected channel or focused plugin" on a row (round 190iz)
+    void sendRow (const Node& n)
+    {
+        if (n.kind == Kind::plugin)
+            browser.sendPluginToSelected (n.generator, n.effect);
+        else if (! n.folder && n.file.existsAsFile() && ! n.missing)
+            browser.sendToSelected (n.file);
+    }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
@@ -1131,6 +1846,23 @@ public:
             return;
 
         auto& n = *rows[(std::size_t) row];
+
+        // round 190iz (FL manual browser.htm): the star at the row's end = favourite; the middle button = send to the
+        // selected channel; Alt+Click = the whole sample (not FL's first 5 seconds)
+        if (e.mods.isMiddleButtonDown())
+        {
+            select (row, false);
+            sendRow (n);
+            return;
+        }
+        if (e.mods.isLeftButtonDown() && rowHeight != liveRowHeight && starBox (row).contains (e.getPosition()))
+        {
+            browser.toggleStarredItem (itemOf (n));
+            repaintRow (row);
+            return;
+        }
+        if (e.mods.isAltDown() && ! n.folder)
+            browser.askPreview (0.0, true);
 
         if (e.mods.isPopupMenu())
         {
@@ -1207,6 +1939,12 @@ public:
             return;
 
         const auto& n = *rows[(std::size_t) row];
+        if (browser.isHotSwapping() && (n.kind == Kind::plugin || n.kind == Kind::file)) // round 190ce: it replaces the linked device
+        {
+            select (row, false);
+            browser.hotSwapLoadSelected();
+            return;
+        }
         if (n.kind == Kind::plugin)
         {
             if (n.activate)
@@ -1258,6 +1996,12 @@ public:
 
         const auto& n = *rows[(std::size_t) row];
         h.hasMenu = true;
+        if (starBox (row).contains (p) && rowHeight != liveRowHeight) // round 190iz: FL's favourite star
+        {
+            h.text = BrowserComponent::collectionStore().has (itemOf (n), 0) ? tr ("Favorite: [LMB] take it out of the STARRED tab")
+                                                                              : tr ("Favorite: [LMB] add it to the STARRED tab");
+            return h;
+        }
 
         switch (n.kind)
         {
@@ -1283,10 +2027,26 @@ public:
                 h.value = n.detail;
                 return h;
             case Kind::plugin:
+                if (factorycontent::isKey (n.pluginKey) && ! n.generator) // round 190ke: a beat or an effect chain
+                {
+                    h.text = n.label + " (" + n.detail + ")  " + tr ("[double-click] add it: a beat as a new Drums track at the playhead, a chain on the selected track");
+                    h.hasMenu = true;
+                    return h;
+                }
                 h.text = n.label + " (" + n.detail + ")  "
                          + (n.generator ? tr ("[double-click] add it as a new channel, or drag it onto the Channel Rack")
                                         : tr ("[double-click] add it to the selected insert, or drag it onto a mixer insert or an effect slot"));
                 h.hasMenu = true;
+                return h;
+            case Kind::factory:
+                h.text = tr ("LYNX content: LYNX's own sounds, beats and effect chains, with tags (the TAGS button filters them)") + "  "
+                         + (n.expanded ? tr ("[LMB] close") : tr ("[LMB] open"));
+                h.value = n.detail;
+                return h;
+            case Kind::collection:
+                h.text = tr ("Collection: the items you put in it (right-click an item > Collections, or the keys 1-7 on a selected row)") + "  "
+                         + (n.expanded ? tr ("[LMB] close") : tr ("[LMB] open")) + "  " + tr ("[RMB] menu");
+                h.value = n.detail;
                 return h;
             case Kind::file:
                 break;
@@ -1334,6 +2094,21 @@ public:
     }
 
     // for snapshots: opens these project sections; returns the first row of a sample item
+    void scrollRowIntoView (int row) { scrollToRow (row); }
+    bool categoryOpen (Category c) const
+    {
+        const auto row = categoryRow (c);
+        return row >= 0 && rows[(std::size_t) row]->expanded;
+    }
+    // round 190mr (DF-135): the row of a project section's header (−1: not listed)
+    int categoryRow (Category c) const
+    {
+        for (int i = 0; i < (int) rows.size(); ++i)
+            if (rows[(std::size_t) i]->kind == Kind::category && rows[(std::size_t) i]->category == c)
+                return i;
+        return -1;
+    }
+
     int openProjectSections (std::initializer_list<Category> open)
     {
         for (auto* n : std::vector<Node*> (rows))
@@ -1347,6 +2122,39 @@ public:
             if (rows[(std::size_t) i]->kind == Kind::item && rows[(std::size_t) i]->item.kind == projectcontents::Kind::sample)
                 return i;
         return -1;
+    }
+
+    // round 190my (FL's Project picker, right-click on a pattern tile): the pattern's row in Current project › Patterns,
+    // selected and in view; −1 when it isn't listed
+    int revealPattern (int index)
+    {
+        openProjectSections ({ Category::patterns });
+        for (int i = 0; i < (int) rows.size(); ++i)
+            if (rows[(std::size_t) i]->kind == Kind::item && rows[(std::size_t) i]->item.kind == projectcontents::Kind::pattern
+                && rows[(std::size_t) i]->item.index == index)
+            {
+                select (i, false);
+                scrollToRow (i);
+                return i;
+            }
+        return -1;
+    }
+
+    // round 190iz (FL: "drag animations", details DF-100): the drag picture of a file, for the preview strip's drags too
+    juce::Image dragImageForFile (const juce::File& f) const
+    {
+        Node n;
+        n.file = f;
+        return dragImage (n);
+    }
+
+    // the name row `row` shows (round 190iz: --shots pick rows by it)
+    juce::String shownName (int row) const
+    {
+        if (! juce::isPositiveAndBelow (row, (int) rows.size()))
+            return {};
+        const auto& n = *rows[(std::size_t) row];
+        return n.label.isNotEmpty() ? n.label : n.folder || ! isAudio (n.file) ? n.file.getFileName() : n.file.getFileNameWithoutExtension();
     }
 
     void setHovered (int row)
@@ -1903,9 +2711,27 @@ private:
         // (issue #104: the items below act on the Plugin database folder as it is on disk now)
         if (n.kind == Kind::plugin || n.kind == Kind::plugins)
             quickpick::refreshPluginDatabase (engine, true);
+        if (n.kind == Kind::plugin && factorycontent::isKey (n.pluginKey)) // round 190ke: LYNX's own content
+        {
+            menu.addSectionHeader (n.label);
+            menu.addItem (tr ("Add"), [act = n.activate] {
+                if (act)
+                    act();
+            });
+            if (const auto item = itemOf (n); ! item.empty())
+                browser.addCollectionItems (menu, item);
+            present (menu);
+            return;
+        }
         if (n.kind == Kind::plugin)
         {
             menu.addSectionHeader (n.label);
+            // round 190iz (REA round 143 B5: FL's first item on a plugin): a generator replaces the selected channel's
+            // (FL's Enter), an effect goes into the selected insert
+            menu.addItem (tr ("Send to selected channel or focused plugin"), [safe, generator = n.generator, effect = n.effect] {
+                if (safe != nullptr)
+                    safe->browser.sendPluginToSelected (generator, effect);
+            });
             menu.addItem (tr ("Add"), [act = n.activate] {
                 if (act)
                     act();
@@ -1946,6 +2772,8 @@ private:
                 });
                 menu.addSubMenu (tr ("Move to folder"), move);
             }
+            if (const auto item = itemOf (n); ! item.empty()) // round 190ce: the collections take Plugin database entries too
+                browser.addCollectionItems (menu, item);
             // FL's "System" group on an entry (round 190bf, fl190be q1-entry-menu.png): its file in the Plugin database
             // folder (the Installed one for a plugin in no folder). FL's "Windows shell menu" is left out: LYNX has no
             // shell context menu of its own.
@@ -1963,7 +2791,31 @@ private:
             present (menu);
             return;
         }
-        if (n.kind == Kind::project || n.kind == Kind::category || n.kind == Kind::plugins)
+        if (n.kind == Kind::collection)
+        {
+            auto safeBrowser = juce::Component::SafePointer<BrowserComponent> (&browser);
+            ui::addItemHeader (menu, tr ("Collection"), n.label, n.colour);
+            menu.addItem (tr ("Rename..."), [safeBrowser, c = n.collection] {
+                if (safeBrowser != nullptr)
+                    safeBrowser->renameCollection (c);
+            });
+            menu.addItem (tr ("Hide this collection"), n.collection != 0 || BrowserComponent::collectionStore().shown().size() > 1, false, [safeBrowser, c = n.collection] {
+                if (safeBrowser != nullptr)
+                    safeBrowser->setCollectionShown (c, false);
+            });
+            // the collections the STARRED tab lists (round 190cy: here, as Live's Collections › Edit, since the
+            // Clip-launch workflow's row menu has only the labels)
+            juce::PopupMenu show;
+            for (int c = 0; c < collections::count; ++c)
+                show.addItem (BrowserComponent::collectionName (c), true, BrowserComponent::collectionStore().isShown (c), [safeBrowser, c] {
+                    if (safeBrowser != nullptr)
+                        safeBrowser->setCollectionShown (c, ! BrowserComponent::collectionStore().isShown (c));
+                });
+            menu.addSubMenu (tr ("Show in the STARRED tab"), show);
+            present (menu);
+            return;
+        }
+        if (n.kind == Kind::project || n.kind == Kind::category || n.kind == Kind::plugins || n.kind == Kind::factory)
         {
             menu.addSectionHeader (n.label);
             expandItems();
@@ -1982,7 +2834,7 @@ private:
                     dir = juce::File (juce::String::fromUTF8 (plugindb::groupFolder (dir.getFullPathName().toStdString(), n.parent->folderKind == 1, n.group).c_str()));
                 databaseDir = dir;
             }
-            if ((n.kind == Kind::project || n.kind == Kind::plugins) && n.parent == nullptr && browser.tab == allTab) // round 163
+            if ((n.kind == Kind::project || n.kind == Kind::plugins) && n.parent == nullptr && browser.shownTab() == allTab) // round 163
             {
                 menu.addSeparator();
                 browser.addHideItem (menu, n.kind == Kind::project ? browserview::projectRootId : browserview::pluginsRootId, n.label);
@@ -2059,6 +2911,7 @@ private:
                     });
                 menu.addSeparator();
                 menu.addItem (tr ("Show in the file manager"), ok, false, [file] { file.revealToUser(); });
+                workflowextras::addBrowserDeleteItem (menu, engine, false, item.index); // round 190iu (issue #191.6): a take
                 break;
             }
             case projectcontents::Kind::generator:
@@ -2090,6 +2943,7 @@ private:
                     if (safe != nullptr && safe->browser.onOpenAutomation)
                         safe->browser.onOpenAutomation (index);
                 });
+                workflowextras::addBrowserDeleteItem (menu, engine, true, item.index); // round 190iu (issue #191.6)
                 break;
         }
 
@@ -2120,8 +2974,25 @@ private:
             else
                 browser.openPluginFolders.erase (key);
         }
+        if (n.kind == Kind::factory) // round 190ke (remembered: the folders are built again with the tree)
+        {
+            const auto key = juce::String::fromUTF8 (n.userFolder.c_str());
+            if (n.expanded)
+                browser.openFactoryFolders.insert (key);
+            else
+                browser.openFactoryFolders.erase (key);
+        }
+        if (n.kind == Kind::collection)
+        {
+            if (n.expanded)
+                browser.closedCollections.erase (n.collection);
+            else
+                browser.closedCollections.insert (n.collection);
+        }
         if (n.expanded)
             load (n);
+        if (n.expanded && n.file.isDirectory()) // round 190lr (DF-96): an opened folder is a place in the history
+            browser.noteLocation (n.file);
         rebuild();
         restoreSelection (keep);
 
@@ -2181,62 +3052,96 @@ private:
     int selected = -1, hovered = -1, pressedRow = -1;
     int dropRow = -1; // the folder files dragged in from the system would be copied to
     bool dragStarted = false;
+    bool overStar = false; // (round 190iz: the mouse is on the hovered row's star)
 };
 
-// --- the tabs: ALL / PROJECT ------------------------------------------------------------------------
+// --- the tabs: FL 2026's six icon tabs (round 190iz; before: ALL / PROJECT / STARRED as text) ----------------------
+// FL (fl-playlist.png 0,104,205,140): six icons spread over the width, the selected one in an outlined box; design finding
+// FM-8: 30x30 boxes, the selected one with a 1.5 px accent outline (radius 4), the others textSecondary, hover bg5. The
+// names are in the hint bar and the tooltip, as FL's icon tabs.
 
 class BrowserComponent::TabBar final : public juce::Component,
-                                       public ui::HintSource
+                                       public ui::HintSource,
+                                       public juce::TooltipClient
 {
 public:
     explicit TabBar (BrowserComponent& b) : browser (b) { setRepaintsOnMouseActivity (true); }
 
+    static constexpr int preferredHeight = 32;
+
+    // the slot (left to right) of a tab, and its box
     juce::Rectangle<int> tabBounds (int t) const
     {
+        const auto slot = browserplaces::slotOf ((browserplaces::Tab) t);
         const auto w = getWidth() / tabCount;
-        return { t * w, 0, t == tabCount - 1 ? getWidth() - t * w : w, getHeight() };
+        const auto cell = juce::Rectangle<int> (slot * w, 0, slot == tabCount - 1 ? getWidth() - slot * w : w, getHeight());
+        const auto side = juce::jmin (30, cell.getWidth() - 2, getHeight() - 2);
+        return cell.withSizeKeepingCentre (side, side);
+    }
+    int tabAt (juce::Point<int> p) const
+    {
+        const auto slot = juce::jlimit (0, tabCount - 1, p.x * tabCount / juce::jmax (1, getWidth()));
+        return (int) browserplaces::tabOrder[(std::size_t) slot];
     }
 
-    static juce::String name (int t) { return t == allTab ? tr ("ALL") : t == projectTab ? tr ("PROJECT") : tr ("STARRED"); }
+    static juce::String name (int t)
+    {
+        switch ((browserplaces::Tab) t)
+        {
+            case browserplaces::Tab::all: return tr ("ALL");
+            case browserplaces::Tab::project: return tr ("PROJECT");
+            case browserplaces::Tab::plugins: return tr ("PLUGINS");
+            case browserplaces::Tab::presets: return tr ("PRESETS");
+            case browserplaces::Tab::sounds: return tr ("SOUNDS");
+            case browserplaces::Tab::starred: return tr ("STARRED");
+        }
+        return {};
+    }
 
     void paint (juce::Graphics& g) override
     {
         using namespace theme;
         const auto mouse = isMouseOver() ? getMouseXYRelative() : juce::Point<int> (-1, -1);
+        const auto hoverTab = mouse.x >= 0 ? tabAt (mouse) : -1;
         for (int t = 0; t < tabCount; ++t)
         {
-            const auto r = tabBounds (t);
+            const auto r = tabBounds (t).toFloat();
             const auto on = browser.tab == t;
-            if (on || r.contains (mouse))
+            if (! on && t == hoverTab)
             {
-                g.setColour (on ? colour::bg4 : colour::bg3);
-                g.fillRoundedRectangle (r.reduced (2, 2).toFloat(), radius::md);
+                g.setColour (colour::bg5);
+                g.fillRoundedRectangle (r, 4.0f);
             }
             if (on)
             {
+                g.setColour (colour::bg4);
+                g.fillRoundedRectangle (r, 4.0f);
                 g.setColour (colour::accent);
-                g.fillRoundedRectangle (r.reduced (10, 0).removeFromBottom (2).toFloat(), 1.0f);
+                g.drawRoundedRectangle (r.reduced (0.75f), 4.0f, 1.5f);
             }
-            g.setColour (on ? colour::textPrimary : colour::textSecondary);
-            g.setFont (font (type::caption, true));
-            g.drawText (name (t), r, juce::Justification::centred, false);
+            const auto icon = r.withSizeKeepingCentre (18.0f, 18.0f);
+            browsertabicons::draw (g, (browserplaces::Tab) t, icon.toNearestInt().toFloat(), on ? colour::textPrimary : colour::textSecondary);
         }
     }
 
-    void mouseDown (const juce::MouseEvent& e) override
-    {
-        for (int t = 0; t < tabCount; ++t)
-            if (tabBounds (t).contains (e.getPosition()))
-                browser.setTab (t);
-    }
+    void mouseDown (const juce::MouseEvent& e) override { browser.setTab (tabAt (e.getPosition())); }
+
+    juce::String getTooltip() override { return isMouseOver() ? name (tabAt (getMouseXYRelative())) : juce::String(); }
 
     ui::Hint hintAt (juce::Point<int> p) override
     {
         ui::Hint h;
-        const auto t = juce::jlimit (0, tabCount - 1, p.x * tabCount / juce::jmax (1, getWidth()));
-        h.text = t == allTab       ? tr ("Browser: ALL - the current project and every sample folder")
-                 : t == projectTab ? tr ("Browser: PROJECT - only what the current project uses (patterns, effects, generators, audio files...)")
-                                   : tr ("Browser: STARRED - the files and folders you starred (right-click > Starred)");
+        switch ((browserplaces::Tab) tabAt (p))
+        {
+            case browserplaces::Tab::all: h.text = tr ("Browser: ALL - the current project and every sample folder"); break;
+            case browserplaces::Tab::project:
+                h.text = tr ("Browser: PROJECT - only what the current project uses (patterns, effects, generators, audio files...)");
+                break;
+            case browserplaces::Tab::plugins: h.text = tr ("Browser: PLUGINS - the Plugin database (generators and effects)"); break;
+            case browserplaces::Tab::presets: h.text = tr ("Browser: PRESETS - the preset folders (synth, channel, plugin and mixer presets)"); break;
+            case browserplaces::Tab::sounds: h.text = tr ("Browser: SOUNDS - the sample folders, audio files only"); break;
+            case browserplaces::Tab::starred: h.text = tr ("Browser: STARRED - the files and folders you starred (the star at a row's end)"); break;
+        }
         return h;
     }
 
@@ -2309,7 +3214,18 @@ public:
         if (isPlaying())
             browser.stopPreview();
         else if (isAudio (file))
+        {
+            browser.askPreview (0.0, true); // (FL's Preview Player: Play plays the whole sample)
             browser.fileSelected (file, true);
+        }
+    }
+
+    // round 190iz: what the preview plays (FL's 5 s from the start or from a Shift+Click, or all of it)
+    void show (const juce::File& f, bool playing, double fromFraction, bool full)
+    {
+        startFraction = juce::jlimit (0.0, 1.0, fromFraction);
+        playFull = full;
+        show (f, playing);
     }
 
     void show (const juce::File& f, bool playing)
@@ -2396,6 +3312,7 @@ public:
         const auto mid = wave.getCentreY();
         const auto progress = position();
         const auto playedX = wave.getX() + wave.getWidth() * (float) progress;
+        const auto fromX = wave.getX() + wave.getWidth() * (float) (progress > 0.0 ? startFraction : 0.0); // (round 190iz)
 
         // the detailed, frequency-coloured waveform (ui/WaveformView) once analysed; the quick peaks until then
         const auto path = file.getFullPathName();
@@ -2406,7 +3323,7 @@ public:
             if (progress > 0.0)
             {
                 g.setColour (accent.withAlpha (0.22f)); // the part already heard
-                g.fillRect (juce::Rectangle<float>::leftTopRightBottom (wave.getX(), wave.getY(), playedX, wave.getBottom()));
+                g.fillRect (juce::Rectangle<float>::leftTopRightBottom (fromX, wave.getY(), juce::jmax (fromX, playedX), wave.getBottom()));
                 g.setColour (textPrimary);
                 g.fillRect (playedX, wave.getY(), 1.0f, wave.getHeight());
             }
@@ -2418,7 +3335,7 @@ public:
             const auto p = peaks[(std::size_t) (x * (int) peaks.size() / juce::jmax (1, (int) wave.getWidth()))];
             const auto h = juce::jmax (0.5f, p * wave.getHeight() * 0.5f);
             const auto px = wave.getX() + (float) x;
-            g.setColour (progress > 0.0 && px <= playedX ? accent : textSecondary.withAlpha (0.75f));
+            g.setColour (progress > 0.0 && px <= playedX && px >= fromX ? accent : textSecondary.withAlpha (0.75f));
             g.fillRect (px, mid - h, 1.0f, h * 2.0f);
         }
 
@@ -2431,8 +3348,14 @@ public:
 
     void mouseDown (const juce::MouseEvent& e) override
     {
-        if (isAudio (file) && e.mods.isLeftButtonDown())
-            browser.fileSelected (file, true); // hear it again
+        if (! isAudio (file) || ! e.mods.isLeftButtonDown())
+            return;
+        // round 190iz: FL's Shift+Click (and a click in the Clip-launch layout, Live's scrub area) plays from the mouse
+        // position; Alt+Click plays to the end; a plain click hears it again from the start
+        const auto wave = getLocalBounds().reduced (6, 4).withTrimmedTop (17).toFloat().reduced (2.0f, 2.0f);
+        const auto at = wave.getWidth() > 1.0f ? juce::jlimit (0.0, 1.0, (double) ((float) e.x - wave.getX()) / (double) wave.getWidth()) : 0.0;
+        browser.askPreview (e.mods.isShiftDown() || browser.isLiveLayout() ? at : 0.0, e.mods.isAltDown());
+        browser.fileSelected (file, true);
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
@@ -2441,7 +3364,8 @@ public:
             if (auto* container = juce::DragAndDropContainer::findParentDragContainerFor (this))
             {
                 dragging = true;
-                container->startDragging (juce::String (dragDescription) + "|" + file.getFullPathName(), this, juce::ScaledImage(), true);
+                container->startDragging (juce::String (dragDescription) + "|" + file.getFullPathName(), this,
+                                          juce::ScaledImage (browser.tree->dragImageForFile (file)), true); // (round 190iz: the drag ghost)
             }
     }
 
@@ -2450,7 +3374,9 @@ public:
     ui::Hint hintAt (juce::Point<int>) override
     {
         ui::Hint h;
-        h.text = isAudio (file) ? tr ("Sample preview: [LMB] hear it again  drag it like a file in the list") : tr ("Sample preview");
+        h.text = isAudio (file) ? (browser.isLiveLayout() ? tr ("Sample preview: [LMB] play from there  [Alt+LMB] to the end  drag it like a file in the list")
+                                                          : tr ("Sample preview: [LMB] hear it again  [Shift+LMB] from there  [Alt+LMB] to the end  drag it like a file in the list"))
+                                : tr ("Sample preview");
         h.value = info;
         return h;
     }
@@ -2490,7 +3416,12 @@ private:
             const auto p = browser.engine.getPreviewInTimeProgress();
             return p < 0.0 ? 1.0 : juce::jlimit (1.0e-6, 1.0 - 1.0e-6, p);
         }
-        return juce::jlimit (0.0, 1.0, (juce::Time::getMillisecondCounterHiRes() - startedAt) / 1000.0 / seconds);
+        // round 190iz: from where it started, for FL's 5 seconds unless it plays to the end
+        const auto elapsed = (juce::Time::getMillisecondCounterHiRes() - startedAt) / 1000.0;
+        const auto limit = playFull || browser.engine.isFullSamplePreview() ? seconds : juce::jmin (seconds, (double) browserpreview::defaultSeconds + startFraction * seconds);
+        if (startFraction * seconds + elapsed >= limit)
+            return 1.0;
+        return juce::jlimit (0.0, 1.0, startFraction + elapsed / seconds);
     }
 
     void timerCallback() override
@@ -2511,6 +3442,8 @@ private:
     juce::File file;
     std::vector<float> peaks;
     double seconds = 0.0, startedAt = 0.0;
+    double startFraction = 0.0; // round 190iz: where the preview started (0..1)
+    bool playFull = false;      // ... and whether it plays to the end
     juce::String info;
     bool dragging = false;
     std::optional<bool> shownPlaying; // the Play / Stop state the button shows
@@ -2595,20 +3528,95 @@ private:
     std::vector<std::pair<juce::String, juce::String>> rows;
 };
 
+// --- Hot-swap (round 190ce): the bar -------------------------------------------------------------------
+// The bar over the tabs while the Browser is linked to a device: what it is linked to, and an X that ends the link
+// (the reference shows a coloured banner at the top of its browser with a close button).
+class BrowserComponent::HotSwapBar final : public juce::Component, public ui::HintSource
+{
+public:
+    explicit HotSwapBar (BrowserComponent& b) : browser (b) { setRepaintsOnMouseActivity (true); }
+
+    static constexpr int height = 22;
+
+    void paint (juce::Graphics& g) override
+    {
+        using namespace theme;
+        g.setColour (colour::accent);
+        g.fillRoundedRectangle (getLocalBounds().toFloat(), radius::md);
+        auto r = getLocalBounds().reduced (6, 0);
+        const auto x = closeBounds();
+        r.setRight (x.getX() - 4);
+        g.setColour (juce::Colours::white);
+        g.setFont (font (type::caption, true));
+        g.drawText (tr ("Swapping {0}", { browser.hotSwapTargetName() }), r, juce::Justification::centredLeft, true); // (the reference: "Swapping Instrument")
+        const auto over = isMouseOver() && x.contains (getMouseXYRelative());
+        if (over)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.22f));
+            g.fillRoundedRectangle (x.toFloat(), 3.0f);
+        }
+        g.setColour (juce::Colours::white);
+        const auto c = x.toFloat().reduced (5.0f);
+        g.drawLine (c.getX(), c.getY(), c.getRight(), c.getBottom(), 1.6f);
+        g.drawLine (c.getX(), c.getBottom(), c.getRight(), c.getY(), 1.6f);
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (closeBounds().contains (e.getPosition()))
+            browser.endHotSwap();
+    }
+
+    ui::Hint hintAt (juce::Point<int> p) override
+    {
+        if (closeBounds().contains (p))
+            return { tr ("End hot-swap (Esc)"), {}, false, false };
+        return { tr ("Hot-swap: Enter or a double-click loads the selected plugin, preset or sample in place of this device"), browser.hotSwapTargetName(), false, false };
+    }
+
+private:
+    juce::Rectangle<int> closeBounds() const { return getLocalBounds().removeFromRight (height).reduced (2); }
+    BrowserComponent& browser;
+};
+
 BrowserComponent::BrowserComponent (AudioEngine& e, Role r)
     : engine (e), role (r)
 {
     tabs = std::make_unique<TabBar> (*this);
     addAndMakeVisible (*tabs);
+    // round 190iz: FL's TAGS button and tags panel, Live's sidebar (the Clip-launch layout shows it)
+    tagsButton = std::make_unique<TagsButton> (*this);
+    addAndMakeVisible (*tagsButton);
+    tagsPanel = std::make_unique<TagsPanel> (*this);
+    addChildComponent (*tagsPanel);
+    // round gaps190kf: the Loop Browser (the Sample browser window's: LYNX's own window, so FL's Browser panel keeps FL's row)
+    loopsButton = std::make_unique<LoopsButton> (*this);
+    addChildComponent (*loopsButton);
+    loopsButton->setVisible (role == Role::samples);
+    loopPanel = std::make_unique<LoopPanel> (*this);
+    addChildComponent (*loopPanel);
+    sidebar = std::make_unique<LiveSidebar> (*this);
+    sidebarView = std::make_unique<juce::Viewport>();
+    sidebarView->setViewedComponent (sidebar.get(), false);
+    sidebarView->setScrollBarsShown (true, false);
+    sidebarView->setScrollBarThickness (8);
+    sidebarView->setWantsKeyboardFocus (false);
+    addChildComponent (*sidebarView);
+    loadTags();
+    loadPrefs();
+    swapBar = std::make_unique<HotSwapBar> (*this);
+    addChildComponent (*swapBar);
+    liveBrowsers().push_back (this);
 
     // the search index (round 162): a background pass over every folder a few seconds after start (FL's automatic
     // indexing: only the folders that changed since the last session are listed again)
     searcher = SearchShared::get();
     searcher->statusChanged.addChangeListener (this);
     searcher->indexChanged.addChangeListener (this);
+    loopLengthsRead().addChangeListener (this); // (round 190mf: the Simple loop rows' lengths)
     juce::Timer::callAfterDelay (4000, [safe = juce::Component::SafePointer<BrowserComponent> (this)] {
         if (safe != nullptr && safe->role == Role::main && ! safe->allRoots.isEmpty())
-            safe->searcher->service->refresh (toPaths (safe->withMerged (safe->allRoots)));
+            safe->searcher->refreshInBackground (toPaths (safe->withMerged (safe->allRoots))); // (round 190hd: the indexer process)
     });
     // "Find similar samples" (round 190as): once it was used (its index file exists), the folders are checked for new
     // samples in the background a while after start; before that nothing is analysed
@@ -2684,8 +3692,19 @@ BrowserComponent::BrowserComponent (AudioEngine& e, Role r)
     details = std::make_unique<DetailsBox>();
     addChildComponent (*details);
 
+    browserStartupMark ("  browser: search index, widgets");
+    if (tagsPanelShown)
+        tagsPanel->setVisible (true);
     rebuildRoots();
+    browserStartupMark ("  browser: roots and tree");
     engine.addChangeListener (this);
+    constructing = false;
+}
+
+void BrowserComponent::browserStartupMark (const char* step) const
+{
+    if (constructing && role == Role::main && startupMark != nullptr)
+        startupMark (step);
 }
 
 juce::File BrowserComponent::userFoldersFile()
@@ -2700,17 +3719,526 @@ juce::File BrowserComponent::starredFile()
 
 void BrowserComponent::setStarred (const juce::File& file, bool on)
 {
-    const auto path = file.getFullPathName();
-    if (on == starred.contains (path))
+    setInCollection (file.getFullPathName().toStdString(), 0, on);
+}
+
+// --- Collections (round 190ce) ------------------------------------------------------------------------
+
+juce::File BrowserComponent::collectionsFile()
+{
+    return PluginHost::settingsFolder().getChildFile ("browser-collections.txt");
+}
+
+collections::Store& BrowserComponent::collectionStore()
+{
+    static collections::Store store;
+    return store;
+}
+
+std::vector<BrowserComponent*>& BrowserComponent::liveBrowsers()
+{
+    static std::vector<BrowserComponent*> all;
+    return all;
+}
+
+void BrowserComponent::loadCollections()
+{
+    if (const auto file = collectionsFile(); file.existsAsFile())
+    {
+        collectionStore() = collections::Store::fromText (file.loadFileAsString().toStdString());
         return;
-    if (on)
-        starred.add (path);
+    }
+    // before round 190ce: one starred path per line
+    std::vector<std::string> paths;
+    for (const auto& line : juce::StringArray::fromLines (starredFile().loadFileAsString()))
+        if (line.trim().isNotEmpty() && juce::File::isAbsolutePath (line.trim()))
+            paths.push_back (line.trim().toStdString());
+    collectionStore() = collections::Store::fromStarred (paths);
+}
+
+void BrowserComponent::saveCollections()
+{
+    const auto& store = collectionStore();
+    collectionsFile().getParentDirectory().createDirectory();
+    collectionsFile().replaceWithText (juce::String::fromUTF8 (store.toText().c_str()));
+    juce::String starredText; // (an older LYNX SHARE reads this one)
+    for (const auto& path : store.starredPaths())
+        starredText << juce::String::fromUTF8 (path.c_str()) << "\n";
+    starredFile().replaceWithText (starredText);
+}
+
+juce::String BrowserComponent::collectionName (int collection)
+{
+    const auto& store = collectionStore();
+    if (store.hasOwnName (collection))
+        return juce::String::fromUTF8 (store.name (collection).c_str());
+    switch (collection)
+    {
+        case 0: return tr ("Starred");
+        case 1: return tr ("Orange");
+        case 2: return tr ("Yellow");
+        case 3: return tr ("Green");
+        case 4: return tr ("Blue");
+        case 5: return tr ("Purple");
+        case 6: return tr ("Gray");
+        default: return {};
+    }
+}
+
+juce::Colour BrowserComponent::collectionColour (int collection)
+{
+    return juce::Colour (collections::colourArgb (collection));
+}
+
+void BrowserComponent::collectionsChanged()
+{
+    for (auto* b : liveBrowsers())
+    {
+        if (b->liveLayout) // round 190iz: Live's sidebar lists the shown collections
+            b->sidebar->refresh();
+        if (b->liveLayout ? b->liveSelection.category == browserplaces::Category::collection : b->tab == starredTab)
+        {
+            const auto row = b->tree->getSelectedRow();
+            const auto scroll = b->treeView->getViewPosition();
+            b->rebuildTree();
+            if (row >= 0 && b->tree->numRows() > 0)
+                b->tree->select (juce::jmin (row, b->tree->numRows() - 1), false);
+            b->treeView->setViewPosition (scroll);
+        }
+        b->tree->repaint();
+        b->results->repaint();
+        if (b->loopsShown && b->loopFilterState.favouritesOnly) // (round gaps190kf: the Favorites button's list)
+            b->applyLoopFilter();
+    }
+}
+
+void BrowserComponent::setInCollection (const std::string& item, int collection, bool on)
+{
+    if (! collectionStore().label (item, collection, on)) // (a hidden collection shows itself: round 190cy)
+        return;
+    saveCollections();
+    collectionsChanged();
+}
+
+void BrowserComponent::toggleCollectionOnSelection (int collection)
+{
+    auto& list = activeList();
+    const auto item = list.selectedItem();
+    if (item.empty())
+    {
+        ui::postHint ({ tr ("Select a file, a folder or a plugin in the Browser first"), {} }, 2500);
+        return;
+    }
+    const auto label = list.selectedLabel();
+    const auto on = ! collectionStore().has (item, collection);
+    setInCollection (item, collection, on);
+    ui::postHint ({ on ? tr ("Added to the collection {0}", { collectionName (collection) }) : tr ("Removed from the collection {0}", { collectionName (collection) }), label }, 2500);
+}
+
+void BrowserComponent::clearCollectionsOnSelection()
+{
+    auto& list = activeList();
+    const auto item = list.selectedItem();
+    if (item.empty())
+        return;
+    const auto label = list.selectedLabel();
+    if (! collectionStore().clear (item))
+        return;
+    saveCollections();
+    collectionsChanged();
+    ui::postHint ({ tr ("Removed from every collection"), label }, 2500);
+}
+
+void BrowserComponent::setCollectionShown (int collection, bool shown)
+{
+    auto& store = collectionStore();
+    store.setShown (collection, shown);
+    if (store.shown().empty()) // (one stays: Starred)
+        store.setShown (0, true);
+    saveCollections();
+    collectionsChanged();
+}
+
+void BrowserComponent::renameCollection (int collection)
+{
+    auto* window = new juce::AlertWindow (tr ("Rename collection"), tr ("Name of the collection (empty: its default name):"), juce::MessageBoxIconType::NoIcon, this);
+    window->addTextEditor ("name", juce::String::fromUTF8 (collectionStore().labels[(std::size_t) juce::jlimit (0, collections::count - 1, collection)].name.c_str()));
+    window->addButton (tr ("OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton (tr ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<BrowserComponent> safe (this);
+    window->enterModalState (true, juce::ModalCallbackFunction::create ([window, safe, collection] (int result) {
+        if (result != 1 || safe == nullptr)
+            return;
+        collectionStore().rename (collection, window->getTextEditorContents ("name").toStdString());
+        saveCollections();
+        safe->collectionsChanged();
+    }), true);
+}
+
+// The collections in a row's menu. Clip-launch workflow (round 190cy, Live 12.4.16 live check 190cw shot 05): a flat
+// list in the menu itself, "Clear all colours" (0) then the seven with their keys (1-7), ticked when the item is in
+// one; renaming and showing / hiding are on a collection's heading. Pattern workflow: as round 190ce built it, a
+// "Collections" sub-menu with the seven, "Remove from all", which collections the STARRED tab lists and their names.
+void BrowserComponent::addCollectionItems (juce::PopupMenu& menu, const std::string& item)
+{
+    if (item.empty())
+        return;
+    juce::Component::SafePointer<BrowserComponent> safe (this);
+    const auto& store = collectionStore();
+    if (liveItemMenus)
+    {
+        menu.addSeparator();
+        menu.addItem (tr ("Clear all colours") + "\t0", store.mask (item) != 0, false, [safe, item] {
+            if (safe == nullptr || ! collectionStore().clear (item))
+                return;
+            saveCollections();
+            safe->collectionsChanged();
+        });
+        for (int c = 0; c < collections::count; ++c)
+        {
+            juce::PopupMenu::Item entry (collectionName (c) + "\t" + juce::String (c + 1));
+            entry.setTicked (store.has (item, c));
+            entry.setColour (collectionColour (c).brighter (0.25f));
+            entry.setAction ([safe, item, c] {
+                if (safe != nullptr)
+                    safe->setInCollection (item, c, ! collectionStore().has (item, c));
+            });
+            menu.addItem (entry);
+        }
+        menu.addSeparator();
+        addTagItems (menu, item); // round 190iz
+        return;
+    }
+    juce::PopupMenu sub;
+    for (int c = 0; c < collections::count; ++c)
+    {
+        juce::PopupMenu::Item entry (collectionName (c) + "\t" + juce::String (c + 1));
+        entry.setTicked (store.has (item, c));
+        entry.setColour (collectionColour (c).brighter (0.25f));
+        entry.setAction ([safe, item, c] {
+            if (safe != nullptr)
+                safe->setInCollection (item, c, ! collectionStore().has (item, c));
+        });
+        sub.addItem (entry);
+    }
+    sub.addSeparator();
+    sub.addItem (tr ("Remove from all") + "\t0", store.mask (item) != 0, false, [safe, item] {
+        if (safe == nullptr || ! collectionStore().clear (item))
+            return;
+        saveCollections();
+        safe->collectionsChanged();
+    });
+    sub.addSeparator();
+    juce::PopupMenu show, rename;
+    for (int c = 0; c < collections::count; ++c)
+    {
+        show.addItem (collectionName (c), true, store.isShown (c), [safe, c] {
+            if (safe != nullptr)
+                safe->setCollectionShown (c, ! collectionStore().isShown (c));
+        });
+        rename.addItem (collectionName (c), [safe, c] {
+            if (safe != nullptr)
+                safe->renameCollection (c);
+        });
+    }
+    sub.addSubMenu (tr ("Show in the STARRED tab"), show);
+    sub.addSubMenu (tr ("Rename"), rename);
+    menu.addSubMenu (tr ("Collections"), sub);
+    addTagItems (menu, item); // round 190iz: FL's Tags section (Tags ▸, Add tag..., Edit tags...)
+}
+
+juce::PopupMenu BrowserComponent::collectionsMenuForSnapshot (const std::string& item)
+{
+    juce::PopupMenu menu;
+    addCollectionItems (menu, item);
+    // (the shot shows the sub-menu's own items: a picture of a menu does not open its sub-menus)
+    for (juce::PopupMenu::MenuItemIterator it (menu); it.next();)
+        if (it.getItem().subMenu != nullptr)
+            return *it.getItem().subMenu;
+    return menu;
+}
+
+void BrowserComponent::selectRowForSnapshot (const juce::String& label)
+{
+    auto& list = activeList();
+    for (int i = 0; i < list.numRows(); ++i)
+    {
+        list.select (i, false);
+        if (list.selectedLabel() == label)
+            return;
+    }
+}
+
+// --- Hot-swap (round 190ce) ---------------------------------------------------------------------------
+
+juce::String BrowserComponent::hotSwapTargetName() const
+{
+    const auto& song = engine.getSong();
+    const auto& t = swapSession.target;
+    if (t.kind == hotswap::Kind::effect)
+    {
+        if (const auto at = hotswap::findEffect (song, t.instance); at.found())
+            return quickpick::slotName (engine, song.mixer[(std::size_t) at.track].effects[(std::size_t) at.slot]);
+    }
+    else if (t.kind == hotswap::Kind::channel)
+    {
+        if (const auto c = hotswap::findChannel (song, t.instance); c >= 0)
+            return juce::String::fromUTF8 (song.channels[(std::size_t) c].name.c_str());
+    }
+    return {};
+}
+
+void BrowserComponent::beginHotSwap (const hotswap::Target& target)
+{
+    const auto& song = engine.getSong();
+    if (! hotswap::exists (song, target))
+        return;
+    swapSession.begin (target, tab, searchBox.getText().toStdString());
+    if (searchBox.getText().isNotEmpty())
+    {
+        searchBox.setText ({}, false);
+        runSearch();
+    }
+    // the Browser goes to what can take the device's place: a sample channel's own sample in its folder, else the
+    // Plugin database's effects or generators
+    bool shown = false;
+    if (target.kind == hotswap::Kind::channel)
+        if (const auto c = hotswap::findChannel (song, target.instance); c >= 0 && hotswap::playsSample (song.channels[(std::size_t) c]))
+        {
+            const juce::File sample (juce::String::fromUTF8 (song.channels[(std::size_t) c].samplePath.c_str()));
+            setTab (allTab);
+            if (sample.existsAsFile())
+                if (const auto row = tree->revealFile (sample); row >= 0)
+                {
+                    tree->select (row, false);
+                    shown = true;
+                }
+            shown = shown || sample == juce::File() || ! sample.existsAsFile(); // (no sample yet: the folders as they are)
+        }
+    // an effect with a preset: that preset, as Live starts hot-swap on the device's current preset (round 190cy)
+    if (! shown && target.kind == hotswap::Kind::effect)
+        shown = revealCurrentPreset (target);
+    if (! shown)
+        showPluginDatabase ({}, target.kind == hotswap::Kind::channel ? 1 : 0);
+    swapBar->setVisible (true);
+    swapBar->repaint();
+    resized();
+    if (onHotSwapChanged != nullptr)
+        onHotSwapChanged();
+}
+
+bool BrowserComponent::revealCurrentPreset (const hotswap::Target& target)
+{
+    const auto& song = engine.getSong();
+    const auto at = hotswap::findEffect (song, target.instance);
+    if (! at.found())
+        return false;
+    const auto& fx = song.mixer[(std::size_t) at.track].effects[(std::size_t) at.slot];
+    if (fx.presetName.empty())
+        return false;
+    // the files the effect's presets come from: FL's preset folders of the plugin it stands for (the editor's preset
+    // list, round 168r) and LYNX's own saved presets of the effect
+    juce::Array<juce::File> files, folders;
+    if (const auto roots = findFlStudioRoots(); ! roots.data.empty())
+        for (const auto& plugin : flPluginsForEffect (fx.kind))
+        {
+            const auto paths = presetcycle::pluginPresetFolders (roots, false, plugin);
+            for (const auto& folder : paths)
+                folders.addIfNotAlreadyThere (juce::File (juce::String::fromUTF8 (folder.c_str())));
+            for (const auto& p : presetcycle::listPresets (paths))
+                files.add (juce::File (juce::String::fromUTF8 (p.path.c_str())));
+        }
+    folders.add (pluginheader::userFolder (fx.kind));
+    files.addArray (pluginheader::userPresets (fx.kind));
+    const auto name = juce::String::fromUTF8 (fx.presetName.c_str());
+    const auto current = std::find_if (files.begin(), files.end(), [&name] (const juce::File& f) { return f.getFileNameWithoutExtension() == name; });
+    if (current == files.end())
+        return false;
+    const auto file = *current;
+    setTab (allTab);
+    if (const auto row = tree->revealFile (file); row >= 0)
+    {
+        tree->select (row, false);
+        return true;
+    }
+    resultsView->setVisible (true);
+    treeView->setVisible (false);
+    results->setFiles (files, folders, tr ("Presets of {0}", { hotSwapTargetName() }));
+    results->select (files.indexOf (file), false);
+    presetsListed = true;
+    return true;
+}
+
+void BrowserComponent::endHotSwap()
+{
+    if (! swapSession.active())
+        return;
+    const auto back = swapSession.end();
+    swapBar->setVisible (false);
+    setTab (back.tab);
+    if (std::exchange (presetsListed, false) || searchBox.getText() != juce::String::fromUTF8 (back.search.c_str()))
+    {
+        searchBox.setText (juce::String::fromUTF8 (back.search.c_str()), false);
+        runSearch();
+    }
+    resized();
+    if (onHotSwapChanged != nullptr)
+        onHotSwapChanged();
+}
+
+void BrowserComponent::hotSwapRefused()
+{
+    ui::postHint ({ tr ("Hot-swap: this can't take the place of {0}", { hotSwapTargetName() }), {} }, 3000);
+}
+
+bool BrowserComponent::hotSwapLoadSelected()
+{
+    if (! swapSession.active())
+        return false;
+    const auto* n = activeList().selectedNode();
+    if (n == nullptr || n->folder)
+        return true; // (the mode keeps Enter: nothing is added to the project while it is on)
+    if (n->kind == FileTree::Kind::plugin)
+    {
+        if (! hotSwapLoadPlugin (n->generator, n->effect))
+            hotSwapRefused();
+        return true;
+    }
+    if (n->kind == FileTree::Kind::file && n->file.existsAsFile())
+    {
+        if (! hotSwapLoadFile (n->file))
+            hotSwapRefused();
+        return true;
+    }
+    hotSwapRefused();
+    return true;
+}
+
+bool BrowserComponent::hotSwapLoadPlugin (const std::function<std::optional<ChannelDef>()>& generator, const std::function<std::optional<EffectSlot>()>& effect)
+{
+    const auto target = swapSession.target;
+    hotswap::Target now;
+    if (target.kind == hotswap::Kind::effect && effect)
+    {
+        auto fx = effect();
+        if (! fx)
+            return false;
+        engine.editSong ([&now, target, fx = std::move (*fx)] (Song& song) mutable { now = hotswap::swapEffect (song, target, std::move (fx)); });
+    }
+    else if (target.kind == hotswap::Kind::channel && generator)
+    {
+        auto c = generator();
+        if (! c)
+            return false;
+        if (const auto channel = hotswap::findChannel (engine.getSong(), target.instance); channel >= 0 && onHotSwapWillReplaceInstrument != nullptr)
+            onHotSwapWillReplaceInstrument (channel);
+        engine.editSong ([&now, target, c = std::move (*c)] (Song& song) mutable { now = hotswap::swapInstrument (song, target, std::move (c)); });
+    }
     else
-        starred.removeString (path);
-    starredFile().getParentDirectory().createDirectory();
-    starredFile().replaceWithText (starred.joinIntoString ("\n") + "\n");
-    if (tab == starredTab)
-        rebuildTree();
+        return false;
+    if (! now.active())
+        return false;
+    swapSession.retarget (now);
+    swapBar->repaint();
+    if (onHotSwapChanged != nullptr)
+        onHotSwapChanged();
+    return true;
+}
+
+bool BrowserComponent::hotSwapLoadFile (const juce::File& file)
+{
+    const auto target = swapSession.target;
+    const auto& song = engine.getSong();
+    const auto loaded = [this] {
+        swapSession.loaded();
+        swapBar->repaint();
+        return true;
+    };
+
+    // a hosted plugin's own preset into the linked plugin (as its window's preset menu loads it)
+    if (pluginpresetui::isPresetFile (file) && (! file.hasFileExtension ("lynxpreset") || pluginpresetui::readLynxPreset (file).has_value()))
+    {
+        juce::AudioPluginInstance* plugin = nullptr;
+        if (target.kind == hotswap::Kind::effect)
+        {
+            if (const auto at = hotswap::findEffect (song, target.instance); at.found())
+                if (auto* p = dynamic_cast<PluginEffect*> (engine.getEffect (at.track, at.slot).get()))
+                    plugin = &p->getInstance();
+        }
+        else if (const auto c = hotswap::findChannel (song, target.instance); c >= 0)
+            if (auto* p = dynamic_cast<PluginInstrument*> (engine.getChannelInstrument (c).get()))
+                plugin = &p->getInstance();
+        juce::String error;
+        if (plugin == nullptr || ! pluginpresetui::load (*plugin, file, error))
+            return false;
+        engine.markModified();
+        // the device comes in on, as the preset loads it (round 190cy, Live 12.4.16)
+        if (const auto at = hotswap::findEffect (song, target.instance); at.found() && ! song.mixer[(std::size_t) at.track].effects[(std::size_t) at.slot].enabled)
+            engine.editSong ([target] (Song& s) { hotswap::presetLoadedInto (s, target); });
+        return loaded();
+    }
+
+    switch (hotswap::candidateFor (song, target, file.getFileName().toStdString()))
+    {
+        case hotswap::Candidate::effectPreset:
+        {
+            const auto at = hotswap::findEffect (song, target.instance);
+            if (file.hasFileExtension ("lynxpreset")) // one of LYNX's presets of this very effect: its settings only
+            {
+                const auto kind = song.mixer[(std::size_t) at.track].effects[(std::size_t) at.slot].kind;
+                const auto preset = presets::fromText (kind, file.loadFileAsString().toStdString());
+                if (! preset)
+                    return false;
+                const auto name = preset->name.empty() ? file.getFileNameWithoutExtension().toStdString() : preset->name;
+                bool ok = false;
+                engine.editSong ([&ok, target, kind, &preset, &name] (Song& s) {
+                    ok = hotswap::swapEffectPreset (s, target, kind, preset->params, preset->hasState ? &preset->state : nullptr, name);
+                });
+                return ok && loaded();
+            }
+            juce::MemoryBlock data;
+            if (! file.loadFileAsData (data))
+                return false;
+            const auto* bytes = static_cast<const std::uint8_t*> (data.getData());
+            auto fx = effectFromFlPreset (std::vector<std::uint8_t> (bytes, bytes + data.getSize()), song.bpm, natives::flDataReader (flStudioAccess()));
+            if (! fx)
+                return false;
+            hotswap::Target now;
+            engine.editSong ([&now, target, fx = std::move (*fx)] (Song& s) mutable { now = hotswap::swapEffect (s, target, std::move (fx)); });
+            if (! now.active())
+                return false;
+            swapSession.retarget (now);
+            swapBar->repaint();
+            if (onHotSwapChanged != nullptr)
+                onHotSwapChanged();
+            return true;
+        }
+        case hotswap::Candidate::synthPreset:
+        {
+            juce::MemoryBlock data;
+            if (! file.loadFileAsData (data))
+                return false;
+            const auto* bytes = static_cast<const std::uint8_t*> (data.getData());
+            const auto synth = synthFromFlPreset (std::vector<std::uint8_t> (bytes, bytes + data.getSize()));
+            if (! synth)
+                return false;
+            ChannelDef c;
+            c.name = file.getFileNameWithoutExtension().toStdString();
+            c.instrument = InstrumentKind::synth;
+            c.synth = *synth;
+            return hotSwapLoadPlugin ([c] { return std::optional<ChannelDef> (c); }, {});
+        }
+        case hotswap::Candidate::sample:
+        {
+            const auto channel = hotswap::findChannel (song, target.instance);
+            if (channel < 0 || onHotSwapSample == nullptr)
+                return false;
+            onHotSwapSample (channel, file); // (the Channel Rack's own sample load: .speech files ask first)
+            return loaded();
+        }
+        default: break;
+    }
+    return false;
 }
 
 // --- what this Browser shows (round 163) ------------------------------------------------------------
@@ -2772,14 +4300,15 @@ void BrowserComponent::saveView() const
 
 bool BrowserComponent::lists (const juce::File& file) const
 {
-    return browserview::listed (file.getFileName().toStdString(), view.filter) || file.isDirectory();
+    // (round 190iz: under the tab's / Live entry's own filter: PRESETS, SOUNDS, Samples...)
+    return browserview::listed (file.getFileName().toStdString(), activeFilter()) || file.isDirectory();
 }
 
 std::shared_ptr<const search::FolderMatches> BrowserComponent::filterMatches() const
 {
-    if (view.filter == browserview::ContentFilter::all || searcher == nullptr)
+    const auto filter = activeFilter(); // (round 190iz)
+    if (filter == browserview::ContentFilter::all || searcher == nullptr)
         return nullptr;
-    const auto filter = view.filter;
     return searcher->service->folderMatches ((int) filter, [filter] (const std::string& name) { return browserview::listed (name, filter); });
 }
 
@@ -3137,6 +4666,28 @@ juce::PopupMenu BrowserComponent::buildViewMenu()
     addViewItems (menu);
     juce::Component::SafePointer<BrowserComponent> safe (this);
     menu.addSeparator();
+    // round 190ce (the reference's preview switch): off = a selected file is shown, not played; Play on the strip plays it
+    menu.addItem (tr ("Preview files when they are selected"), true, autoPreview, [safe] {
+        autoPreview = ! autoPreview;
+        if (! autoPreview && safe != nullptr)
+            safe->stopPreview();
+        if (safe != nullptr && safe->onPreviewVolumeChanged != nullptr)
+            safe->onPreviewVolumeChanged(); // (saved with the preview volume)
+    });
+    // FL's Browser menu › View "Auto-hide" (round 190mv, DF-107; capture 190mv A2: only a floating Browser hides)
+    if (role != Role::samples && onAutoHideChanged != nullptr)
+        menu.addItem (tr ("Auto-hide"), true, autoHide, [safe] {
+            autoHide = ! autoHide;
+            if (safe != nullptr && safe->onAutoHideChanged != nullptr)
+                safe->onAutoHideChanged();
+        });
+    // FL's Browser menu › View "Full sample preview" (round 190iz; off: a click plays the first 5 seconds, as FL)
+    menu.addItem (tr ("Full sample preview"), true, engine.isFullSamplePreview(), [safe] {
+        if (safe == nullptr)
+            return;
+        safe->engine.setFullSamplePreview (! safe->engine.isFullSamplePreview());
+        safe->savePrefs();
+    });
     // LYNX's own (round 190aq, off by default): loops are auditioned at the project's tempo, starting on the beat
     menu.addItem (tr ("Preview in time (loops play at the project's tempo, on the beat)"), true, engine.isPreviewInTime(), [safe] {
         if (safe == nullptr)
@@ -3145,6 +4696,10 @@ juce::PopupMenu BrowserComponent::buildViewMenu()
         if (safe->onPreviewVolumeChanged != nullptr)
             safe->onPreviewVolumeChanged(); // (saved with the preview volume)
     });
+    // round 190kx (Simple layout, as BandLab): dropped loops take the tempo and key found in their audio
+    if (showsLoopRowInfo())
+        menu.addItem (tr ("Dropped loops take the tempo and key found in their audio"), true, loopanalysis::dropDetects().load(),
+                      [] { workflowextras::setExtra ("simple.loopDetect", ! loopanalysis::dropDetects().load()); });
     menu.addSeparator();
     menu.addItem (tr ("Refresh"), [safe] { if (safe != nullptr) safe->rebuildRoots(); });
     menu.addItem (tr ("Refresh search index"), [safe] { if (safe != nullptr) safe->refreshSearchIndex (false); });
@@ -3173,6 +4728,8 @@ public:
             wire (browser);
         addAndMakeVisible (browser);
         setSize (340, 620);
+        if (std::exchange (BrowserComponent::openLoopsNext, false)) // (round gaps190kf: the Simple layout's Loops tile)
+            browser.setLoopsShown (true);
     }
 
     ~SampleBrowserHost() override
@@ -3196,11 +4753,83 @@ public:
 
     void resized() override { browser.setBounds (getLocalBounds()); }
 
+    // issue #174: a sample dragged from this window onto a plugin's own editor (or out of LYNX) goes on as a file drag
+    bool shouldDropFilesWhenDraggedExternally (const juce::DragAndDropTarget::SourceDetails& details, juce::StringArray& files,
+                                               bool& canMoveFiles) override
+    {
+        return externaldrag::shouldDropFiles (details, nullptr, files, canMoveFiles);
+    }
+
     static juce::File file() { return PluginHost::settingsFolder().getChildFile ("sample-browser-view.txt"); }
 
     BrowserComponent browser;
 };
 } // namespace
+
+namespace
+{
+// Round 190lx (DS-42): the Simple layout's Loops dock (BrowserComponent::makeLoopsDock)
+class LoopsDock final : public juce::Component
+{
+public:
+    LoopsDock (AudioEngine& engine, const std::function<void (BrowserComponent&)>& wire, std::function<void()> closed)
+        : browser (engine, BrowserComponent::Role::samples), onClose (std::move (closed))
+    {
+        if (wire != nullptr)
+            wire (browser);
+        title.setText (tr ("Loops"), juce::dontSendNotification);
+        title.setFont (theme::font (theme::type::title, true));
+        title.setColour (juce::Label::textColourId, theme::colour::textPrimary);
+        title.setInterceptsMouseClicks (false, false);
+        closeButton.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));
+        closeButton.setTooltip (tr ("Close"));
+        closeButton.onClick = [this] {
+            if (onClose != nullptr)
+                onClose();
+        };
+        addAndMakeVisible (title);
+        addAndMakeVisible (closeButton);
+        addAndMakeVisible (browser);
+        browser.setLoopsShown (true);
+        setTitle (tr ("Loops"));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (theme::colour::bg2);
+        g.setColour (theme::colour::border); // (BandLab: a 1 px edge on the left)
+        g.drawVerticalLine (0, 0.0f, (float) getHeight());
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().withTrimmedLeft (1);
+        auto head = r.removeFromTop (36).reduced (12, 4);
+        closeButton.setBounds (head.removeFromRight (28));
+        title.setBounds (head);
+        browser.setBounds (r);
+    }
+
+    BrowserComponent browser;
+
+private:
+    juce::Label title;
+    juce::TextButton closeButton;
+    std::function<void()> onClose;
+};
+} // namespace
+
+std::unique_ptr<juce::Component> BrowserComponent::makeLoopsDock (AudioEngine& engine, const std::function<void (BrowserComponent&)>& wire,
+                                                                  std::function<void()> onClose)
+{
+    return std::make_unique<LoopsDock> (engine, wire, std::move (onClose));
+}
+
+BrowserComponent* BrowserComponent::browserOfLoopsDock (juce::Component* dock)
+{
+    auto* d = dynamic_cast<LoopsDock*> (dock);
+    return d != nullptr ? &d->browser : nullptr;
+}
 
 std::unique_ptr<juce::Component> BrowserComponent::makeSampleBrowserContent (AudioEngine& engine, const std::function<void (BrowserComponent&)>& wire)
 {
@@ -3303,51 +4932,203 @@ void BrowserComponent::rebuildRoots()
     refreshViewButton();
     refreshFoldersPanel();
 
-    starred.clear();
-    for (const auto& line : juce::StringArray::fromLines (starredFile().loadFileAsString()))
-        if (line.trim().isNotEmpty() && juce::File::isAbsolutePath (line.trim()))
-            starred.addIfNotAlreadyThere (line.trim());
+    loadCollections();
+    if (liveLayout) // round 190iz: Live's Places follow the folders
+        sidebar->refresh();
 
     rebuildTree();
 }
 
+// A collection's items for the STARRED tab and Live's Collections (round 190iz: from the STARRED tab's code of round 190ce):
+// folders first (each opens like the ALL tab's), then files, then Plugin database entries, each by name; missing files
+// and plugins that are gone are left out.
+std::vector<std::unique_ptr<BrowserComponent::FileTree::Node>> BrowserComponent::FileTree::collectionNodes (BrowserComponent& browser, int collection)
+{
+    const auto& store = collectionStore();
+    std::vector<std::unique_ptr<FileTree::Node>> out;
+    juce::Array<juce::File> folders, files;
+    std::vector<std::unique_ptr<FileTree::Node>> plugins;
+    for (const auto& item : store.itemsOf (collection))
+    {
+        if (collections::isPluginItem (item))
+        {
+            if (auto n = FileTree::makePluginItem (browser, collections::pluginKeyOf (item)))
+                plugins.push_back (std::move (n));
+            continue;
+        }
+        if (const juce::File f (juce::String::fromUTF8 (item.c_str())); f.isDirectory())
+            folders.add (f);
+        else if (f.existsAsFile())
+            files.add (f);
+    }
+    const auto byName = [] (const juce::File& a, const juce::File& b) { return a.getFileName().compareNatural (b.getFileName()) < 0; };
+    std::sort (folders.begin(), folders.end(), byName);
+    std::sort (files.begin(), files.end(), byName);
+    std::sort (plugins.begin(), plugins.end(), [] (const auto& a, const auto& b) { return a->label.compareNatural (b->label) < 0; });
+    for (const auto& f : folders)
+        out.push_back (FileTree::makeFolder (f, f.getFileName(), collectionColour (collection)));
+    for (const auto& f : files)
+    {
+        auto n = std::make_unique<FileTree::Node>();
+        n->file = f;
+        out.push_back (std::move (n));
+    }
+    for (auto& n : plugins)
+        out.push_back (std::move (n));
+    return out;
+}
+
+// Round 190iz: Live's Instruments / Audio Effects / MIDI Effects / Plug-Ins / Modulators: the Plugin database entries
+// of that kind as one list, by name (the same rows, double-click and drag as in the database's tree)
+std::vector<std::unique_ptr<BrowserComponent::FileTree::Node>> BrowserComponent::FileTree::livePluginNodes (BrowserComponent& browser, browserplaces::Category category)
+{
+    std::vector<std::unique_ptr<FileTree::Node>> out;
+    auto safe = juce::Component::SafePointer<BrowserComponent> (&browser);
+    auto& engine = browser.engine;
+    const auto wanted = browserplaces::wantsPlugins (category);
+    if (wanted != 0)
+        for (auto& e : quickpick::generatorEntries (engine))
+        {
+            const char* groups[] = { "LYNX", "FL engines", "VFX", "" };
+            if (! browserplaces::keepsPlugin (category, true, groups[juce::jlimit (0, 3, e.folder)], e.label.toStdString()))
+                continue;
+            auto n = std::make_unique<FileTree::Node>();
+            n->kind = FileTree::Kind::plugin;
+            n->pluginKey = e.key;
+            n->label = quickpick::shownName (engine, e.key, e.label);
+            n->original = e.label;
+            n->detail = e.detail;
+            n->icon = e.folder == 3 ? Icon::plugin : Icon::keyboard;
+            n->generator = e.make;
+            n->activate = [safe, make = e.make] {
+                if (auto c = make(); c && safe != nullptr && safe->onAddInstrument)
+                    safe->onAddInstrument (std::move (*c));
+            };
+            out.push_back (std::move (n));
+        }
+    if (wanted != 1)
+        for (auto& e : quickpick::effectEntries (engine))
+        {
+            const char* groups[] = { "LYNX", "FL engines", "", "" };
+            if (! browserplaces::keepsPlugin (category, false, groups[juce::jlimit (0, 3, e.folder)], e.label.toStdString()))
+                continue;
+            auto n = std::make_unique<FileTree::Node>();
+            n->kind = FileTree::Kind::plugin;
+            n->pluginKey = e.key;
+            n->label = quickpick::shownName (engine, e.key, e.label);
+            n->original = e.label;
+            n->detail = e.detail;
+            n->icon = e.folder == 3 ? Icon::plugin : Icon::mixer;
+            n->effect = e.make;
+            n->activate = [safe, make = e.make] {
+                if (auto fx = make(); fx && safe != nullptr && safe->onAddEffect)
+                    safe->onAddEffect (std::move (*fx));
+            };
+            out.push_back (std::move (n));
+        }
+    std::stable_sort (out.begin(), out.end(), [] (const auto& a, const auto& b) { return a->label.compareNatural (b->label) < 0; });
+    return out;
+}
+
+bool BrowserComponent::showsRoot (int i) const
+{
+    if (! juce::isPositiveAndBelow (i, allRoots.size()) || ! roots.contains (allRoots[i]))
+        return false; // hidden from this Browser (round 163)
+    const auto kind = allRootKinds[(std::size_t) i];
+    if (liveLayout)
+    {
+        if (liveSelection.category == browserplaces::Category::folder)
+            return allRoots[i].getFullPathName().toStdString() == liveSelection.path;
+        return browserplaces::categoryShowsRoot (liveSelection.category, kind);
+    }
+    return browserplaces::tabShowsRoot ((browserplaces::Tab) tab, kind);
+}
+
+browserview::ContentFilter BrowserComponent::activeFilter() const
+{
+    if (liveLayout)
+        return browserplaces::categoryFilter (liveSelection.category, view.filter);
+    return browserplaces::tabFilter ((browserplaces::Tab) tab, view.filter);
+}
+
 void BrowserComponent::rebuildTree()
 {
+    using browserplaces::Category;
     std::vector<std::unique_ptr<FileTree::Node>> top;
-    if (tab == starredTab)
-    {
-        // folders first (each opens like the ALL tab's), then files, both by name; missing ones are left out
-        juce::Array<juce::File> folders, files;
-        for (const auto& path : starred)
-            if (const juce::File f (path); f.isDirectory())
-                folders.add (f);
-            else if (f.existsAsFile())
-                files.add (f);
-        const auto byName = [] (const juce::File& a, const juce::File& b) { return a.getFileName().compareNatural (b.getFileName()) < 0; };
-        std::sort (folders.begin(), folders.end(), byName);
-        std::sort (files.begin(), files.end(), byName);
-        for (const auto& f : folders)
-            top.push_back (FileTree::makeFolder (f, f.getFileName(), theme::colour::accent));
-        for (const auto& f : files)
-        {
-            auto n = std::make_unique<FileTree::Node>();
-            n->file = f;
-            top.push_back (std::move (n));
-        }
+    const auto cat = liveSelection.category;
+    categoryQuery = {};
+    auto finish = [this, &top] {
         tree->setTopLevel (std::move (top));
         treeView->setViewPosition (0, 0);
+    };
+    if (liveLayout && cat == Category::collection) // round 190iz: Live's Collections
+    {
+        top = FileTree::collectionNodes (*this, liveSelection.collection);
+        finish();
         return;
     }
-    if (tab == projectTab || view.shows (browserview::projectRootId))
-        top.push_back (FileTree::makeProject (tab == projectTab));
-    if (tab == allTab && view.shows (browserview::pluginsRootId)) // FL's Plugin database, under the project (round 142)
+    if (! liveLayout && tab == starredTab)
+    {
+        // Only Starred switched on (as it is at first): its items alone, the tab as it always was. More than one (or
+        // another one): each collection under its heading.
+        const auto shown = collectionStore().shown();
+        if (shown.size() == 1 && shown.front() == 0)
+            top = FileTree::collectionNodes (*this, 0);
+        else
+            for (const auto c : shown)
+            {
+                auto items = FileTree::collectionNodes (*this, c);
+                auto heading = FileTree::makeCollection (c, (int) items.size(), closedCollections.count (c) == 0);
+                heading->children = std::move (items);
+                top.push_back (std::move (heading));
+            }
+        finish();
+        return;
+    }
+    // round 190iz: FL's PLUGINS tab (the Plugin database, opened) and Live's plugin categories (one list each)
+    if (liveLayout ? (browserplaces::wantsPlugins (cat) >= 0 && cat != Category::all) : tab == pluginsTab)
+    {
+        if (liveLayout)
+            top = FileTree::livePluginNodes (*this, cat);
+        else
+        {
+            auto db = FileTree::makePluginDatabase (*this, openPluginFolders);
+            db->expanded = true;
+            top.push_back (std::move (db));
+        }
+        finish();
+        return;
+    }
+    const auto allLike = liveLayout ? cat == Category::all : tab == allTab;
+    if (liveLayout ? (cat == Category::currentProject || (allLike && view.shows (browserview::projectRootId)))
+                   : (tab == projectTab || (allLike && view.shows (browserview::projectRootId))))
+        top.push_back (FileTree::makeProject (shownTab() == projectTab));
+    // FL's Plugin database, under the project (round 142); always while hot-swap is on (round 190ce: it is what the
+    // linked device is replaced from, also when the user's view leaves it out)
+    if (allLike && (view.shows (browserview::pluginsRootId) || swapSession.active()))
+    {
+        browserStartupMark ("  browser: roots (FL folders, user folders, view, collections)");
         top.push_back (FileTree::makePluginDatabase (*this, openPluginFolders));
+        browserStartupMark ("  browser: the Plugin database tree");
+    }
+    // round 190ke (owner decision D2): LYNX's own content with its tags, in the Simple layout
+    if (! liveLayout && layoutstyle::current() == layoutstyle::Style::simple && (allLike || tab == presetsTab || tab == soundsTab))
+        top.push_back (FileTree::makeFactoryRoot (*this, openFactoryFolders));
 
-    if (tab == allTab)
+    if (liveLayout && cat == Category::templates) // round 190iz: Live's Templates: the user's project templates
+    {
+        if (const auto folder = userTemplatesFolder(); folder.isDirectory())
+        {
+            auto n = FileTree::makeFolder (folder, tr ("Templates"), rootColour (99));
+            n->expanded = true;
+            top.push_back (std::move (n));
+        }
+    }
+    else if (liveLayout || allLike || tab == presetsTab || tab == soundsTab)
         for (int i = 0; i < allRoots.size(); ++i)
         {
-            if (! roots.contains (allRoots[i]))
-                continue; // hidden from this Browser (round 163)
+            if (! showsRoot (i))
+                continue;
             if (const auto merged = withMerged ({ allRoots[i] });
                 std::all_of (merged.begin(), merged.end(), [this] (const juce::File& f) { return filterHides (f); }))
                 continue; // nothing in it is listed under the content filter (round 164)
@@ -3357,23 +5138,46 @@ void BrowserComponent::rebuildTree()
             n->also = mergedInto (allRoots[i]);
             if (allRootKinds[(std::size_t) i] == browserview::RootKind::flMidi)
                 n->icon = Icon::note; // (FL's Scores folder has a note)
+            if (liveLayout && cat == Category::folder) // (Live's place: its content at once)
+                n->expanded = true;
             top.push_back (std::move (n));
         }
 
-    tree->setTopLevel (std::move (top));
-    treeView->setViewPosition (0, 0);
+    finish();
+    // Live's Drums (round 190iz): the sample places searched for drum words, in the results list
+    if (liveLayout && cat == Category::drums)
+    {
+        categoryQuery = browserplaces::drumsQuery();
+        runSearch();
+    }
 }
 
 void BrowserComponent::setTab (int newTab)
 {
     newTab = juce::jlimit (0, tabCount - 1, newTab);
+    if (liveLayout) // round 190iz: no tabs in the Clip-launch layout: Live's All / Current Project / Favorites instead
+    {
+        browserplaces::Entry e;
+        if (newTab == projectTab)
+            e.category = browserplaces::Category::currentProject;
+        else if (newTab == starredTab)
+        {
+            e.group = browserplaces::Group::collections;
+            e.category = browserplaces::Category::collection;
+            e.collection = 0;
+        }
+        if (e.category != liveSelection.category || e.collection != liveSelection.collection || ! liveSelection.path.empty())
+            showLiveEntry (e);
+        return;
+    }
     if (newTab == tab)
         return;
     tab = newTab;
     rebuildTree();
     tabs->repaint();
-    if (searchBox.getText().isNotEmpty())
+    if (searchBox.getText().isNotEmpty() || tagFilterActive()) // (round 190iz: the tag filter too)
         runSearch();
+    savePrefs(); // round 190iz: FL remembers the last tab (LastTabIndex)
 }
 
 void BrowserComponent::setProjectFile (const juce::File& file)
@@ -3384,8 +5188,45 @@ void BrowserComponent::setProjectFile (const juce::File& file)
     rebuildTree(); // the "Project folder" entry follows the project
 }
 
+// round 190kx: the loop analysis' worker, made on first use
+loopinfo::Shared& BrowserComponent::loopInfoShared()
+{
+    if (loopInfo == nullptr)
+    {
+        loopInfo = loopinfo::Shared::get (engine);
+        loopInfo->addChangeListener (this);
+    }
+    return *loopInfo;
+}
+
+bool BrowserComponent::showsLoopRowInfo() const { return ! liveLayout && layoutstyle::current() == layoutstyle::Style::simple; }
+
+void BrowserComponent::loopInfoChanged()
+{
+    tree->refreshLoopTexts();
+    // the Loop Browser lists again with the new tempos and keys (at most twice a second: its rows are rebuilt)
+    if (loopsShown && ! std::exchange (loopFilterAgainAsked, true))
+        juce::Timer::callAfterDelay (500, [safe = juce::Component::SafePointer<BrowserComponent> (this)] {
+            if (safe == nullptr)
+                return;
+            safe->loopFilterAgainAsked = false;
+            if (safe->loopsShown)
+                safe->applyLoopFilter();
+        });
+}
+
 void BrowserComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
 {
+    if (loopInfo != nullptr && source == loopInfo.get())
+    {
+        loopInfoChanged();
+        return;
+    }
+    if (source == &loopLengthsRead())
+    {
+        loopLengthsArrived();
+        return;
+    }
     if (source == &searcher->statusChanged)
     {
         indexStatusChanged();
@@ -3399,12 +5240,25 @@ void BrowserComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
     if (source == &searcher->indexChanged)
     {
         applyFilterToTree();
+        if (loopsShown) // (round gaps190kf: the loops are listed again, in place)
+        {
+            runLoopSearch();
+            return;
+        }
         // the background check found changed folders: the results shown are searched again, in place
-        if (resultsView->isVisible() && tab != projectTab && searchBox.getText().trim().isNotEmpty())
+        if (resultsView->isVisible() && shownTab() != projectTab && searchBox.getText().trim().isNotEmpty())
             runSearch (true);
         return;
     }
 
+    // round 190ce: the device the Browser is linked to was deleted (or the project replaced): the link ends
+    if (swapSession.active())
+    {
+        if (! swapSession.stillValid (engine.getSong()))
+            endHotSwap();
+        else
+            swapBar->repaint();
+    }
     // the project changed: its sections are listed again a moment later (not on every knob step)
     projectDirty = true;
     if (! isTimerRunning())
@@ -3428,6 +5282,72 @@ void BrowserComponent::addUserFolder()
     });
 }
 
+int BrowserComponent::addUserFolders (const juce::StringArray& paths)
+{
+    std::vector<std::string> dropped;
+    juce::StringArray names;
+    for (const auto& path : paths)
+        if (const juce::File folder (path); folder.isDirectory())
+            dropped.push_back (folder.getFullPathName().toStdString());
+    if (dropped.empty())
+        return 0;
+    std::vector<std::string> list;
+    for (const auto& line : juce::StringArray::fromLines (userFoldersFile().loadFileAsString()))
+        list.push_back (line.toStdString());
+    const auto added = userfolders::add (list, dropped, ! juce::File::areFileNamesCaseSensitive());
+    if (added.empty())
+    {
+        showNote (dropped.size() == 1 ? tr ("{0} is in the Browser already", { juce::File (juce::String::fromUTF8 (dropped.front().c_str())).getFileName() })
+                                      : tr ("These folders are in the Browser already"));
+        return 0;
+    }
+    juce::StringArray lines;
+    for (const auto& l : list)
+        lines.add (juce::String::fromUTF8 (l.c_str()));
+    userFoldersFile().getParentDirectory().createDirectory();
+    userFoldersFile().replaceWithText (lines.joinIntoString ("\n"));
+    setTab (allTab);
+    rebuildRoots();
+    for (auto* other : liveBrowsers()) // (the other Browsers list the same folders)
+        if (other != this)
+            other->reloadUserFolders();
+    showNote (added.size() == 1 ? tr ("Added {0} to the Browser", { juce::File (juce::String::fromUTF8 (added.front().c_str())).getFileName() })
+                                : tr ("Added {0} folders to the Browser", { juce::String ((int) added.size()) }));
+    return (int) added.size();
+}
+
+bool BrowserComponent::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    return std::any_of (files.begin(), files.end(), [] (const juce::String& f) { return juce::File (f).isDirectory(); });
+}
+
+void BrowserComponent::fileDragEnter (const juce::StringArray&, int, int)
+{
+    folderDragOver = true;
+    repaint();
+}
+
+void BrowserComponent::fileDragExit (const juce::StringArray&)
+{
+    folderDragOver = false;
+    repaint();
+}
+
+void BrowserComponent::filesDropped (const juce::StringArray& files, int, int)
+{
+    folderDragOver = false;
+    repaint();
+    addUserFolders (files);
+}
+
+void BrowserComponent::paintOverChildren (juce::Graphics& g)
+{
+    if (! folderDragOver)
+        return;
+    g.setColour (theme::colour::accent);
+    g.drawRect (getLocalBounds(), 2);
+}
+
 void BrowserComponent::removeUserFolder (const juce::File& folder)
 {
     auto lines = juce::StringArray::fromLines (userFoldersFile().loadFileAsString());
@@ -3443,13 +5363,17 @@ void BrowserComponent::removeUserFolder (const juce::File& folder)
 
 BrowserComponent::~BrowserComponent()
 {
+    std::erase (liveBrowsers(), this);
     engine.removeChangeListener (this);
     searcher->statusChanged.removeChangeListener (this);
     searcher->indexChanged.removeChangeListener (this);
+    loopLengthsRead().removeChangeListener (this);
     searcher->service->cancelSearch();
     similar->statusChanged.removeChangeListener (this);
     if (similarId != 0)
         similar->service->cancel();
+    if (loopInfo != nullptr)
+        loopInfo->removeChangeListener (this);
     focusWatcher.reset();
     engine.previewFile ({});
 }
@@ -3462,12 +5386,29 @@ void BrowserComponent::waitForListing (int)
 void BrowserComponent::resized()
 {
     auto area = getLocalBounds().reduced (4);
-    tabs->setBounds (area.removeFromTop (26));
-    area.removeFromTop (4);
+    if (swapBar->isVisible()) // round 190ce: the hot-swap bar over the tabs
+    {
+        swapBar->setBounds (area.removeFromTop (HotSwapBar::height));
+        area.removeFromTop (3);
+    }
+    // round 190iz: FL's six icon tabs (Pattern / Simple layouts); the Clip-launch layout has Live's sidebar instead
+    tabs->setVisible (! liveLayout);
+    if (! liveLayout)
+    {
+        tabs->setBounds (area.removeFromTop (TabBar::preferredHeight));
+        area.removeFromTop (2);
+    }
     {
         auto row = area.removeFromTop (24);
         viewButton.setBounds (row.removeFromRight (22));
         row.removeFromRight (4);
+        tagsButton->setBounds (row.removeFromRight (TagsButton::width)); // (FL's TAGS button in the search row)
+        row.removeFromRight (4);
+        if (loopsButton->isVisible()) // (round gaps190kf: the Sample browser window's LOOPS)
+        {
+            loopsButton->setBounds (row.removeFromRight (LoopsButton::width));
+            row.removeFromRight (4);
+        }
         searchBox.setBounds (row);
     }
     // indexing progress / what the search found (round 162)
@@ -3479,11 +5420,30 @@ void BrowserComponent::resized()
     details->setVisible (details->hasFile() && area.getHeight() > 120);
     if (details->isVisible())
         details->setBounds (area.removeFromBottom (DetailsBox::preferredHeight).withX (0).withWidth (getWidth()));
+
+    // Live's two panes: the sidebar (about a third, 84-120 px) beside the content, whose top holds the tag chips and
+    // the "Name" column title
+    sidebarView->setVisible (liveLayout);
+    if (liveLayout)
+    {
+        const auto sideWidth = juce::jlimit (84, 120, area.getWidth() / 3);
+        sidebarView->setBounds (area.removeFromLeft (sideWidth));
+        sidebar->setSize (sideWidth - (sidebar->getHeight() > sidebarView->getHeight() ? 8 : 0), sidebar->getHeight());
+        area.removeFromLeft (1);
+    }
+    tagsPanel->setVisible (tagsPanelShown);
+    if (tagsPanelShown)
+        tagsPanel->setBounds (area.removeFromTop (tagsPanel->heightFor (area.getWidth())));
+    loopPanel->setVisible (loopsShown);
+    if (loopsShown) // (round gaps190kf: the grid takes at most about half the height; its rows scroll past that)
+        loopPanel->setBounds (area.removeFromTop (loopPanel->heightFor (area.getWidth(), juce::jmax (140, area.getHeight() / 2 + 40))));
+    nameHeader = liveLayout ? area.removeFromTop (18) : juce::Rectangle<int>();
     treeView->setBounds (area);
     resultsView->setBounds (area);
 
     for (auto* list : { tree.get(), results.get() })
     {
+        list->setLiveRows (liveLayout);
         list->setSize (area.getWidth() - 10, list->getHeight());
         list->updateSize();
     }
@@ -3501,6 +5461,16 @@ void BrowserComponent::paint (juce::Graphics& g)
 {
     const uitrace::Scope trace ("BrowserComponent paint", true, g.getClipBounds());
     g.fillAll (theme::colour::bg2);
+    if (auto header = nameHeader; ! header.isEmpty()) // round 190iz: Live's list title ("Name")
+    {
+        g.setColour (theme::colour::bg3);
+        g.fillRect (header);
+        g.setColour (theme::colour::border);
+        g.fillRect (header.removeFromBottom (1));
+        g.setFont (theme::font (theme::type::caption, true));
+        g.setColour (theme::colour::textSecondary);
+        g.drawText (tr ("Name"), header.withTrimmedLeft (8), juce::Justification::centredLeft, false);
+    }
     if (! statusArea.isEmpty())
     {
         g.setFont (theme::font (theme::type::caption));
@@ -3516,6 +5486,10 @@ void BrowserComponent::showPreviewForSnapshot (const juce::File& file)
 
 void BrowserComponent::fileSelected (const juce::File& file, bool preview)
 {
+    // round 190iz: what was asked for this preview (Shift+Click / Alt+Click / Play), then plain again
+    const auto startFraction = std::exchange (previewStartAsked, 0.0);
+    const auto full = std::exchange (previewFullAsked, false);
+    preview = previewWanted (preview); // (round 190ce: the automatic preview can be switched off)
     if (details != nullptr && file != juce::File())
     {
         const auto wasVisible = details->hasFile();
@@ -3536,11 +5510,11 @@ void BrowserComponent::fileSelected (const juce::File& file, bool preview)
 
     if (preview && file.existsAsFile())
     {
-        engine.previewFile (file);
+        engine.previewFile (file, startFraction, full); // (round 190iz: FL's 5 seconds unless full)
         previewedFile = file;
     }
 
-    strip->show (file, preview);
+    strip->show (file, preview, startFraction, full);
     tree->repaint();
     results->repaint();
 }
@@ -3554,6 +5528,22 @@ void BrowserComponent::addSystemItems (juce::PopupMenu& menu, const juce::File& 
 {
     menu.addSeparator();
     menu.addItem (tr ("Starred"), true, isStarred (file), [this, file] { setStarred (file, ! isStarred (file)); });
+    addCollectionItems (menu, file.getFullPathName().toStdString());
+    if (resultsView->isVisible() && shownTab() != projectTab) // round 190ce: from a search result to its place in the folders
+        menu.addItem (tr ("Show in its folder"), [safe = juce::Component::SafePointer<BrowserComponent> (this), file] {
+            if (safe == nullptr)
+                return;
+            safe->searchBox.setText ({}, false);
+            safe->runSearch();
+            if (safe->liveLayout) // (round 190iz: Live's All shows every place)
+                safe->showLiveEntry ({});
+            else
+                safe->setTab (allTab);
+            if (const auto row = safe->tree->revealFile (file); row >= 0)
+                safe->tree->select (row, false);
+            else
+                safe->showNote (tr ("This file is not in a folder the Browser shows"));
+        });
     juce::PopupMenu system;
     system.addItem (tr ("Open parent folder"), [file] { file.getParentDirectory().startAsProcess(); });
     system.addItem (tr ("Locate file"), [file] { file.revealToUser(); });
@@ -3594,12 +5584,18 @@ void BrowserComponent::confirmDeleteFile (const juce::File& file)
 
 void BrowserComponent::showFileMenu (const juce::File& file)
 {
+    buildFileMenu (file).showMenuAsync (juce::PopupMenu::Options().withMousePosition()); // (round 190iz: built apart for --shots)
+}
+
+juce::PopupMenu BrowserComponent::buildFileMenu (const juce::File& file)
+{
     juce::PopupMenu menu;
     menu.addSectionHeader (file.getFileName());
 
     if (isAudio (file))
     {
-        menu.addItem (tr ("Send to the selected channel"), onLoadIntoChannel != nullptr, false, [this, file] { onLoadIntoChannel (file); });
+        // FL's first item (REA round 143 B3; round 190iz: FL's own words and its focused-plugin rule, core/BrowserSend.h)
+        menu.addItem (tr ("Send to selected channel or focused plugin"), [this, file] { sendToSelected (file); });
         menu.addItem (tr ("Open in a new channel"), [this, file] { openFile (file); });
         menu.addSeparator();
         menu.addItem (tr ("Send to the Playlist as an audio clip"), onSendToPlaylist != nullptr, false, [this, file] { onSendToPlaylist (file); });
@@ -3614,8 +5610,14 @@ void BrowserComponent::showFileMenu (const juce::File& file)
         menu.addItem (tr ("Open project"), onOpenProject != nullptr, false, [this, file] { onOpenProject (file); });
     else if (file.hasFileExtension ("mid;midi"))
         menu.addItem (tr ("Open MIDI file"), onOpenProject != nullptr, false, [this, file] { onOpenProject (file); });
-    else if (file.hasFileExtension ("fst;gmsynth"))
+    else if (file.hasFileExtension ("fst;gmsynth") || genpresetui::isPresetFile (file))
+    {
+        if (pluginpresetui::isFlPresetOfPlugin (file)) // round 190iz: an FL preset of a hosted plugin
+            menu.addItem (tr ("Send to selected channel or focused plugin"), [this, file] { sendToSelected (file); });
         menu.addItem (tr ("Open in a new channel"), [this, file] { openFile (file); });
+    }
+    else if (pluginpresetui::isPresetFile (file)) // round 190iz: a hosted plugin's preset (.lynxpreset, .fxp, .vstpreset)
+        menu.addItem (tr ("Send to selected channel or focused plugin"), [this, file] { sendToSelected (file); });
     else if (file.hasFileExtension ("sf2;sf3;sfz"))
     {
         const auto selected = engine.getSelectedChannel();
@@ -3625,13 +5627,22 @@ void BrowserComponent::showFileMenu (const juce::File& file)
         menu.addItem (tr ("Open in a new channel"), [this, file] { openSoundFontFile (engine, file); });
         menu.addItem (tr ("Send to the selected channel"), selectedIsFont, false, [this, file, selected] { openSoundFontFile (engine, file, selected); });
     }
+    else if (isSamplerInstrumentFile (file))
+    {
+        const auto selected = engine.getSelectedChannel();
+        const auto& song = engine.getSong();
+        const auto selectedIsDw = selected >= 0 && selected < (int) song.channels.size()
+                                  && song.channels[(std::size_t) selected].instrument == InstrumentKind::directwave;
+        menu.addItem (tr ("Open in a new channel"), [this, file] { openSamplerInstrumentFile (engine, file); });
+        menu.addItem (tr ("Send to the selected channel"), selectedIsDw, false, [this, file, selected] { openSamplerInstrumentFile (engine, file, selected); });
+    }
 
     addSystemItems (menu, file);
     menu.addItem (tr ("Collapse all folders"), [this] { tree->collapseAll(); });
     juce::PopupMenu browserMenu;
     addViewItems (browserMenu);
     menu.addSubMenu (tr ("Browser"), browserMenu);
-    menu.showMenuAsync (juce::PopupMenu::Options().withMousePosition());
+    return menu;
 }
 
 void BrowserComponent::showFolderMenu (const juce::File& folder, std::function<void()> expandAll)
@@ -3642,10 +5653,12 @@ void BrowserComponent::showFolderMenu (const juce::File& folder, std::function<v
     menu.addItem (tr ("Expand all"), expandAll != nullptr, false, [expandAll] { expandAll(); });
     menu.addItem (tr ("Collapse all"), [this] { tree->collapseAll(); });
     menu.addItem (tr ("Starred"), folder.isDirectory(), isStarred (folder), [this, folder] { setStarred (folder, ! isStarred (folder)); });
+    if (folder.isDirectory())
+        addCollectionItems (menu, folder.getFullPathName().toStdString());
     menu.addItem (tr ("Open in the file manager"), [folder] { folder.startAsProcess(); });
     menu.addItem (tr ("Copy the file path"), [folder] { juce::SystemClipboard::copyTextToClipboard (folder.getFullPathName()); });
     menu.addSeparator();
-    if (const auto id = rootId (folder); id.isNotEmpty() && tab == allTab)
+    if (const auto id = rootId (folder); id.isNotEmpty() && shownTab() == allTab)
     {
         addHideItem (menu, id, allRootNames[allRoots.indexOf (folder)]);
         if (allRootKinds[(std::size_t) allRoots.indexOf (folder)] == browserview::RootKind::user)
@@ -3705,12 +5718,31 @@ juce::Array<juce::File> BrowserComponent::searchRoots() const
     // the top-level folder holding the selection; nothing selected there: every folder
     if (const auto root = tree->selectedRoot(); root.isDirectory())
         return withMerged ({ root });
-    if (tab == starredTab) // the starred folders
+    if (liveLayout && liveSelection.category == browserplaces::Category::collection) // round 190iz: Live's collection
     {
         juce::Array<juce::File> folders;
-        for (const auto& path : starred)
-            if (const juce::File f (path); f.isDirectory())
-                folders.add (f);
+        for (const auto& item : collectionStore().itemsOf (liveSelection.collection))
+            if (const juce::File f (juce::String::fromUTF8 (item.c_str())); ! collections::isPluginItem (item) && f.isDirectory())
+                folders.addIfNotAlreadyThere (f);
+        return folders;
+    }
+    if (liveLayout || tab == presetsTab || tab == soundsTab) // round 190iz: the places the tab / Live entry lists
+    {
+        juce::Array<juce::File> shown;
+        for (int i = 0; i < allRoots.size(); ++i)
+            if (showsRoot (i))
+                shown.add (allRoots[i]);
+        if (liveLayout && liveSelection.category == browserplaces::Category::templates)
+            shown.add (userTemplatesFolder());
+        return withMerged (shown);
+    }
+    if (tab == starredTab) // the folders of the collections shown
+    {
+        juce::Array<juce::File> folders;
+        for (const auto c : collectionStore().shown())
+            for (const auto& item : collectionStore().itemsOf (c))
+                if (const juce::File f (juce::String::fromUTF8 (item.c_str())); ! collections::isPluginItem (item) && f.isDirectory())
+                    folders.addIfNotAlreadyThere (f);
         return folders;
     }
     return withMerged (roots);
@@ -3752,11 +5784,11 @@ void BrowserComponent::setSearchForSnapshot (const juce::String& text)
         answer->second = r;
     });
     searcher->service->waitIdle (120000);
-    juce::Array<juce::File> found;
+    auto found = collectionMatches (text); // (round 190ce: as searchAnswered, the collections' names first)
     {
         const std::lock_guard<std::mutex> guard (answer->first);
         for (const auto& path : answer->second.paths)
-            found.add (juce::File (juce::String::fromUTF8 (path.c_str())));
+            found.addIfNotAlreadyThere (juce::File (juce::String::fromUTF8 (path.c_str())));
     }
     results->setFiles (found, scope, found.isEmpty() ? tr ("Nothing found for \"{0}\".", { text }) : juce::String());
     if (! found.isEmpty())
@@ -3844,6 +5876,35 @@ void BrowserComponent::showPluginDatabase (const juce::String& folder, int gener
     }
 }
 
+bool BrowserComponent::locateFile (const juce::File& file)
+{
+    if (searchBox.getText().isNotEmpty())
+    {
+        searchBox.setText ({}, false);
+        runSearch();
+    }
+    if (liveLayout) // (round 190iz: Live's All shows every place)
+        showLiveEntry ({});
+    else
+        setTab (allTab);
+    if (const auto row = tree->revealFile (file); row >= 0)
+    {
+        tree->select (row, false);
+        tree->grabKeyboardFocus();
+        return true;
+    }
+    showNote (tr ("This file is not in a folder the Browser shows"));
+    return false;
+}
+
+juce::Rectangle<int> BrowserComponent::selectedRowScreenBounds() const
+{
+    if (tree == nullptr || ! tree->isShowing() || tree->getSelectedRow() < 0)
+        return {};
+    const auto row = tree->getSelectedRow();
+    return tree->localAreaToGlobal (juce::Rectangle<int> (0, row * tree->rowHeight, tree->getWidth(), tree->rowHeight));
+}
+
 void BrowserComponent::showScores (const juce::String& subfolder)
 {
     // the Piano roll's File › Browse scores (round 168g; FL: FUN_0123a580 opens its browser at the Scores folder): the
@@ -3873,6 +5934,60 @@ void BrowserComponent::showScores (const juce::String& subfolder)
             return;
         }
     showNote (tr ("FL Studio's scores were not found (FL Studio is not installed)"));
+}
+
+void BrowserComponent::showFactoryContentForSnapshot (const juce::StringArray& openFolders)
+{
+    openFactoryFolders.clear();
+    for (const auto& f : openFolders)
+        openFactoryFolders.insert (f);
+    rebuildTree();
+}
+
+juce::StringArray BrowserComponent::rowLabelsForCheck() const { return tree->rowLabels(); }
+
+// round 190kx (--loopinfo190kxshot): waits for the loop analysis of what is listed, then fills the rows / Loop Browser
+bool BrowserComponent::waitLoopInfoForSnapshot (int timeoutMs)
+{
+    if (loopInfo == nullptr)
+        return true;
+    const auto idle = loopInfo->service().waitIdle (timeoutMs);
+    tree->refreshLoopTexts();
+    if (loopsShown)
+        applyLoopFilter();
+    return idle;
+}
+
+std::size_t BrowserComponent::loopInfoQueuedForCheck() { return loopInfo != nullptr ? loopInfo->service().queued() : 0; }
+
+juce::StringArray BrowserComponent::loopRowTextsForCheck() const
+{
+    juce::StringArray out;
+    for (int i = 0; i < tree->numRows(); ++i)
+        if (const auto* n = tree->nodeAt (i); n != nullptr && n->loopText.isNotEmpty())
+            out.add (n->file.getFileNameWithoutExtension() + ": " + n->loopText);
+    return out;
+}
+juce::StringArray BrowserComponent::resultLabelsForCheck() const { return results->rowLabels(); }
+
+// FL's General › Undo history › "Show undo history in the browser when undoing changes" (round 190mr, DF-135): the
+// Browser's Current project › History opens, its header scrolled into view
+void BrowserComponent::showHistory()
+{
+    setTab (projectTab);
+    tree->openProjectSections ({ Category::history });
+    tree->scrollRowIntoView (tree->categoryRow (Category::history));
+}
+
+bool BrowserComponent::historyShownForCheck() const
+{
+    return shownTab() == projectTab && tree->categoryOpen (Category::history);
+}
+
+bool BrowserComponent::revealProjectPattern (int pattern)
+{
+    setTab (projectTab);
+    return tree->revealPattern (pattern) >= 0;
 }
 
 void BrowserComponent::showProjectForSnapshot()
@@ -3939,7 +6054,7 @@ void BrowserComponent::timerCallback()
     if (std::exchange (projectDirty, false))
     {
         tree->refreshProject();
-        if (tab == projectTab && resultsView->isVisible())
+        if (shownTab() == projectTab && resultsView->isVisible())
             runSearch();
     }
 }
@@ -3951,7 +6066,7 @@ void BrowserComponent::runSearch (bool quiet)
     if (similarTo != juce::File())
     {
         // similar samples are listed while the box still says so; any other text is an ordinary search again
-        if (tab != projectTab && searchBox.getText() == similarLabel())
+        if (shownTab() != projectTab && searchBox.getText() == similarLabel())
         {
             runSimilar (quiet);
             return;
@@ -3961,7 +6076,20 @@ void BrowserComponent::runSearch (bool quiet)
         if (std::exchange (similarId, 0) != 0)
             similar->service->cancel();
     }
-    const auto query = searchBox.getText().trim();
+    if (loopsShown) // round gaps190kf: the Loop Browser's list (the box's text narrows it by name)
+    {
+        if (loopInfos.empty() && ! loopsAnswer)
+            runLoopSearch();
+        else
+            applyLoopFilter();
+        return;
+    }
+    if (tagFilterActive()) // round 190iz: tags picked in the tags panel, or "#tag" in the box
+    {
+        runTagFilter();
+        return;
+    }
+    const auto query = effectiveQuery(); // (round 190iz: Live's Drums searches when the box is empty)
     resultsView->setVisible (query.isNotEmpty());
     treeView->setVisible (query.isEmpty());
 
@@ -3972,7 +6100,7 @@ void BrowserComponent::runSearch (bool quiet)
         return;
     }
 
-    if (tab == projectTab) // the project's own items, at once
+    if (shownTab() == projectTab) // the project's own items, at once
     {
         auto found = FileTree::projectMatches (engine.getSong(), query);
         const auto none = found.empty();
@@ -3982,7 +6110,12 @@ void BrowserComponent::runSearch (bool quiet)
 
     const auto scope = searchRoots();
     if (scope.isEmpty())
+    {
+        // round 190ce: no folder to search, but the collections are still searched by their names
+        const auto tagged = collectionMatches (query);
+        results->setFiles (tagged, {}, tagged.isEmpty() ? tr ("Nothing found for \"{0}\".", { query }) : juce::String());
         return;
+    }
 
     if (! quiet)
     {
@@ -4000,15 +6133,30 @@ void BrowserComponent::runSearch (bool quiet)
                                           });
 }
 
+juce::Array<juce::File> BrowserComponent::collectionMatches (const juce::String& query) const
+{
+    std::array<std::string, collections::count> names;
+    for (int c = 0; c < collections::count; ++c)
+        names[(std::size_t) c] = collectionName (c).toStdString();
+    juce::Array<juce::File> out;
+    for (const auto& item : collectionStore().search (query.toStdString(), &names))
+        if (! collections::isPluginItem (item))
+            if (const juce::File f (juce::String::fromUTF8 (item.c_str())); f.existsAsFile() && (activeFilter() == browserview::ContentFilter::all || lists (f)))
+                out.add (f);
+    return out;
+}
+
 void BrowserComponent::searchAnswered (const search::SearchResult& r, const juce::String& query, const juce::Array<juce::File>& scope)
 {
-    if (r.id != searchId || searchBox.getText().trim() != query)
+    if (r.id != searchId || effectiveQuery() != query)
         return;
 
-    juce::Array<juce::File> found;
+    // round 190ce: first the files found through the name of a collection they are in ("starred kick"), then the
+    // files found by their own names
+    auto found = collectionMatches (query);
     for (const auto& path : r.paths)
-        if (juce::File f (juce::String::fromUTF8 (path.c_str())); view.filter == browserview::ContentFilter::all || lists (f))
-            found.add (f);
+        if (juce::File f (juce::String::fromUTF8 (path.c_str())); activeFilter() == browserview::ContentFilter::all || lists (f))
+            found.addIfNotAlreadyThere (f);
 
     // (partial answers and re-searches keep the selection and the scroll position)
     const auto selected = results->selectedFile();
@@ -4058,7 +6206,7 @@ void BrowserComponent::indexStatusChanged()
         return; // similar samples are listed: their own line stays
     const auto st = searcher->service->status();
     juce::String line;
-    if (resultsView->isVisible() && tab != projectTab && searchBox.getText().trim().isNotEmpty())
+    if (resultsView->isVisible() && shownTab() != projectTab && searchBox.getText().trim().isNotEmpty())
     {
         // a search is shown: its line stays; while the folders are indexed, the progress is added
         line = statusLine.upToFirstOccurrenceOf ("  ·  ", false, false);
@@ -4094,7 +6242,7 @@ void BrowserComponent::findSimilar (const juce::File& file)
 {
     if (! file.existsAsFile())
         return;
-    if (tab == projectTab)
+    if (shownTab() == projectTab)
         setTab (allTab);
     similarTo = file;
     searchPending = false;
@@ -4103,6 +6251,32 @@ void BrowserComponent::findSimilar (const juce::File& file)
     if (! allRoots.isEmpty() && ! std::exchange (similar->passAsked, true))
         similar->service->refresh (toPaths (withMerged (allRoots)));
     runSearch();
+}
+
+void BrowserComponent::findSimilarSamples (const juce::File& file, std::function<void (juce::Array<juce::File>)> done)
+{
+    BrowserComponent* main = nullptr;
+    for (auto* b : liveBrowsers())
+        if (b->role == Role::main)
+            main = b;
+    if (main == nullptr || main->similar == nullptr || ! file.existsAsFile())
+    {
+        if (done)
+            juce::MessageManager::callAsync ([done] { done ({}); });
+        return;
+    }
+    if (! main->allRoots.isEmpty() && ! std::exchange (main->similar->passAsked, true))
+        main->similar->service->refresh (toPaths (main->withMerged (main->allRoots)));
+    main->similar->service->findSimilar (file.getFullPathName().toStdString(), toPaths (main->similarScope()), (std::size_t) maxSimilar,
+                                         [done] (const similarity::Result& r) {
+                                             juce::Array<juce::File> found;
+                                             for (const auto& m : r.matches)
+                                                 found.add (juce::File (juce::String::fromUTF8 (m.path.c_str())));
+                                             juce::MessageManager::callAsync ([done, found] {
+                                                 if (done)
+                                                     done (found);
+                                             });
+                                         });
 }
 
 void BrowserComponent::runSimilar (bool quiet)
@@ -4134,7 +6308,7 @@ void BrowserComponent::similarAnswered (const similarity::Result& r)
     juce::Array<juce::File> found;
     juce::StringArray details;
     for (const auto& m : r.matches)
-        if (juce::File f (juce::String::fromUTF8 (m.path.c_str())); view.filter == browserview::ContentFilter::all || lists (f))
+        if (juce::File f (juce::String::fromUTF8 (m.path.c_str())); activeFilter() == browserview::ContentFilter::all || lists (f))
         {
             found.add (f);
             details.add (juce::String (similarity::percent (m.distance)) + "%");
@@ -4191,7 +6365,7 @@ void BrowserComponent::findSimilarForSnapshot (const juce::File& file, const juc
     similar->passAsked = true;
     similar->service->refresh (toPaths ({ folder }));
     similar->service->waitIdle (300000);
-    if (tab == projectTab)
+    if (shownTab() == projectTab)
         setTab (allTab);
     similarTo = file;
     searchBox.setText (similarLabel(), juce::dontSendNotification);
@@ -4283,19 +6457,89 @@ void BrowserComponent::step (int delta, bool load)
         onLoadIntoChannel (file);
 }
 
+// Round 190lr (DF-96, FL's Browser "Navigation history": Backspace / Shift+Backspace = previous / next location; DL-102,
+// Live's Ctrl+[ / Ctrl+]): the folders opened, in order; going back or forward selects and reveals that folder again
+void BrowserComponent::noteLocation (const juce::File& folder)
+{
+    if (walkingHistory || folder == juce::File())
+        return;
+    if (historyAt >= 0 && historyAt < (int) locations.size() && locations[(std::size_t) historyAt] == folder)
+        return;
+    locations.resize ((std::size_t) juce::jmax (0, historyAt + 1)); // (a new place drops the forward part)
+    locations.push_back (folder);
+    if (locations.size() > 64)
+        locations.erase (locations.begin());
+    historyAt = (int) locations.size() - 1;
+}
+
+bool BrowserComponent::walkHistory (int delta)
+{
+    const auto to = historyAt + delta;
+    if (to < 0 || to >= (int) locations.size())
+        return false;
+    historyAt = to;
+    const juce::ScopedValueSetter<bool> walking (walkingHistory, true);
+    return locateFile (locations[(std::size_t) to]);
+}
+
+// Round 190lr (DF-97, FL's Browser: "Use (F3) to skip to the next matching item"): with a search typed, the next (−1:
+// previous) row of the results, round to the first after the last; a file is previewed as Up / Down do
+void BrowserComponent::findMatch (int delta)
+{
+    if (searchBox.getText().trim().isEmpty())
+        return;
+    auto& list = activeList();
+    const auto count = list.numRows();
+    if (count == 0)
+        return;
+    const auto at = list.getSelectedRow();
+    const auto row = at < 0 ? (delta > 0 ? 0 : count - 1) : ((at + delta) % count + count) % count;
+    list.select (row, false);
+    if (const auto file = list.selectedFile(); file.existsAsFile())
+        fileSelected (file, true);
+}
+
+bool BrowserComponent::typeToJump (const juce::KeyPress& key)
+{
+    auto& list = activeList();
+    const auto row = ui::typeAheadRow (&list, key, list.getSelectedRow(), list.numRows(), [&list] (int r) { return list.rowName (r); });
+    if (row < 0)
+        return false;
+    list.select (row, false);
+    return true;
+}
+
 void BrowserComponent::openFolder (bool open)
 {
     if (! resultsView->isVisible())
         tree->openSelected (open);
 }
 
+bool BrowserComponent::previewSelected()
+{
+    const auto file = getSelectedFile();
+    if (! file.existsAsFile())
+        return false;
+    const juce::ScopedValueSetter<bool> force (forcePreview, true);
+    fileSelected (file, true);
+    return true;
+}
+
 void BrowserComponent::loadSelected()
 {
+    if (hotSwapLoadSelected()) // round 190ce: while linked, Enter replaces the linked device
+        return;
     const auto file = getSelectedFile();
 
     if (! file.existsAsFile())
         return;
 
+    if (isSamplerInstrumentFile (file))
+    {
+        // Enter: into the selected DirectWave channel, else a new one (round 190ii)
+        openSamplerInstrumentFile (engine, file, engine.getSelectedChannel());
+        return;
+    }
     if (file.hasFileExtension ("sf2;sf3;sfz"))
     {
         // Enter: into the selected LYNX Soundfont channel, else a new one
@@ -4391,6 +6635,14 @@ void BrowserComponent::newSampleChannel (const juce::File& file)
 
 void BrowserComponent::openFile (const juce::File& file)
 {
+    // a user preset of one of LYNX's generators (round 190fs): a new channel with that generator and sound
+    if (genpresetui::isPresetFile (file))
+    {
+        juce::String error;
+        if (! genpresetui::addChannel (engine, file, error) && error.isNotEmpty())
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon, tr ("Preset"), error);
+        return;
+    }
     // a hosted plugin's preset (round 162d, issue #8): into the plugin it belongs to
     if (pluginpresetui::isPresetFile (file) && (! file.hasFileExtension ("lynxpreset") || pluginpresetui::readLynxPreset (file).has_value()))
     {
@@ -4403,6 +6655,11 @@ void BrowserComponent::openFile (const juce::File& file)
     {
         if (! openSoundFontFile (engine, file))
             juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Load SoundFont"), tr ("This file is not a SoundFont LYNX SHARE can read."));
+        return;
+    }
+    if (isSamplerInstrumentFile (file))
+    {
+        openSamplerInstrumentFile (engine, file); // (round 190ii, issue #149: a new DirectWave channel)
         return;
     }
     if (isAudio (file) && file.hasFileExtension ("speech"))
@@ -4430,6 +6687,14 @@ void BrowserComponent::openFile (const juce::File& file)
     // preset of an FL synth that LYNX converts (3x Osc, Sytrus, GMS...): new channel with the built-in synth
     if (file.hasFileExtension ("fst;gmsynth"))
     {
+        // FL's preset of a third-party plugin (round 190fs): into that plugin (an open window, or a new channel)
+        if (pluginpresetui::isFlPresetOfPlugin (file))
+        {
+            juce::String message;
+            if (! pluginpresetui::applyFlPresetFromBrowser (engine, file, message) && message.isNotEmpty())
+                juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon, tr ("Preset"), message);
+            return;
+        }
         juce::MemoryBlock data;
 
         if (! file.loadFileAsData (data))
@@ -4459,4 +6724,503 @@ void BrowserComponent::openFile (const juce::File& file)
     if (file.hasFileExtension ("lynx;flp;als;flm;mid;midi") && onOpenProject)
         onOpenProject (file);
 }
+
+// --- Round 190iz: tags, Live's browser, send to selected, prefs ----------------------------------------------------------
+
+browsertags::Store& BrowserComponent::tagStore()
+{
+    static browsertags::Store store;
+    return store;
+}
+
+browsertags::Store BrowserComponent::shownTags()
+{
+    if (layoutstyle::current() != layoutstyle::Style::simple)
+        return tagStore();
+    return factorycontent::merged (tagStore());
+}
+
+void BrowserComponent::layoutStyleChanged()
+{
+    static bool wasSimple = false; // (only a move into or out of the Simple layout changes what is listed)
+    const auto simple = layoutstyle::current() == layoutstyle::Style::simple;
+    if (std::exchange (wasSimple, simple) == simple)
+        return;
+    for (auto* b : liveBrowsers())
+    {
+        b->rebuildTree();
+        if (b->tagsPanelShown)
+        {
+            b->tagsPanel->refresh();
+            b->resized();
+        }
+        if (b->tagFilterActive())
+            b->runSearch (true);
+    }
+}
+
+juce::File BrowserComponent::tagsFile()
+{
+    // the user's tag store (FL: one tag database of the user; not in the project)
+    return PluginHost::settingsFolder().getChildFile ("browser-tags.txt");
+}
+
+void BrowserComponent::loadTags()
+{
+    static bool loaded = false; // (once per process: every Browser shares the store)
+    if (std::exchange (loaded, true))
+        return;
+    if (const auto file = tagsFile(); file.existsAsFile())
+        tagStore() = browsertags::Store::fromText (file.loadFileAsString().toStdString());
+}
+
+void BrowserComponent::saveTags()
+{
+    tagsFile().getParentDirectory().createDirectory();
+    tagsFile().replaceWithText (juce::String::fromUTF8 (tagStore().toText().c_str()));
+}
+
+void BrowserComponent::tagsChanged()
+{
+    for (auto* b : liveBrowsers())
+    {
+        // picked tags that were deleted go
+        const auto shown = shownTags();
+        std::erase_if (b->picked, [&shown] (const std::string& t) { return ! shown.exists (t); });
+        if (b->tagsPanelShown)
+        {
+            b->tagsPanel->refresh();
+            b->resized(); // (the panel's height follows its chips)
+        }
+        b->tagsButton->repaint();
+        if (b->loopsShown) // (round gaps190kf: tags that name a keyword give it)
+            b->runLoopSearch();
+        else if (b->tagFilterActive() || b->resultsView->isVisible())
+            b->runSearch (true);
+        b->tree->repaint();
+        b->results->repaint();
+    }
+}
+
+void BrowserComponent::setTagged (const std::string& item, const juce::String& tag, bool on)
+{
+    if (tagStore().set (item, tag.toStdString(), on))
+    {
+        saveTags();
+        tagsChanged();
+    }
+}
+
+void BrowserComponent::addTagItems (juce::PopupMenu& menu, const std::string& item)
+{
+    if (item.empty())
+        return;
+    juce::Component::SafePointer<BrowserComponent> safe (this);
+    // FL's Tags section: Favorite (LYNX's Starred / the collections, above), Tags ▸, Add tag, Edit tags
+    juce::PopupMenu tags;
+    const auto shown = shownTags(); // (round 190ke: with LYNX content's tags in the Simple layout)
+    for (const auto& t : shown.all())
+    {
+        const auto name = juce::String::fromUTF8 (t.name.c_str());
+        tags.addItem (name, true, shown.has (item, t.name), [safe, item, name] {
+            if (safe != nullptr)
+                safe->setTagged (item, name, ! tagStore().has (item, name.toStdString()));
+        });
+    }
+    if (tags.getNumItems() == 0)
+        tags.addItem (tr ("(no tags yet)"), false, false, nullptr);
+    menu.addSubMenu (tr ("Tags"), tags);
+    menu.addItem (tr ("Add tag..."), [safe, item] {
+        if (safe != nullptr)
+            safe->askAddTag (item);
+    });
+    menu.addItem (tr ("Edit tags..."), ! tagStore().names.empty(), false, [safe] {
+        if (safe != nullptr)
+            safe->showEditTags();
+    });
+}
+
+void BrowserComponent::askAddTag (const std::string& item)
+{
+    auto* window = new juce::AlertWindow (tr ("Add tag"), tr ("Type a tag to add to the item. Separate several with commas: Kick,808,C# gives it three tags."),
+                                          juce::MessageBoxIconType::NoIcon);
+    window->addTextEditor ("tags", {});
+    window->addButton (tr ("OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+    window->addButton (tr ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<BrowserComponent> safe (this);
+    window->enterModalState (true, juce::ModalCallbackFunction::create ([window, safe, item] (int result) {
+                                 const auto text = window->getTextEditorContents ("tags").toStdString();
+                                 if (result != 1 || safe == nullptr)
+                                     return;
+                                 if (tagStore().add ({ item }, text) > 0)
+                                 {
+                                     saveTags();
+                                     safe->tagsChanged();
+                                 }
+                             }),
+                             true);
+}
+
+void BrowserComponent::showEditTags()
+{
+    // FL's "Edit tags": each tag with its count; pick one to rename or delete it everywhere
+    juce::PopupMenu menu;
+    menu.addSectionHeader (tr ("Edit tags"));
+    juce::Component::SafePointer<BrowserComponent> safe (this);
+    for (const auto& t : tagStore().all())
+    {
+        juce::PopupMenu one;
+        const auto tag = t.name;
+        one.addItem (tr ("Rename..."), [safe, tag] {
+            if (safe == nullptr)
+                return;
+            auto* window = new juce::AlertWindow (tr ("Rename tag"), tr ("The tag's new name, on every item that has it:"), juce::MessageBoxIconType::NoIcon);
+            window->addTextEditor ("name", juce::String::fromUTF8 (tag.c_str()));
+            window->addButton (tr ("OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+            window->addButton (tr ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+            window->enterModalState (true, juce::ModalCallbackFunction::create ([window, safe, tag] (int result) {
+                                         const auto name = window->getTextEditorContents ("name").toStdString();
+                                         if (result == 1 && safe != nullptr && tagStore().rename (tag, name))
+                                         {
+                                             for (auto& p : safe->picked)
+                                                 if (browsertags::Store::key (p) == browsertags::Store::key (tag))
+                                                     p = browsertags::cleanTag (name);
+                                             saveTags();
+                                             safe->tagsChanged();
+                                         }
+                                     }),
+                                     true);
+        });
+        one.addItem (tr ("Delete tag"), [safe, tag] {
+            if (safe == nullptr)
+                return;
+            tagStore().remove (tag);
+            saveTags();
+            safe->tagsChanged();
+        });
+        menu.addSubMenu (juce::String::fromUTF8 (tag.c_str()) + "  (" + juce::String (t.items) + ")", one);
+    }
+    if (tagStore().names.empty())
+        menu.addItem (tr ("(no tags yet)"), false, false, nullptr);
+    menu.showMenuAsync (juce::PopupMenu::Options().withMousePosition());
+}
+
+void BrowserComponent::setTagsPanelShown (bool shown)
+{
+    if (shown == tagsPanelShown)
+        return;
+    tagsPanelShown = shown;
+    if (shown)
+        tagsPanel->refresh();
+    if (shown && loopsShown) // (round gaps190kf: one filter panel at a time)
+    {
+        setLoopsShown (false);
+        return;
+    }
+    resized();
+    tagsButton->repaint();
+    savePrefs();
+}
+
+void BrowserComponent::setPickedTags (std::vector<std::string> tags)
+{
+    picked = std::move (tags);
+    if (layoutstyle::current() == layoutstyle::Style::simple && tagsPanelShown) // (round 190ke: the picked chips come first)
+        tagsPanel->refresh();
+    else
+        tagsPanel->repaint();
+    tagsButton->repaint();
+    runSearch();
+    savePrefs();
+}
+
+void BrowserComponent::setTagMatch (browsertags::Match match)
+{
+    if (match == matchMode)
+        return;
+    matchMode = match;
+    tagsPanel->repaint();
+    if (tagFilterActive())
+        runSearch();
+    savePrefs();
+}
+
+bool BrowserComponent::tagFilterActive() const
+{
+    return ! picked.empty() || ! browsertags::parseQuery (searchBox.getText().trim().toStdString()).tags.empty();
+}
+
+void BrowserComponent::runTagFilter()
+{
+    // FL: the picked tags filter the content (Any / All); Live: "#tag" in the search; the rest of the text must be in
+    // the item's name
+    const auto query = browsertags::parseQuery (searchBox.getText().trim().toStdString());
+    const auto store = shownTags(); // (round 190ke: LYNX content's tags too, in the Simple layout)
+    std::vector<std::string> items;
+    if (! picked.empty())
+        items = store.filter (picked, matchMode);
+    if (! query.tags.empty())
+    {
+        const auto hashed = store.filter (query.tags, browsertags::Match::all);
+        if (picked.empty())
+            items = hashed;
+        else
+            std::erase_if (items, [&hashed] (const std::string& i) { return std::find (hashed.begin(), hashed.end(), i) == hashed.end(); });
+    }
+    std::vector<std::unique_ptr<FileTree::Node>> nodes;
+    for (const auto& item : items)
+    {
+        if (collections::isPluginItem (item))
+        {
+            if (auto n = FileTree::makePluginItem (*this, collections::pluginKeyOf (item)); n != nullptr && browsertags::nameHasWords (n->label.toStdString(), query.rest))
+                nodes.push_back (std::move (n));
+            continue;
+        }
+        const juce::File f (juce::String::fromUTF8 (item.c_str()));
+        if (! browsertags::nameHasWords (f.getFileName().toStdString(), query.rest))
+            continue;
+        if (f.isDirectory())
+            nodes.push_back (FileTree::makeFolder (f, f.getFileName(), juce::Colour()));
+        else if (f.existsAsFile() && lists (f))
+        {
+            auto n = std::make_unique<FileTree::Node>();
+            n->file = f;
+            n->detail = f.getParentDirectory().getFileName(); // (the folder it is in, on the right)
+            nodes.push_back (std::move (n));
+        }
+    }
+    std::stable_sort (nodes.begin(), nodes.end(), [] (const auto& a, const auto& b) {
+        const auto na = a->label.isNotEmpty() ? a->label : a->file.getFileName();
+        const auto nb = b->label.isNotEmpty() ? b->label : b->file.getFileName();
+        return na.compareNatural (nb) < 0;
+    });
+    const auto count = (int) nodes.size();
+    resultsView->setVisible (true);
+    treeView->setVisible (false);
+    results->setNodes (std::move (nodes), count == 0 ? tr ("No item has these tags.") : juce::String());
+    resultsView->setViewPosition (0, 0);
+    const auto line = count == 1 ? tr ("1 tagged item") : tr ("{0} tagged items", { juce::String (count) });
+    if (line != statusLine)
+    {
+        const auto relayout = statusLine.isEmpty();
+        statusLine = line;
+        if (relayout)
+            resized();
+        repaint();
+    }
+}
+
+void BrowserComponent::setLiveLayout (bool on)
+{
+    if (on == liveLayout)
+        return;
+    liveLayout = on;
+    if (on)
+        sidebar->refresh();
+    resized();
+    rebuildTree();
+    if (searchBox.getText().isNotEmpty() || tagFilterActive())
+        runSearch();
+}
+
+void BrowserComponent::showLiveEntry (const browserplaces::Entry& entry)
+{
+    if (! entry.available)
+        return;
+    if (entry.category == browserplaces::Category::addFolder) // Live's "Add Folder...": a place, not a view
+    {
+        addUserFolder();
+        return;
+    }
+    liveSelection = entry;
+    sidebar->repaint();
+    rebuildTree();
+    if (searchBox.getText().isNotEmpty() || tagFilterActive())
+        runSearch();
+    else if (categoryQuery.isEmpty())
+    {
+        resultsView->setVisible (false);
+        treeView->setVisible (true);
+    }
+    savePrefs();
+}
+
+browsersend::Channel BrowserComponent::selectedChannelKind() const
+{
+    const auto row = engine.getSelectedChannel();
+    const auto& song = engine.getSong();
+    if (row < 0 || row >= (int) song.channels.size())
+        return browsersend::Channel::none;
+    const auto kind = song.channels[(std::size_t) row].instrument;
+    if (kind == InstrumentKind::sampler || kind == InstrumentKind::kick || kind == InstrumentKind::snare || kind == InstrumentKind::hat
+        || kind == InstrumentKind::clap || kind == InstrumentKind::granulizer || kind == InstrumentKind::wavetraveller)
+        return browsersend::Channel::playsSample;
+    if (kind == InstrumentKind::soundfont)
+        return browsersend::Channel::soundFont;
+    if (kind == InstrumentKind::plugin)
+        return browsersend::Channel::plugin;
+    return browsersend::Channel::other;
+}
+
+void BrowserComponent::sendToSelected (const juce::File& file)
+{
+    using namespace browsersend;
+    const auto item = isAudio (file) ? Item::sample
+                      : file.hasFileExtension ("sf2;sf3;sfz") ? Item::soundFont
+                      : pluginpresetui::isFlPresetOfPlugin (file) || pluginpresetui::isPresetFile (file) ? Item::pluginPreset
+                      : genpresetui::isPresetFile (file) || file.hasFileExtension ("fst;gmsynth") ? Item::generatorPreset
+                                                                                                    : Item::other;
+    const auto focused = ! PluginWindows::openPlugins().empty();
+    switch (decide (item, selectedChannelKind(), focused))
+    {
+        case Action::sampleIntoSelected:
+            if (onLoadIntoChannel == nullptr || ! onLoadIntoChannel (file))
+                openFile (file);
+            return;
+        case Action::fontIntoSelected:
+            openSoundFontFile (engine, file, engine.getSelectedChannel());
+            return;
+        case Action::presetToFocusedPlugin:
+        {
+            juce::String message;
+            const auto ok = pluginpresetui::isFlPresetOfPlugin (file) ? pluginpresetui::applyFlPresetFromBrowser (engine, file, message)
+                                                                      : pluginpresetui::applyFromBrowser (engine, file, message);
+            if (! ok && message.isNotEmpty())
+                juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon, tr ("Plugin preset"), message);
+            return;
+        }
+        case Action::sampleNewChannel:
+        case Action::fontNewChannel:
+        case Action::generatorPresetChannel:
+        case Action::none: // (a plugin preset with no plugin to take it: what a double-click does, which says what to open)
+            if (item != Item::other)
+                openFile (file);
+            else
+                showNote (tr ("Select a channel or open a plugin window that can take this file"));
+            return;
+        case Action::replaceSelected:
+        case Action::newChannel:
+        case Action::effectToInsert: return; // (Plugin database entries: sendPluginToSelected)
+    }
+}
+
+void BrowserComponent::sendPluginToSelected (const std::function<std::optional<ChannelDef>()>& generator,
+                                             const std::function<std::optional<EffectSlot>()>& effect)
+{
+    using namespace browsersend;
+    const auto action = decide (generator ? Item::generator : Item::effect, selectedChannelKind(), ! PluginWindows::openPlugins().empty());
+    if (action == Action::replaceSelected && generator)
+    {
+        // FL's Enter on a generator: it replaces the selected channel's (as hot-swap does, one undo step)
+        auto c = generator();
+        if (! c)
+            return;
+        const auto channel = engine.getSelectedChannel();
+        const auto target = hotswap::targetOfChannel (engine.getSong(), channel);
+        if (! target.active())
+            return;
+        if (onHotSwapWillReplaceInstrument != nullptr)
+            onHotSwapWillReplaceInstrument (channel);
+        engine.editSong ([target, c = std::move (*c)] (Song& song) mutable { hotswap::swapInstrument (song, target, std::move (c)); });
+        return;
+    }
+    if (action == Action::newChannel && generator)
+    {
+        if (auto c = generator(); c && onAddInstrument)
+            onAddInstrument (std::move (*c));
+        return;
+    }
+    if (effect)
+        if (auto fx = effect(); fx && onAddEffect)
+            onAddEffect (std::move (*fx));
+}
+
+void BrowserComponent::hoverRowForSnapshot (const juce::String& label)
+{
+    auto& list = activeList();
+    for (int i = 0; i < list.numRows(); ++i)
+        if (list.shownName (i) == label)
+        {
+            list.setHovered (i);
+            return;
+        }
+}
+
+void BrowserComponent::showPreviewPlayedForSnapshot (const juce::File& file, double fromFraction)
+{
+    strip->show (file, true, fromFraction, false);
+}
+
+void BrowserComponent::toggleStarredItem (const std::string& item)
+{
+    if (! item.empty())
+        setInCollection (item, 0, ! collectionStore().has (item, 0));
+}
+
+juce::File BrowserComponent::prefsFile() const
+{
+    return PluginHost::settingsFolder().getChildFile (role == Role::main ? "browser-prefs.txt" : "browser-prefs-samples.txt");
+}
+
+void BrowserComponent::loadPrefs()
+{
+    if (! readPrefs)
+        return;
+    for (const auto& line : juce::StringArray::fromLines (prefsFile().loadFileAsString()))
+    {
+        const auto key = line.upToFirstOccurrenceOf ("=", false, false).trim();
+        const auto value = line.fromFirstOccurrenceOf ("=", false, false).trim();
+        if (key == "tab")
+            tab = juce::jlimit (0, tabCount - 1, value.getIntValue());
+        else if (key == "fullSamplePreview" && role == Role::main)
+            engine.setFullSamplePreview (value == "1");
+        else if (key == "tagsPanel")
+            tagsPanelShown = value == "1";
+        else if (key == "tagMatch")
+            matchMode = value == "all" ? browsertags::Match::all : browsertags::Match::any;
+        else if (key == "tag" && value.isNotEmpty())
+            picked.push_back (value.toStdString());
+        else if (key == "liveCategory")
+            liveSelection.category = (browserplaces::Category) juce::jlimit (0, (int) browserplaces::Category::collection, value.getIntValue());
+        else if (key == "liveCollection")
+            liveSelection.collection = value.getIntValue();
+        else if (key == "livePath")
+            liveSelection.path = value.toStdString();
+        else if (key == "loopsPanel") // (round gaps190kf)
+            loopsShown = value == "1" && role == Role::samples;
+        else if (key == "loopCategories")
+            loopCategoryMask = juce::jlimit (1, 7, value.getIntValue());
+        else if (key == "loopLayout")
+            loopLayoutState = loopkeys::Layout::fromText (value.replaceCharacter ('|', '\n').toStdString());
+    }
+    {
+        const auto shown = shownTags();
+        std::erase_if (picked, [&shown] (const std::string& t) { return ! shown.exists (t); });
+    }
+    if (! browserplaces::libraryAvailable (liveSelection.category) || liveSelection.category == browserplaces::Category::addFolder)
+        liveSelection = {};
+}
+
+void BrowserComponent::savePrefs() const
+{
+    if (! readPrefs) // (--shots leave the user's file alone)
+        return;
+    juce::String text;
+    text << "tab=" << tab << "\n"
+         << "fullSamplePreview=" << (engine.isFullSamplePreview() ? 1 : 0) << "\n"
+         << "tagsPanel=" << (tagsPanelShown ? 1 : 0) << "\n"
+         << "tagMatch=" << (matchMode == browsertags::Match::all ? "all" : "any") << "\n"
+         << "liveCategory=" << (int) liveSelection.category << "\n"
+         << "liveCollection=" << liveSelection.collection << "\n"
+         << "livePath=" << juce::String::fromUTF8 (liveSelection.path.c_str()) << "\n"
+         << "loopsPanel=" << (loopsShown ? 1 : 0) << "\n"
+         << "loopCategories=" << loopCategoryMask << "\n";
+    if (loopLayoutState != loopkeys::Layout::defaults())
+        text << "loopLayout=" << juce::String::fromUTF8 (loopLayoutState.toText().c_str()).trimEnd().replaceCharacter ('\n', '|') << "\n";
+    for (const auto& t : picked)
+        text << "tag=" << juce::String::fromUTF8 (t.c_str()) << "\n";
+    prefsFile().getParentDirectory().createDirectory();
+    prefsFile().replaceWithText (text);
+}
+#include "ui/LoopBrowserParts.inc" // round gaps190kf
 } // namespace lynx

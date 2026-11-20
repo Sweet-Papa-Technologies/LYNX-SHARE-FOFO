@@ -8,6 +8,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "engine/AudioEngine.h"
+#include "engine/GeneratorCatalog.h"
 
 namespace lynx::quickpick
 {
@@ -22,18 +23,7 @@ namespace lynx::quickpick
 // generatorEntries() is THE list of generators (issue #18): the Channel Rack's Insert ›, Replace › and "+" menus
 // (addGeneratorMenu), the Browser's Plugin database, the user's plugin folders and the renamed picks all read it, so
 // they never differ.
-struct GeneratorEntry
-{
-    std::string key;
-    juce::String label, detail;
-    int folder = 0; // 0 LYNX, 1 FL engines, 2 VFX, 3 installed
-    std::function<std::optional<ChannelDef>()> make;
-    // where addGeneratorMenu puts a LYNX one (folder 0): 0 the first block (Kick … Synth), 1 the tools block (Envelope
-    // Controller … Fruity Video Player), 2 after the FL engines / VFX submenus (Patcher, LYNX Soundfont)
-    int section = 1;
-    InstrumentKind kind = InstrumentKind::synth; // what make() gives (the Replace menu ticks the channel's own)
-    bool available = true; // false: an FL engine without the user's FL installation (shown disabled in the menu only)
-};
+using GeneratorEntry = generators::Entry;
 
 struct EffectEntry
 {
@@ -108,6 +98,18 @@ void refreshPluginDatabase (AudioEngine& engine, bool force = false);
 // open stay as they are, the next one shows the change).
 juce::File pluginDatabaseEntry (const std::string& key, bool instruments);
 void markPluginDatabaseChanged();
+// Round 190mf: the folder is watched (the app's folder watcher calls markPluginDatabaseChanged / a forced refresh after
+// every change on disk): refreshPluginDatabase then reads it only when it was marked changed or the plugin list changed,
+// instead of every two seconds (the Channel rack "+" menu read it each time it opened: ~200-250 ms). Whether the last
+// read is still current; the last read's times (--plusmenutime).
+void setPluginDatabaseWatched (bool watched);
+bool pluginDatabaseCurrent (AudioEngine& engine);
+struct RefreshTimes
+{
+    double listMs = 0, readMs = 0; // building the plugin list, reading the folder
+    int reads = 0;                 // folder reads so far
+};
+RefreshTimes lastRefreshTimes();
 // A radio item (FL's Categories / Simple / Tree, Disk recording's Format): a dot instead of a tick
 void addRadioItem (juce::PopupMenu& menu, const juce::String& text, bool selected, std::function<void()> action);
 void installPluginDatabase (AudioEngine& engine);

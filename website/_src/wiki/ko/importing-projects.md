@@ -1,5 +1,5 @@
 ---
-source: bcd8a275bd
+source: c4e89e7e72
 ---
 `파일 › 열기...` (`Ctrl+O`) 메뉴는 LYNX SHARE 자체 `.lynx` 프로젝트와 `.flp`, `.als`, `.flm`, `.mid` 파일을 엽니다. 다른 프로그램의 프로젝트는 가져오기로 처리됩니다. 저장되지 않은 새 LYNX SHARE 프로젝트가 만들어지고, 원본 파일에는 절대 쓰지 않습니다.
 
@@ -16,8 +16,8 @@ source: bcd8a275bd
 | 형식 | 변환되는 것 | 변환되지 않는 것 |
 |---|---|---|
 | `.flp` (FL Studio) | 채널, 샘플, 패턴, 슬라이드와 포르타 노트, 모든 어레인지먼트, 마커, 박자 변경, 오토메이션, 컨트롤러 연결, 라우팅이 있는 믹서, 사이드체인, 트랙 EQ, 기본 이펙트 | FLEX 팩은 암호화되어 있어 열지 않습니다. FLEX 채널에는 프리셋 이름에 따라 고른 신스 패치가 적용됩니다 |
-| `.als` (Live 11, 12) | MIDI, 오디오, 그룹, 리턴 트랙, 템포, 박자, 로케이터, 루프, 볼륨, 팬, 뮤트, 솔로, 센드와 그 오토메이션, 세션 클립과 장면, 워프 마커 | Live 자체 이펙트는 제외됩니다. 랙은 첫 번째 체인만 유지됩니다. Simpler, Sampler, 드럼 랙은 LYNX SHARE 샘플러가 됩니다 |
-| `.flm` (FL Studio Mobile) | 템포, 박자, 채널마다 믹서 인서트 하나, 레인마다 플레이리스트 트랙 하나, 패턴, 오프셋과 피치가 있는 오디오 클립, 드럼 키트, DW Sampler 샘플, `.dwp` 프로그램 | FLM의 이펙트와 오토메이션 레인. 다른 FLM 제너레이터는 내장 신스로 재생됩니다 |
+| `.als` (Live 11, 12) | MIDI, 오디오, 그룹, 리턴 트랙, 템포, 박자, 로케이터, 루프, 볼륨, 팬, 뮤트, 솔로, 센드와 그 오토메이션, 세션 클립과 장면, 워프 마커, 랙과 Drum Rack, Live 자체 디바이스 중 많은 수(EQ Eight, Compressor, Glue Compressor, Reverb, Delay, Auto Filter, Saturator, Utility, Simpler, Drift 등)를 LYNX SHARE 자체의 것으로 | LYNX SHARE에 대응하는 것이 없는 Live 디바이스(Hybrid Reverb, Grain Delay, Amp, Roar, FM Operator 패치 등)는 빠지고 목록으로 보여 줍니다. MIDI Effect Rack은 변환되지 않습니다 |
+| `.flm` (FL Studio Mobile) | 템포, 박자, 채널마다 믹서 인서트 하나, 레인마다 플레이리스트 트랙 하나, 패턴, 오프셋과 피치가 있는 오디오 클립, 드럼 키트, DW Sampler와 `.dwp` 프로그램, Slicer, MiniSynth, Transistor Bass, 3x Osc, GMSynth, SuperSaw, 이펙트, 오토메이션, 코드 세트 | 다른 FLM 제너레이터는 내장 신스로 재생됩니다 |
 | `.mid` | 노트, 박자, 모든 템포 변경 | MIDI 파일에는 사운드가 없습니다. 채널에는 LYNX SHARE 신스 또는 MIDI Out 채널이 지정됩니다 |
 
 `.flp` 안의 서드파티 VST2, VST3, CLAP 플러그인과 `.als` 안의 VST2, VST3 플러그인은 같은 플러그인이 컴퓨터에 설치되어 있으면 저장된 상태와 함께 로드됩니다.
@@ -27,6 +27,12 @@ source: bcd8a275bd
 FL Studio의 제너레이터와 이펙트는 로드되지 않습니다. LYNX SHARE는 저장된 설정을 읽어 새로 만든 엔진으로 재생합니다. 각 엔진에는 품질 단계가 있으며, 테스트한 모든 상태에서 원본과 비트 단위로 같은 `Exact`부터 `Placeholder`(설정은 유지되지만 플러그인이 무음이거나 오디오를 그대로 통과시킴)까지입니다. 단계 설명은 [FL Studio에서 넘어오기](/wiki/coming-from-fl-studio/)에 있습니다.
 
 `.flp` 파일은 FL Studio가 설치되어 있지 않아도 열립니다. 일부 엔진은 웨이브, 샘플, 임펄스가 필요하며, 이는 실행 중에 사용자의 FL Studio 설치 폴더에서 읽어 옵니다.
+
+FL Studio의 "FL Studio Mobile Rack"을 쓰는 `.flp`(FL Studio Mobile 자체의 "Save as FLP"는 악기 트랙마다 하나씩 만듭니다)는 악기와 이펙트가 `.flm`과 같은 엔진으로 재생되며, "FL Studio Mobile Rack FX" 이펙트도 마찬가지입니다. 드럼 키트나 여러 악기가 들어 있는 랙은 아직 내장 신스로 재생됩니다.
+
+## FL Studio Mobile 팩토리 사운드
+
+`.flm`이 쓰는 팩토리 사운드(드럼 키트, DirectWave 프로그램, SoundFont, GMSynth 웨이브)는 FL Studio Mobile의 것이며 LYNX SHARE와 함께 배포되지 않습니다. LYNX SHARE는 본인이 가진 앱 사본의 `Resources` 폴더에서 찾습니다. `설정 › 파일 › FL Studio Mobile 리소스`에서 추가하세요(그 위 폴더나 FL Studio 설치 폴더를 지정해도 됩니다). FL Studio 설치 폴더에는 일부만 들어 있으며, 본인 폴더 다음에 검색됩니다. 아직 없는 파일은 누락된 파일 창에 나열됩니다.
 
 ## 누락된 샘플
 

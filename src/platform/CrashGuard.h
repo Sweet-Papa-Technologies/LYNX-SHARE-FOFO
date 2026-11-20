@@ -3,7 +3,31 @@
 // Calls into code LYNX does not control (hosted VST3 / CLAP / VST2 plugins) behind a structured-exception guard, so a
 // plugin that crashes (access violation, division by zero, a C++ exception escaping it) is caught at the call instead
 // of taking the whole app down. On Windows this is SEH (__try / __except in CrashGuard.cpp, the only unit built with
-// -fms-extensions); elsewhere the call is made directly.
+// -fms-extensions).
+//
+// Linux / macOS (round 190dt; x86-64 and ARM64): a fault is a signal. call() arms a jump buffer of this thread
+// (sigsetjmp, no system call) for the length of the call; a handler for SIGSEGV / SIGBUS / SIGILL / SIGFPE, installed
+// on top of the crash handler (hardenSignals, or the first call), jumps back to call() (siglongjmp) only when ALL of:
+//   - this thread is inside an armed call (other threads, and every fault outside a guarded call, go to the crash
+//     handler as before: the crash file and the emergency save);
+//   - the kernel raised it for an instruction (not a signal sent by kill / raise);
+//   - the first frame from the faulting instruction outwards that is not the C / C++ runtime or the system's own
+//     libraries (libc, libstdc++, libgcc_s, ld.so, libsystem_*, libobjc...) belongs to a module that is not LYNX's
+//     executable: a plugin's memcpy from a null pointer faults in libc but is the plugin's; a fault in LYNX's or
+//     JUCE's code (a host callback the plugin made, JUCE's VST3 wrapper) is LYNX's own and is never caught, nor is
+//     one whose frames cannot tell (code outside every module called from LYNX, an unwinder that finds nothing).
+// C++ exceptions leaving the call are caught there too (code 0xE06D7363, as on Windows).
+// What it cannot make safe (as with SEH, the caller then never touches that instance again, and LYNX goes on):
+//   - the jump skips the destructors of the frames between call() and the fault: what they held stays held (JUCE's
+//     per-instance VST3 process lock, LYNX's per-instance CLAP gate; both only guard that dead instance), and what
+//     the plugin held stays held (its own locks; a lock of the C library, e.g. malloc's when it faulted inside
+//     malloc: then a later allocation of another thread may block, as the heap may be damaged anyway);
+//   - finding out whose fault it is runs in the signal handler (dladdr, the unwinder): not async-signal-safe by the
+//     letter of POSIX; a fault there is passed on to the crash handler (SA_NODEFER), never caught;
+//   - not caught: aborts (SIGABRT: the C library's heap checks, assertions, Rust's panic=abort), stack overflows
+//     (no alternate stack on the audio thread), faults inside its editor's event handling (see the window guard
+//     below). Faults on the plugin's own threads: see watchPluginModule (round 190gg). "Run in a separate process"
+//     (engine/PluginSandbox.h) is the complete protection: there the plugin dies alone.
 //
 // A caught crash leaves the plugin in an unknown state: the caller must never call that instance again (PluginEffect /
 // PluginInstrument switch to bypass / silence and report it, engine/PluginHost.h).
@@ -11,6 +35,7 @@
 #include <cstdint>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace lynx::crashguard
 {
@@ -23,6 +48,34 @@ std::uint32_t run (Fn&& fn) noexcept
 {
     return call ([] (void* c) { (*static_cast<std::remove_reference_t<Fn>*> (c)) (); }, &fn);
 }
+// This build catches a plugin's faults in call() (Windows SEH; Linux / macOS on x86-64 / ARM64 signals)
+bool pluginFaultsCaught() noexcept;
+
+// Round 190gg (B4): faults on a hosted plugin's OWN threads (Linux / macOS on x86-64 / ARM64; the app only, not the
+// exported plugins' runtime; nothing on Windows). A thread the plugin started (its GUI renderer, a disk streamer, a
+// licence check) runs no LYNX call, so call() cannot catch its fault. The handler of call() now also looks at a fault
+// outside every guarded call: when, from the faulting instruction to the thread's first frame (which the walk must
+// reach: the C library's thread start), no frame is LYNX's executable, and the first frame that is not the system's
+// runtime belongs to a module given to watchPluginModule (the plugin's file, or a file in its bundle folder), the
+// fault is noted (pluginThreadFaults) and that thread is parked for good (it waits with every signal blocked; whatever
+// it held stays held). The app then switches every instance of that plugin off (engine/PluginHost.h,
+// switchOffPluginsOfThreadFaults), as after a crash inside a call. Anything else goes to the crash handler as before:
+// a fault on a LYNX thread (even inside a plugin's code it called), on a thread whose frames cannot be walked to its
+// start, in a module nobody watches, or while another fault is being looked at.
+// watchPluginModule: message thread, after the module was loaded in this process (an absolute path; at most 128).
+void watchPluginModule (const std::string& fileUtf8) noexcept;
+bool pluginThreadFaultsCaught() noexcept;
+struct PluginThreadFault
+{
+    std::string module; // the watched path
+    std::uint32_t code = 0;
+    std::string where;  // "file+0xoffset" of the plugin's faulting frame
+};
+int pluginThreadFaultCount() noexcept;            // only grows
+std::vector<PluginThreadFault> pluginThreadFaults(); // the last 16, oldest first
+// --faulttest thread / thread-libc: a fault on a thread of LYNX's own with LYNX's executable watched as if it were a
+// plugin's module: it must still end the process through the crash handler (a return = the thread was parked)
+void faultOnOwnThreadForTest (bool inCLibrary) noexcept;
 
 // Plugin editor windows (issue #32, round 174a; Windows x64 only, elsewhere these do nothing). A hosted plugin's own
 // window procedure runs outside every LYNX call (DispatchMessageW calls it from the message loop), so a fault in it
@@ -132,8 +185,44 @@ void setFatalErrorHandler (void (*handler) (const char* report)) noexcept;
 // kind: "thread" (an exception escaping a std::thread), "noexcept", "destructor", "terminate" (no exception),
 // "abort", "purecall", "invalidparam" (Windows only; elsewhere returns). Returns only for an unknown kind.
 void fatalForTest (const std::string& kind) noexcept;
+// --faulttest guarded / guarded-libc (round 190dt): a fault in LYNX's own code inside a guarded call (`inCLibrary`:
+// a memcpy from a null pointer that LYNX makes, so the faulting instruction is in the C library). It must NOT be
+// caught: the process ends through the crash handler; a return (with the code) means it was swallowed.
+std::uint32_t faultInGuardedCallForTest (bool inCLibrary) noexcept;
 // "module+0xoffset" of one code address ("" when unknown)
 std::string describeAddress (const void* address);
+
+// Crash handler watchdog (rollup 0.1.30 step 12, owner decision after round 190mo). The crash handler writes a file and
+// saves the project: both allocate. After the C library's heap-corruption abort (glibc aborts while it holds the
+// arena's lock) the first allocation waits for that lock for ever, so a crash became a hang (25 minutes until a test's
+// timeout). Now:
+// - prepareCrashWatchdog (startup, message thread, after the crash handler is installed): the folder the handler writes
+//   to, the time limit (60 s; LYNX_CRASH_WATCHDOG_S = 1 … 600 for tests), Windows' idle watchdog thread, a first
+//   backtrace() (the C library loads its unwinder then, which allocates). setCrashFolder: another folder (--faulttest).
+// - armCrashWatchdog: the FIRST thing the crash handler does. Linux / macOS: alarm() with SIGALRM back at its default
+//   action and unblocked on this thread (the kernel ends the process; async-signal-safe); Windows: wakes the thread
+//   prepared above, which ends the process with the crash's code (TerminateProcess) after the time limit. Whatever the
+//   handler then does, the process is gone within the limit.
+// - heapCorruptionCrash: the crash is the C library's own abort — Linux: SIGABRT whose abort() was called from inside
+//   libc itself (its heap checks; also its fortify checks, which mean a damaged memory too), macOS: SIGABRT with a frame
+//   in libsystem_malloc; Windows: STATUS_HEAP_CORRUPTION (0xC0000374). Allocation-free (backtrace + dladdr on a fixed
+//   array). A C++ terminate, LYNX's or a plugin's own abort() keep the usual handling.
+// - writeHeapCrashFile: for that case, the crash file without the heap: "crash heap-corruption <time>.txt" in the
+//   prepared folder, written with open / write and the frames by backtrace_symbols_fd (Windows: CreateFileW / WriteFile,
+//   the exception code only). The caller then skips everything that allocates (the usual crash file, the session note,
+//   the emergency save: the project in memory may be what the corruption broke).
+void prepareCrashWatchdog (const std::string& crashFolderUtf8) noexcept;
+void setCrashFolder (const std::string& crashFolderUtf8) noexcept;
+int crashWatchdogSeconds() noexcept;
+void armCrashWatchdog (void* exceptionPointers) noexcept;
+bool heapCorruptionCrash (void* exceptionPointers) noexcept;
+void writeHeapCrashFile (void* exceptionPointers) noexcept;
+// --faulttest heap / hang (tests of the above): `heap` breaks a heap chunk's header and frees its neighbour, so the C
+// library aborts inside free() holding the arena lock (Linux; macOS: frees a pointer it never handed out); `hang`
+// makes the crash handler wait for ever after it armed the watchdog (setHangInCrashHandlerForTest), then faults.
+[[noreturn]] void heapCorruptionForTest() noexcept;
+void setHangInCrashHandlerForTest() noexcept;
+bool hangInCrashHandlerForTest() noexcept;
 
 // UI hang watch (round 157a). A frozen message thread leaves no crash file: Windows shows "not responding" and the
 // user closes LYNX. startHangWatch (on the message thread) starts a watcher thread; heartbeat() (the message thread,
@@ -149,6 +238,7 @@ void startHangWatch (const std::string& folderUtf8, int stallMs = 2000) noexcept
 //   message thread still writes its crash file;
 // - SIGTERM / SIGHUP (the session logging out, the terminal that started LYNX closed, `kill`) leave a session step
 //   ("ended by SIGTERM ...") before LYNX ends as it did before. Without them the report could only say "closed".
+// - round 190dt: the plugin-call guard of call() (see the top of this file), on top of the crash handler.
 void hardenSignals() noexcept;
 void heartbeat() noexcept;
 void stopHangWatch() noexcept;

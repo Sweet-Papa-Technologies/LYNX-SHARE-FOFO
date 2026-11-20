@@ -1,9 +1,11 @@
 #include "ui/PluginPresetMenu.h"
 
+#include "core/FlWrapper.h"
 #include "core/PresetCycle.h"
 #include "ui/FileChoosers.h"
 #include "ui/HintBar.h"
 
+#include "engine/ClapFormat.h"
 #include "engine/PluginHost.h"
 #include "engine/Vst2Format.h"
 #include "platform/Paths.h"
@@ -154,6 +156,25 @@ bool saveFx (juce::AudioPluginInstance& plugin, bool bank, const juce::String& n
     out = pp::writeFx (fx);
     return true;
 }
+// Whether FL's wrapper record `f` (an .fst preset) is for this plugin: the same name, or the same VST2 id
+bool sameFlPlugin (const ForeignPlugin& f, const juce::PluginDescription& d)
+{
+    if (d.name.equalsIgnoreCase (juce::String::fromUTF8 (f.name.c_str())))
+        return true;
+    return f.format == ForeignPlugin::Format::vst2 && f.vst2Id != 0 && d.pluginFormatName == Vst2PluginFormat::formatName
+           && (juce::uint32) d.uniqueId == f.vst2Id;
+}
+
+std::optional<ForeignPlugin> flWrapperOf (const juce::File& file)
+{
+    juce::MemoryBlock data;
+    if (! file.hasFileExtension ("fst") || file.getSize() > 256 * 1024 * 1024 || ! file.loadFileAsData (data))
+        return std::nullopt;
+    ForeignPlugin f;
+    if (! foreignFromFlPreset (bytesOf (data), f))
+        return std::nullopt;
+    return f;
+}
 } // namespace
 
 juce::File presetsRoot()
@@ -187,7 +208,9 @@ std::optional<pp::Preset> readLynxPreset (const juce::File& file)
     return pp::fromText (file.loadFileAsString().toStdString());
 }
 
-bool load (juce::AudioPluginInstance& plugin, const juce::File& file, juce::String& error)
+namespace
+{
+bool loadUnguarded (juce::AudioPluginInstance& plugin, const juce::File& file, juce::String& error)
 {
     if (file.hasFileExtension ("lynxpreset"))
     {
@@ -203,7 +226,33 @@ bool load (juce::AudioPluginInstance& plugin, const juce::File& file, juce::Stri
             error = tr ("This preset belongs to {0}.", { juce::String::fromUTF8 (preset->pluginName.c_str()) });
             return false;
         }
+        const ScopedClapStateContext forPreset (ClapStateContext::preset); // (round 190jg: a CLAP plugin's preset state)
         plugin.setStateInformation (preset->state.data(), (int) preset->state.size());
+        return true;
+    }
+
+    // FL's preset of a third-party plugin (round 190fs): the plugin's state from FL's wrapper record, as an .flp's
+    if (file.hasFileExtension ("fst"))
+    {
+        const auto f = flWrapperOf (file);
+        if (! f)
+        {
+            error = tr ("This file is not a plugin preset.");
+            return false;
+        }
+        if (! sameFlPlugin (*f, plugin.getPluginDescription()))
+        {
+            error = tr ("This preset belongs to {0}.", { juce::String::fromUTF8 (f->name.c_str()) });
+            return false;
+        }
+        juce::MemoryBlock state;
+        const auto converted = PluginHost::stateFromFlWrapper (*f, plugin.getPluginDescription());
+        if (converted.empty() || ! state.fromBase64Encoding (juce::String::fromUTF8 (converted.c_str())))
+        {
+            error = tr ("The settings of this preset can't be carried over to this version of the plugin (VST2 / VST3).");
+            return false;
+        }
+        plugin.setStateInformation (state.getData(), (int) state.getSize());
         return true;
     }
 
@@ -230,6 +279,17 @@ bool load (juce::AudioPluginInstance& plugin, const juce::File& file, juce::Stri
         return ok;
     }
     error = tr ("Unknown preset format.");
+    return false;
+}
+} // namespace
+
+bool load (juce::AudioPluginInstance& plugin, const juce::File& file, juce::String& error)
+{
+    // round 190gg (B4): a plugin that crashes on a preset is switched off (as when it crashes while playing), not LYNX
+    auto ok = false;
+    if (callPluginFromUi (plugin, "loading a preset", [&] { ok = loadUnguarded (plugin, file, error); }))
+        return ok;
+    error = tr ("{0} crashed and was switched off.", { plugin.getName() });
     return false;
 }
 
@@ -261,7 +321,10 @@ bool save (juce::AudioPluginInstance& plugin, const juce::File& file, const juce
     else
     {
         juce::MemoryBlock state;
-        plugin.getStateInformation (state);
+        {
+            const ScopedClapStateContext forPreset (ClapStateContext::preset); // (round 190jg: clap.state-context)
+            plugin.getStateInformation (state);
+        }
         pp::Preset p;
         p.name = presetName.toStdString();
         p.pluginName = plugin.getName().toStdString();
@@ -354,6 +417,58 @@ bool applyFromBrowser (AudioEngine& engine, const juce::File& file, juce::String
     return false;
 }
 
+bool isFlPresetOfPlugin (const juce::File& file)
+{
+    return flWrapperOf (file).has_value();
+}
+
+bool applyFlPresetFromBrowser (AudioEngine& engine, const juce::File& file, juce::String& message)
+{
+    const auto f = flWrapperOf (file);
+    if (! f)
+        return false;
+    const auto name = juce::String::fromUTF8 (f->name.c_str());
+    // an open window of that plugin first (the last one used first), then the selected channel's plugin
+    std::vector<juce::AudioPluginInstance*> candidates = PluginWindows::openPlugins();
+    if (auto* p = dynamic_cast<PluginInstrument*> (engine.getChannelInstrument (engine.getSelectedChannel()).get()))
+        candidates.push_back (&p->getInstance());
+    for (auto* p : candidates)
+        if (p != nullptr && sameFlPlugin (*f, p->getPluginDescription()))
+        {
+            juce::String error;
+            if (! load (*p, file, error))
+            {
+                message = error;
+                return false;
+            }
+            engine.markModified();
+            if (auditionOnLoad())
+                engine.auditionPreset (*p);
+            return true;
+        }
+    // nobody has it open: an instrument LYNX SHARE found becomes a new channel with the preset (as FL's Browser does)
+    if (const auto d = engine.getPluginHost().findForeign (*f, true); d.has_value() && d->isInstrument)
+    {
+        PluginRef ref;
+        ref.id = d->createIdentifierString().toStdString();
+        ref.name = d->name.toStdString();
+        ref.state = PluginHost::stateFromFlWrapper (*f, *d);
+        engine.editSong ([&] (Song& s) {
+            ChannelDef c;
+            c.name = file.getFileNameWithoutExtension().toStdString();
+            c.instrument = InstrumentKind::plugin;
+            c.plugin = ref;
+            c.mixerTrack = s.claimFreeInsert();
+            s.channels.push_back (c);
+        });
+        engine.setSelectedChannel ((int) engine.getSong().channels.size() - 1);
+        return true;
+    }
+    message = tr ("This preset is for {0}. Add {0} to a channel or a mixer track first (scan for plugins if it is not in the list), "
+                  "open its window and load the preset from its Presets menu.", { name });
+    return false;
+}
+
 // --- audition on load (round 190ao) --------------------------------------------------------------------------------
 namespace
 {
@@ -396,9 +511,20 @@ PresetBar::PresetBar (juce::AudioPluginInstance& p, std::function<void()> change
     }
 }
 
+void PresetBar::setTitleLook (bool shouldBe)
+{
+    titleLook = shouldBe;
+    prev.setVisible (! titleLook);
+    next.setVisible (! titleLook);
+    resized();
+    repaint();
+}
+
 void PresetBar::resized()
 {
     auto r = getLocalBounds();
+    if (titleLook)
+        return; // (painted and hit-tested by areas: the name, then ◀ ▶ at the right)
     prev.setBounds (r.removeFromLeft (24));
     r.removeFromLeft (2);
     next.setBounds (r.removeFromLeft (24));
@@ -407,6 +533,26 @@ void PresetBar::resized()
 void PresetBar::paint (juce::Graphics& g)
 {
     using namespace theme;
+    if (titleLook)
+    {
+        auto r = getLocalBounds();
+        const auto nextArea = r.removeFromRight (16), prevArea = r.removeFromRight (16);
+        const auto mouse = getMouseXYRelative();
+        const auto over = isMouseOver();
+        g.setColour (over && r.contains (mouse) ? colour::textPrimary : colour::textSecondary);
+        g.setFont (font (type::small));
+        g.drawText (current.isEmpty() ? tr ("Presets") : current, r.withTrimmedRight (4), juce::Justification::centredRight, true);
+        for (const auto left : { true, false })
+        {
+            const auto a = (left ? prevArea : nextArea).toFloat();
+            juce::Path p;
+            p.addTriangle (left ? 3.0f : -3.0f, -4.5f, left ? 3.0f : -3.0f, 4.5f, left ? -3.0f : 3.0f, 0.0f);
+            p.applyTransform (juce::AffineTransform::translation (a.getCentreX(), a.getCentreY()));
+            g.setColour (over && a.contains (mouse.toFloat()) ? colour::accent : colour::textPrimary);
+            g.fillPath (p);
+        }
+        return;
+    }
     auto r = getLocalBounds().withTrimmedLeft (54).toFloat();
     g.setColour (isMouseOver() ? colour::bg5 : colour::bg4);
     g.fillRoundedRectangle (r, radius::md);
@@ -423,7 +569,19 @@ void PresetBar::paint (juce::Graphics& g)
 
 void PresetBar::mouseUp (const juce::MouseEvent& e)
 {
-    if (e.x >= 54 && ! e.mouseWasDraggedSinceMouseDown())
+    if (e.mouseWasDraggedSinceMouseDown())
+        return;
+    if (titleLook)
+    {
+        if (e.x >= getWidth() - 16)
+            step (1);
+        else if (e.x >= getWidth() - 32)
+            step (-1);
+        else
+            showMenu();
+        return;
+    }
+    if (e.x >= 54)
         showMenu();
 }
 
@@ -460,9 +618,28 @@ void PresetBar::step (int delta)
 
 void PresetBar::apply (const Entry& entry)
 {
+    // round 190in (R8): FL's Hybridize — the parameters as they were, half of them put back after the preset loads
+    std::vector<float> before;
+    if (hybridize())
+        callPluginFromUi (plugin, "reading its parameters", [this, &before] {
+            for (auto* p : plugin.getParameters())
+                before.push_back (p->getValue());
+        });
+    const juce::ScopeGuard mix { [this, &before] {
+        if (before.empty())
+            return;
+        auto& random = juce::Random::getSystemRandom();
+        callPluginFromUi (plugin, "mixing a preset (Hybridize)", [this, &before, &random] {
+            const auto& params = plugin.getParameters();
+            for (int i = 0; i < params.size() && i < (int) before.size(); ++i)
+                if (params[i]->isAutomatable() && random.nextBool())
+                    params[i]->setValueNotifyingHost (before[(std::size_t) i]);
+        });
+    } };
     if (entry.program >= 0)
     {
-        plugin.setCurrentProgram (entry.program);
+        if (! callPluginFromUi (plugin, "loading a program", [this, &entry] { plugin.setCurrentProgram (entry.program); }))
+            return; // (round 190gg: it crashed and was switched off; the "Plugin crashed" prompt says so)
         currentProgram = entry.program;
         currentFile = juce::File();
         setName (entry.name);
@@ -491,7 +668,21 @@ void PresetBar::setName (const juce::String& name)
         onChanged();
 }
 
-void PresetBar::showMenu()
+void PresetBar::randomize()
+{
+    // FL's Presets › Randomize: random values to the published (automatable) parameters (round 190in, R8)
+    auto& random = juce::Random::getSystemRandom();
+    callPluginFromUi (plugin, "randomizing its parameters", [this, &random] {
+        for (auto* p : plugin.getParameters())
+            if (p->isAutomatable())
+                p->setValueNotifyingHost (random.nextFloat());
+    });
+    currentFile = juce::File();
+    currentProgram = -1;
+    setName ({});
+}
+
+juce::PopupMenu PresetBar::presetsMenu()
 {
     juce::PopupMenu menu;
     const auto list = entries();
@@ -527,7 +718,7 @@ void PresetBar::showMenu()
     menu.addItem (tr ("Save preset..."), [this] { saveAs(); });
     menu.addItem (tr ("Load preset file..."), [this] { loadFile(); });
     menu.addItem (tr ("Export preset file..."), [this] { exportFile(); });
-    if (currentFile.existsAsFile())
+    if (currentFile.existsAsFile() && currentFile.isAChildOf (presetsRoot())) // (never a file loaded from elsewhere, e.g. FL's own .fst)
         menu.addItem (tr ("Delete preset \"{0}\"", { currentFile.getFileNameWithoutExtension() }), [this] {
             currentFile.deleteFile();
             currentFile = juce::File();
@@ -544,6 +735,19 @@ void PresetBar::showMenu()
         menu.addSeparator();
         menu.addItem (tr ("Play a note when a preset loads"), true, auditionOnLoad(), [] { setAuditionOnLoad (! auditionOnLoad()); });
     }
+    // FL's Presets › Randomize / Hybridize (round 190in, R8: FL manual, Plugin wrapper › Presets)
+    menu.addSeparator();
+    menu.addItem (tr ("Randomize"), [safe = juce::Component::SafePointer<PresetBar> (this)] {
+        if (safe != nullptr)
+            safe->randomize();
+    });
+    menu.addItem (tr ("Hybridize"), true, hybridize(), [] { hybridize() = ! hybridize(); });
+    return menu;
+}
+
+void PresetBar::showMenu()
+{
+    auto menu = presetsMenu();
     if (extendMenu)
     {
         menu.addSeparator();
@@ -578,7 +782,7 @@ void PresetBar::saveAs()
 
 void PresetBar::loadFile()
 {
-    chooser = lynx::ui::makeFileChooser (tr ("Load preset"), folderFor (plugin.getName()), "*.lynxpreset;*.fxp;*.fxb;*.vstpreset");
+    chooser = lynx::ui::makeFileChooser (tr ("Load preset"), folderFor (plugin.getName()), "*.lynxpreset;*.fxp;*.fxb;*.vstpreset;*.fst");
     juce::Component::SafePointer<PresetBar> safe (this);
     lynx::ui::launchChooser (chooser, juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles, [safe] (const juce::FileChooser& fc) {
         if (safe != nullptr && fc.getResult().existsAsFile())

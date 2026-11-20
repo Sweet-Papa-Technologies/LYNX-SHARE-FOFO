@@ -68,7 +68,7 @@ inline double patternPlayhead (const Song& song, int pattern, double transportTi
             return -1.0;
         if (linearOrigin >= 0.0 && transportTick >= linearOrigin)
             return transportTick - linearOrigin;
-        const auto length = (double) std::max<std::int64_t> (1, song.patterns[(std::size_t) pattern].effectiveLength (song.beatsPerBar));
+        const auto length = (double) std::max<std::int64_t> (1, song.patterns[(std::size_t) pattern].effectiveLength (song.meter()));
         return std::fmod (transportTick, length);
     }
 
@@ -81,7 +81,7 @@ inline double patternPlayhead (const Song& song, int pattern, double transportTi
                 best = &c;
 
     // a stretched clip loops its pattern (LYNX extra stretchedClipsLoop, issue #25): the playhead wraps with it
-    return best != nullptr ? patternTickInClip (*best, inSong, song.patterns[(std::size_t) pattern].effectiveLength (song.beatsPerBar)) : -1.0;
+    return best != nullptr ? patternTickInClip (*best, inSong, song.patterns[(std::size_t) pattern].effectiveLength (song.meter())) : -1.0;
 }
 
 // Where the transport goes when the Piano Roll's ruler is clicked at `patternTick` (round 163, FL: clicking the
@@ -160,6 +160,28 @@ inline std::int64_t stopTarget (bool alreadyStopped, bool rememberSeek, std::int
     return rememberSeek && seekMark > 0 ? seekMark : 0;
 }
 
+// Where Stop or Space (while playing) sends the playhead, as FL 2026 does (issue #169, REA round 190gy, FLEngine):
+// FL keeps a seek mark (FUN_011c9300, global 0x15e0458), set by every position the user sets while "Remember seek
+// time" is on: a ruler click in the Playlist or the Piano roll, also one made during playback, and the position
+// playback was started from. Its Stop (the toolbar's StopBtnClick 0x1030470 = FUN_011ca520 (0, 0), also Space and the
+// Piano roll play button's right-click) goes back to that mark; Stop while stopped goes to the very start and
+// forgets it (FUN_011c9de0); switching Pattern / Song forgets it (FUN_011ca630). Pause (the Play button pressed while
+// playing = FUN_011ca520 (2, …), LYNX's Ctrl+Space and the Piano roll's play button) keeps the position and leaves
+// the mark alone: a later Stop still goes back to the mark. "Remember seek time" is on in a fresh FL (its variable
+// 0x15d89a0 starts as 1). With it off LYNX keeps its earlier rule: Space goes back to where playback started, the
+// Stop button to the start.
+// `mark` = the remembered position for the current Pattern / Song mode (-1 = none), `playStart` = where this playback
+// was started from (not a resume after a pause).
+inline std::int64_t stopReturnTarget (bool alreadyStopped, bool rememberSeek, bool spaceKey, std::int64_t mark,
+                                      std::int64_t playStart) noexcept
+{
+    if (alreadyStopped)
+        return 0;
+    if (rememberSeek)
+        return std::max<std::int64_t> (0, mark >= 0 ? mark : playStart);
+    return spaceKey ? std::max<std::int64_t> (0, playStart) : 0;
+}
+
 // FL 2026's Shift+Space (measured in FL, round 165 issue11c, issue #11): while playing or recording it stops and puts
 // the position at the start of the time selection (Song mode with a time selection) or else of the song / pattern —
 // not where playback started and not where Shift+Space was pressed. While stopped it plays from the current position,
@@ -174,5 +196,26 @@ inline std::int64_t shiftSpaceStopTarget (bool songMode, bool hasTimeSelection, 
 inline double rollPlayRightClickTarget (bool playing, double position, double lastStart) noexcept
 {
     return playing || position != lastStart ? std::max (0.0, lastStart) : 0.0;
+}
+// --- issue #195: going to the start ---------------------------------------------------------------------------------
+// FL's Home (KeyMap "transport.toStart"): the position goes to the start of the song (Song mode) or the pattern, playing
+// or not, and becomes the mark a later Stop goes back to ("Remember seek time"), as a ruler click at the start would.
+//
+// LYNX extra (Settings › LYNX extras, off by default): REAPER's W does the same. FL gives plain W nothing in its main
+// windows, so the key is free there; the typing keyboard keeps it while it is on (W is one of its notes), a text field
+// keeps it, and a key the user bound himself in the shortcut editor wins. The switch is kept in ui-options.txt
+// ("wToStart").
+inline bool& wGoesToStart() noexcept
+{
+    static bool on = false;
+    return on;
+}
+inline void setWGoesToStart (bool on) noexcept { wGoesToStart() = on; }
+
+// True when the key `keyCode` (JUCE: a letter is its capital) with these modifiers is the extra's W and nothing that
+// comes first takes it: the switch, no modifier, the typing keyboard not taking it, no text field focused.
+inline bool wKeyGoesToStart (bool extraOn, int keyCode, bool anyModifier, bool typingKeyboardTakesIt, bool textFieldFocused) noexcept
+{
+    return extraOn && (keyCode == 'W' || keyCode == 'w') && ! anyModifier && ! typingKeyboardTakesIt && ! textFieldFocused;
 }
 } // namespace lynx::transportedit

@@ -1,9 +1,12 @@
 #include "engine/FileSort.h"
 #include "engine/SampleLibrary.h"
+#include "core/FlSettings.h"
 #include "core/CacheBudget.h"
 #include "platform/Paths.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <condition_variable>
@@ -12,14 +15,26 @@
 #include <set>
 
 #include "core/AudioEdit.h"
+#include "core/ContentShare.h"
 #include "core/SampleFiles.h"
 #include "core/OggVorbis.h"
 #include "core/Mp3Decoder.h"
 #include "core/TimeStretch.h"
+#include "core/VideoTrack.h"
 #include "core/LoadTrace.h"
 #include "engine/Mp3Format.h"
 #include "engine/WavPackFormat.h"
 #include "core/Speech.h"
+
+#if JUCE_WINDOWS
+ #ifndef NOMINMAX
+  #define NOMINMAX
+ #endif
+ #include <windows.h>
+#else
+ #include <sys/mman.h>
+ #include <unistd.h>
+#endif
 
 namespace lynx
 {
@@ -34,6 +49,9 @@ struct SharedCache
     std::condition_variable done;
     std::map<juce::String, std::weak_ptr<const SampleData>> entries;
     std::set<juce::String> loading;
+    // round 190ks: the decoded samples in RAM by their content's fingerprint, so a second file with the same audio (a copy
+    // in another folder) shares the first one's data instead of holding it twice
+    std::multimap<std::uint64_t, std::weak_ptr<const SampleData>> byContent;
     // stretched copies (pitch-preserving tempo follow): the latest length per file, kept (shared like the decoded ones)
     std::mutex stretchLock;
     std::map<juce::String, std::shared_ptr<const SampleData>> stretched;
@@ -43,6 +61,51 @@ SharedCache& sharedCache()
 {
     static SharedCache c;
     return c;
+}
+} // namespace
+
+namespace
+{
+// round 190ks: what makes two decoded samples interchangeable — the audio and everything a channel reads beside it
+std::uint64_t contentPrint (const SampleData& d) noexcept
+{
+    auto h = contentshare::hashBytes (d.left.data(), d.left.size() * sizeof (float));
+    h = contentshare::hashBytes (d.right.data(), d.right.size() * sizeof (float), h);
+    const double fields[] = { d.sampleRate, (double) d.loopStart, (double) d.loopEnd, (double) d.acidBeats, (double) d.sliceMarkers,
+                              (double) d.bitsPerSample, d.floatData ? 1.0 : 0.0, d.cropped ? 1.0 : 0.0, d.cropFrom, d.cropTo };
+    h = contentshare::hashBytes (fields, sizeof (fields), h);
+    return contentshare::hashBytes (d.markerStarts.data(), d.markerStarts.size() * sizeof (std::int64_t), h);
+}
+
+bool sameContent (const SampleData& a, const SampleData& b) noexcept
+{
+    return a.sampleRate == b.sampleRate && a.loopStart == b.loopStart && a.loopEnd == b.loopEnd && a.markerStarts == b.markerStarts
+           && a.acidBeats == b.acidBeats && a.sliceMarkers == b.sliceMarkers && a.bitsPerSample == b.bitsPerSample && a.floatData == b.floatData
+           && a.cropped == b.cropped && a.cropFrom == b.cropFrom && a.cropTo == b.cropTo && a.left.size() == b.left.size()
+           && a.right.size() == b.right.size() && ! a.isMapped() && ! b.isMapped()
+           // (an empty channel's data() may be null: memcmp only on samples, round 190mo's UBSan run)
+           && (a.left.empty() || std::memcmp (a.left.data(), b.left.data(), a.left.size() * sizeof (float)) == 0)
+           && (a.right.empty() || std::memcmp (a.right.data(), b.right.data(), a.right.size() * sizeof (float)) == 0);
+}
+
+// the data already in RAM with the same content, else `data` itself (then remembered); under the cache's lock
+std::shared_ptr<const SampleData> shareContent (SharedCache& shared, std::shared_ptr<const SampleData> data, std::uint64_t print)
+{
+    const auto [from, to] = shared.byContent.equal_range (print);
+    for (auto it = from; it != to;)
+    {
+        auto other = it->second.lock();
+        if (other == nullptr)
+        {
+            it = shared.byContent.erase (it); // (its last user let it go)
+            continue;
+        }
+        if (other == data || sameContent (*other, *data))
+            return other;
+        ++it;
+    }
+    shared.byContent.emplace (print, data);
+    return data;
 }
 } // namespace
 
@@ -197,8 +260,24 @@ juce::String SampleLibrary::wildcard() const
     return formats.getWildcardForAllFormats() + ";*.speech"; // FL's speech files are samples too (round 168b)
 }
 
+namespace
+{
+std::atomic<SampleLibrary::VideoSoundDecoder> videoSoundDecoder { nullptr };
+}
+
+void SampleLibrary::setVideoSoundDecoder (VideoSoundDecoder decoder) noexcept { videoSoundDecoder.store (decoder); }
+
 std::unique_ptr<juce::AudioFormatReader> SampleLibrary::createReader (const juce::File& file)
 {
+    // a video file: its sound track, decoded by the system into a cached WAV (round als190ka, issue #193)
+    if (videotrack::isVideoPath (file.getFullPathName().toStdString()))
+    {
+        if (const auto decoder = videoSoundDecoder.load(); decoder != nullptr)
+            if (const auto wav = decoder (file); wav.existsAsFile())
+                return std::unique_ptr<juce::AudioFormatReader> (formats.createReaderFor (wav));
+        return nullptr;
+    }
+
     // before JUCE's own Ogg reader (vorbisfile), which drops blocks in many of FL's files (REA_rodada77 §3)
     if (auto reader = createFlOggReader (file))
         return reader;
@@ -271,6 +350,28 @@ std::uint64_t stretchFingerprint (StretchMethod method)
     return prints[m];
 }
 
+// Round 190ik: Complex Pro's own engine print (its transposition with the formants kept), keyed only into Complex Pro's
+// copies so the plain Complex ones stay valid
+juce::String proFingerprintKey (StretchMethod method, const StretchOptions& options)
+{
+    if (method != StretchMethod::complex || ! stretchBakesPitch (method, options.modes))
+        return {};
+    static const auto print = [] {
+        SampleData test;
+        test.sampleRate = 44100.0;
+        for (int i = 0; i < 6000; ++i)
+        {
+            const auto t = (double) i / test.sampleRate;
+            test.left.push_back ((float) (0.3 * std::sin (2.0 * 3.14159265358979 * 220.0 * t) + 0.2 * std::sin (2.0 * 3.14159265358979 * 660.0 * t)));
+        }
+        StretchOptions pro;
+        pro.modes.complexPro = true;
+        const auto out = timeStretch (test, 2.6, StretchMethod::complex, 5.0, pro);
+        return fnv (out->left.data(), out->left.size() * sizeof (float));
+    }();
+    return "|pf" + juce::String::toHexString ((juce::int64) print);
+}
+
 // A warp map's part of a cache key ("" for none). "wm1": the mapped renderer's version — raise it when its output changes
 juce::String stretchMapKey (const StretchMap& map)
 {
@@ -282,19 +383,224 @@ juce::String stretchMapKey (const StretchMap& map)
     return "|wm1:" + juce::String::toHexString (s.hashCode64());
 }
 
-juce::File stretchCacheFile (const juce::String& path, double ratio, StretchMethod method, double semitones, const StretchMap& map)
+juce::File stretchCacheFile (const juce::String& path, double ratio, StretchMethod method, double semitones, const StretchMap& map,
+                             const StretchOptions& options)
 {
     const auto source = platform::localFile (path);
     if (! source.existsAsFile())
         return {};
     const auto key = source.getFullPathName() + "|" + juce::String (source.getSize()) + "|" + juce::String (source.getLastModificationTime().toMilliseconds())
                    + "|" + juce::String (ratio, 10) + "|" + juce::String ((int) method) + "|" + juce::String::toHexString ((juce::int64) stretchFingerprint (method))
-                   + (semitones != 0.0 ? "|st" + juce::String (semitones, 6) : juce::String()) + stretchMapKey (map);
+                   + (semitones != 0.0 ? "|st" + juce::String (semitones, 6) : juce::String()) + stretchMapKey (map)
+                   + juce::String (stretchOptionsKey (options, method)) + proFingerprintKey (method, options);
     return SampleLibrary::cacheFolder().getChildFile (juce::String::toHexString (key.hashCode64()) + ".str");
+}
+
+// A precomputed span's stretched copy on disk (round 190gn): keyed by the span's audio (rate, frames and a hash of its
+// floats), the ratio, the method, the stretcher's fingerprint and the warp mode's own settings
+juce::File spanCacheFile (const SampleData& span, double ratio, StretchMethod method, double semitones, const StretchOptions& options)
+{
+    if (span.frames() == 0)
+        return {};
+    auto h = fnv (span.leftData(), span.frames() * sizeof (float));
+    if (span.isStereo())
+        h = fnv (span.rightData(), span.frames() * sizeof (float), h);
+    const auto key = "span|" + juce::String::toHexString ((juce::int64) h) + "|" + juce::String (span.sampleRate, 3) + "|" + juce::String ((juce::int64) span.frames())
+                     + "|" + juce::String (ratio, 10) + "|" + juce::String ((int) method) + "|" + juce::String::toHexString ((juce::int64) stretchFingerprint (method))
+                     + (semitones != 0.0 ? "|st" + juce::String (semitones, 6) : juce::String())
+                     + juce::String (stretchOptionsKey (options, method)) // (rollup 0.1.28: round 190fm's warp settings)
+                     + proFingerprintKey (method, options);
+    return SampleLibrary::cacheFolder().getChildFile (juce::String::toHexString (key.hashCode64()) + ".str");
+}
+
+// Round 190gn (A2, memory): a stretched copy read back from the disk cache is mapped from its file instead of copied
+// into the process's own memory (FL's Thief: 24 copies, 229 MB of private memory), and every page of the mapping is
+// locked in RAM (VirtualLock / mlock) before the sampler can see it: the audio thread never waits for the disk and
+// never takes a page fault on it (locked pages are always mapped and resident). The pages are the cache file's, not
+// the process's (no commit, shared with another LYNX that maps the same copy). When the pages can't be locked (the
+// system's limit for locked memory) the copy is read into RAM as before. The floats are the file's: the same sound.
+namespace lockedpages
+{
+std::mutex& budgetLock()
+{
+    static std::mutex m;
+    return m;
+}
+#if JUCE_WINDOWS
+std::size_t& lockedTotal()
+{
+    static std::size_t total = 0;
+    return total;
+}
+#endif
+
+bool lock (const void* at, std::size_t bytes)
+{
+    if (at == nullptr || bytes == 0)
+        return false;
+    static const bool off = [] { const auto* e = std::getenv ("LYNX_STRETCH_MAP"); return e != nullptr && e[0] == '0'; }();
+    if (off)
+        return false;
+#if JUCE_WINDOWS
+    // a process may lock about its minimum working set: raise it (and the maximum) by what is locked
+    const std::scoped_lock l (budgetLock());
+    const auto process = GetCurrentProcess();
+    SIZE_T least = 0, most = 0;
+    if (! GetProcessWorkingSetSize (process, &least, &most))
+        return false;
+    const SIZE_T slack = 4u << 20;
+    if (! SetProcessWorkingSetSize (process, least + bytes + slack, std::max (most, least + bytes + slack) + bytes))
+        return false;
+    if (! VirtualLock (const_cast<void*> (at), bytes))
+    {
+        SetProcessWorkingSetSize (process, least, most);
+        return false;
+    }
+    lockedTotal() += bytes;
+    return true;
+#else
+    return mlock (at, bytes) == 0;
+#endif
+}
+
+void unlock (const void* at, std::size_t bytes)
+{
+    if (at == nullptr || bytes == 0)
+        return;
+#if JUCE_WINDOWS
+    const std::scoped_lock l (budgetLock());
+    VirtualUnlock (const_cast<void*> (at), bytes);
+    const auto process = GetCurrentProcess();
+    SIZE_T least = 0, most = 0;
+    if (GetProcessWorkingSetSize (process, &least, &most) && least > bytes)
+        SetProcessWorkingSetSize (process, least - bytes, most > bytes ? most - bytes : most);
+    lockedTotal() -= std::min (lockedTotal(), bytes);
+#else
+    munlock (at, bytes);
+#endif
+}
+
+// the bytes of [at, at + bytes) that are resident and locked now (Windows: the working set's Valid + Locked bits;
+// elsewhere resident pages, the lock itself is mlock's promise) — the load log's proof
+std::int64_t lockedBytes (const void* at, std::size_t bytes)
+{
+    if (at == nullptr || bytes == 0)
+        return 0;
+#if JUCE_WINDOWS
+    struct Block { void* va; ULONG_PTR flags; }; // PSAPI_WORKING_SET_EX_INFORMATION (flags bit 0 Valid, bit 22 Locked)
+    using Query = BOOL (WINAPI*) (HANDLE, PVOID, DWORD);
+    static const auto query = (Query) (void*) GetProcAddress (GetModuleHandleW (L"kernel32.dll"), "K32QueryWorkingSetEx");
+    if (query == nullptr)
+        return -1;
+    SYSTEM_INFO info {};
+    GetSystemInfo (&info);
+    const auto page = (std::size_t) info.dwPageSize;
+    const auto first = reinterpret_cast<std::uintptr_t> (at) / page * page;
+    const auto pages = (reinterpret_cast<std::uintptr_t> (at) + bytes - first + page - 1) / page;
+    std::vector<Block> blocks (pages);
+    for (std::size_t i = 0; i < pages; ++i)
+        blocks[i].va = reinterpret_cast<void*> (first + i * page);
+    if (! query (GetCurrentProcess(), blocks.data(), (DWORD) (blocks.size() * sizeof (Block))))
+        return -1;
+    std::int64_t locked = 0;
+    for (const auto& b : blocks)
+        if ((b.flags & 1u) != 0 && (b.flags & (1u << 22)) != 0)
+            locked += (std::int64_t) page;
+    return std::min<std::int64_t> (locked, (std::int64_t) bytes);
+#else
+    const auto page = (std::size_t) sysconf (_SC_PAGESIZE);
+    const auto first = reinterpret_cast<std::uintptr_t> (at) / page * page;
+    const auto pages = (reinterpret_cast<std::uintptr_t> (at) + bytes - first + page - 1) / page;
+    std::vector<unsigned char> resident (pages);
+   #if defined(__APPLE__)
+    if (mincore (reinterpret_cast<void*> (first), pages * page, reinterpret_cast<char*> (resident.data())) != 0)
+   #else
+    if (mincore (reinterpret_cast<void*> (first), pages * page, resident.data()) != 0)
+   #endif
+        return -1;
+    std::int64_t in = 0;
+    for (const auto r : resident)
+        in += (r & 1) != 0 ? (std::int64_t) page : 0;
+    return std::min<std::int64_t> (in, (std::int64_t) bytes);
+#endif
+}
+} // namespace lockedpages
+
+// the owner of a mapped, locked stretched copy (SampleData::mapping)
+struct LockedCopy
+{
+    std::unique_ptr<juce::MemoryMappedFile> file;
+    const void* at = nullptr;
+    std::size_t bytes = 0;
+    ~LockedCopy() { lockedpages::unlock (at, bytes); }
+};
+
+// What every mapped stretched copy holds locked now (memoryUse)
+std::mutex& lockedCopiesLock()
+{
+    static std::mutex m;
+    return m;
+}
+std::vector<std::weak_ptr<const LockedCopy>>& lockedCopies()
+{
+    static std::vector<std::weak_ptr<const LockedCopy>> list;
+    return list;
+}
+
+// The copy mapped and locked (nullptr: not possible, read it instead)
+std::shared_ptr<SampleData> mapStretched (const juce::File& file, double rate, juce::int64 frames, std::int32_t channels)
+{
+    auto copy = std::make_shared<LockedCopy>();
+    copy->file = std::make_unique<juce::MemoryMappedFile> (file, juce::MemoryMappedFile::readOnly);
+    const auto* d = static_cast<const char*> (copy->file->getData());
+    const auto bytes = (std::size_t) (frames * channels) * sizeof (float);
+    if (d == nullptr || copy->file->getSize() != (std::size_t) stretchHeader + bytes || std::memcmp (d, stretchMagic, 8) != 0)
+        return nullptr;
+    const auto* samples = d + stretchHeader;
+    if (! lockedpages::lock (samples, bytes))
+        return nullptr;
+    copy->at = samples;
+    copy->bytes = bytes;
+    auto out = std::make_shared<SampleData>();
+    out->sampleRate = rate;
+    out->mappedFrames = (std::size_t) frames;
+    out->mappedLeft = reinterpret_cast<const float*> (samples);
+    out->mappedRight = channels == 2 ? reinterpret_cast<const float*> (samples) + frames : nullptr;
+    {
+        const std::scoped_lock l (lockedCopiesLock());
+        auto& list = lockedCopies();
+        list.erase (std::remove_if (list.begin(), list.end(), [] (const std::weak_ptr<const LockedCopy>& w) { return w.expired(); }), list.end());
+        list.push_back (copy);
+    }
+    out->mapping = std::move (copy);
+    return out;
 }
 
 std::shared_ptr<SampleData> readStretched (const juce::File& file)
 {
+    // round 190gn: mapped and locked when it can be (the header read alone first)
+    if (file != juce::File() && file.existsAsFile())
+        if (juce::FileInputStream in (file); in.openedOk())
+        {
+            char header[stretchHeader] {};
+            if (in.read (header, stretchHeader) == stretchHeader && std::memcmp (header, stretchMagic, 8) == 0)
+            {
+                double rate = 0.0;
+                juce::int64 frames = 0;
+                std::int32_t channels = 0;
+                std::memcpy (&rate, header + 8, 8);
+                std::memcpy (&frames, header + 16, 8);
+                std::memcpy (&channels, header + 24, 4);
+                if (frames > 0 && (channels == 1 || channels == 2) && rate > 0.0
+                    && file.getSize() == stretchHeader + frames * channels * (juce::int64) sizeof (float))
+                    if (auto mapped = mapStretched (file, rate, frames, channels))
+                    {
+                        file.setLastModificationTime (juce::Time::getCurrentTime()); // (recently used: pruned last)
+                        return mapped;
+                    }
+            }
+        }
+
     juce::MemoryBlock block;
     if (file == juce::File() || ! file.existsAsFile() || ! file.loadFileAsData (block) || block.getSize() < (std::size_t) stretchHeader)
         return nullptr;
@@ -386,13 +692,14 @@ void writeStretchedLater (const juce::File& file, std::shared_ptr<const SampleDa
 } // namespace
 
 std::shared_ptr<const SampleData> SampleLibrary::loadStretched (const juce::String& path, double ratio, StretchMethod method, double semitones,
-                                                               const StretchMap& map)
+                                                               const StretchMap& map, const StretchOptions& options)
 {
-    if (method != StretchMethod::beats)
-        semitones = 0.0; // (only Beats renders a transposition offline)
+    if (! stretchBakesPitch (method, options.modes))
+        semitones = 0.0; // (only Beats and, round 190ik, Complex Pro render a transposition offline)
     // 10 significant digits: ratios within 0.1 % of 1 are resampled to the exact length, so 4 decimals were too coarse
     const auto key = path + "|" + juce::String (ratio, 10) + "|" + juce::String ((int) method)
-                     + (semitones != 0.0 ? "|st" + juce::String (semitones, 6) : juce::String()) + stretchMapKey (map);
+                     + (semitones != 0.0 ? "|st" + juce::String (semitones, 6) : juce::String()) + stretchMapKey (map)
+                     + juce::String (stretchOptionsKey (options, method)); // (round 190fm: empty for the defaults)
     auto& shared = sharedCache();
 
     {
@@ -402,7 +709,7 @@ std::shared_ptr<const SampleData> SampleLibrary::loadStretched (const juce::Stri
     }
 
     static const bool useDisk = [] { const auto* e = std::getenv ("LYNX_STRETCH_DISK"); return e == nullptr || e[0] != '0'; }();
-    const auto onDisk = useDisk ? stretchCacheFile (path, ratio, method, semitones, map) : juce::File();
+    const auto onDisk = useDisk ? stretchCacheFile (path, ratio, method, semitones, map, options) : juce::File();
     std::shared_ptr<const SampleData> stretched;
     {
         const loadtrace::Scope timing ("stretch_disk_read");
@@ -418,7 +725,8 @@ std::shared_ptr<const SampleData> SampleLibrary::loadStretched (const juce::Stri
         std::shared_ptr<SampleData> made;
         {
             const loadtrace::Scope timing ("stretch_compute");
-            made = map.empty() ? timeStretch (*original, ratio, method, semitones) : timeStretchMapped (*original, map, method, semitones);
+            made = map.empty() ? timeStretch (*original, ratio, method, semitones, options)
+                               : timeStretchMapped (*original, map, method, semitones, options);
         }
         stretched = std::move (made);
         if (stretched != nullptr && onDisk != juce::File())
@@ -439,24 +747,40 @@ std::shared_ptr<const SampleData> SampleLibrary::loadStretched (const juce::Stri
 
 std::shared_ptr<const SampleData> SampleLibrary::loadStretchedSpan (const juce::String& path, const std::string& variantKey,
                                                                    const std::shared_ptr<const SampleData>& span, double ratio,
-                                                                   StretchMethod method, double semitones)
+                                                                   StretchMethod method, double semitones, const StretchOptions& options)
 {
     if (span == nullptr || span->frames() == 0)
         return nullptr;
-    if (method != StretchMethod::beats)
+    if (! stretchBakesPitch (method, options.modes))
         semitones = 0.0;
     const auto key = path + "|span|" + juce::String::fromUTF8 (variantKey.c_str()) + "|" + juce::String (ratio, 10) + "|"
-                     + juce::String ((int) method) + (semitones != 0.0 ? "|st" + juce::String (semitones, 6) : juce::String());
+                     + juce::String ((int) method) + (semitones != 0.0 ? "|st" + juce::String (semitones, 6) : juce::String())
+                     + juce::String (stretchOptionsKey (options, method));
     auto& shared = sharedCache();
     {
         const std::scoped_lock l (shared.stretchLock);
         if (auto it = shared.stretched.find (key); it != shared.stretched.end())
             return it->second;
     }
+    // round 190gn (A2): on disk too (the stretch is the costly part of an open: Thief's 10 spans, 1.8 s), keyed by the span's
+    // own audio (what is stretched), so any change to the file or to its precomputed effects makes another copy
+    static const bool useDisk = [] { const auto* e = std::getenv ("LYNX_STRETCH_DISK"); return e == nullptr || e[0] != '0'; }();
+    const auto onDisk = useDisk ? spanCacheFile (*span, ratio, method, semitones, options) : juce::File();
     std::shared_ptr<const SampleData> stretched;
     {
+        const loadtrace::Scope timing ("stretch_disk_read");
+        if (auto read = readStretched (onDisk))
+        {
+            copySpanInfo (*span, *read);
+            stretched = std::move (read);
+        }
+    }
+    if (stretched == nullptr)
+    {
         const loadtrace::Scope timing ("stretch_compute");
-        stretched = timeStretchSpan (*span, ratio, method, semitones);
+        stretched = timeStretchSpan (*span, ratio, method, semitones, options);
+        if (stretched != nullptr && onDisk != juce::File())
+            writeStretchedLater (onDisk, stretched);
     }
     if (stretched == nullptr)
         return nullptr;
@@ -609,6 +933,8 @@ std::shared_ptr<const SampleData> SampleLibrary::loadStreamed (const juce::File&
 
     auto data = std::make_shared<SampleData>();
     data->sampleRate = reader.sampleRate;
+    data->bitsPerSample = (int) reader.bitsPerSample;
+    data->floatData = reader.usesFloatingPointData;
     data->mappedFrames = (std::size_t) frames;
     data->mappedLeft = reinterpret_cast<const float*> (static_cast<const char*> (mapped->left->getData()) + cacheHeader);
     data->mappedRight = mapped->right != nullptr
@@ -679,9 +1005,14 @@ std::shared_ptr<const SampleData> SampleLibrary::load (const juce::String& path)
         shared.loading.insert (path);
     }
     auto data = decode (path);
+    // round 190ks: a sample decoded into RAM whose audio another file already holds shares that one's (mapped ones are
+    // the OS's page cache already). The print is made outside the lock.
+    const auto print = data != nullptr && ! data->isMapped() && data->frames() > 0 && contentshare::enabled() ? contentPrint (*data) : 0;
     {
         const std::scoped_lock l (shared.lock);
         shared.loading.erase (path);
+        if (data != nullptr && print != 0)
+            data = shareContent (shared, std::move (data), print);
         if (data != nullptr)
             shared.entries[path] = data;
     }
@@ -710,7 +1041,8 @@ void readWavExtras (const juce::File& file, SampleData& data)
             break;
         const auto len = (std::int64_t) ((std::uint32_t) h[4] | ((std::uint32_t) h[5] << 8) | ((std::uint32_t) h[6] << 16) | ((std::uint32_t) h[7] << 24));
         const auto next = in.getPosition() + len + (len & 1);
-        const auto wanted = std::memcmp (h, "cue ", 4) == 0 || std::memcmp (h, "LIST", 4) == 0 || std::memcmp (h, "acid", 4) == 0;
+        const auto wanted = std::memcmp (h, "cue ", 4) == 0 || std::memcmp (h, "LIST", 4) == 0 || std::memcmp (h, "acid", 4) == 0
+                            || std::memcmp (h, "strc", 4) == 0;
         if (wanted && len <= (1 << 20) && in.getPosition() + len <= total)
         {
             const auto at = riff.size();
@@ -726,7 +1058,9 @@ void readWavExtras (const juce::File& file, SampleData& data)
         return;
     const auto x = audioedit::decodeWavExtras (riff.data(), riff.size(), (std::int64_t) data.frames());
     data.markerStarts = x.markerStarts;
-    data.acidBeats = x.acidBeats;
+    data.sliceMarkers = x.sliceMarkers;
+    // (FL's General › "Read sample tempo information", round 190bx: off = the tempo stored in the file is ignored)
+    data.acidBeats = flsettings::sampleTempoBeats (x.acidBeats);
 }
 } // namespace
 
@@ -739,12 +1073,82 @@ std::shared_ptr<const SampleData> SampleLibrary::findLoaded (const juce::String&
     return nullptr;
 }
 
+namespace
+{
+std::int64_t heldBytes (const SampleData& d)
+{
+    return (std::int64_t) (d.left.capacity() + d.right.capacity()) * (std::int64_t) sizeof (float);
+}
+std::int64_t mappedBytesOf (const SampleData& d)
+{
+    return d.isMapped() ? (std::int64_t) d.mappedFrames * (d.mappedRight != nullptr ? 2 : 1) * (std::int64_t) sizeof (float) : 0;
+}
+} // namespace
+
+std::int64_t SampleLibrary::lockedStretchedBytes()
+{
+    std::vector<std::shared_ptr<const LockedCopy>> live;
+    {
+        const std::scoped_lock l (lockedCopiesLock());
+        for (const auto& w : lockedCopies())
+            if (auto c = w.lock())
+                live.push_back (std::move (c));
+    }
+    std::int64_t locked = 0;
+    for (const auto& c : live)
+    {
+        const auto n = lockedpages::lockedBytes (c->at, c->bytes);
+        if (n < 0)
+            return -1;
+        locked += n;
+    }
+    return locked;
+}
+
+SampleLibrary::MemoryUse SampleLibrary::memoryUse()
+{
+    MemoryUse use;
+    auto& shared = sharedCache();
+    {
+        const std::scoped_lock l (shared.lock);
+        std::set<const SampleData*> counted; // (round 190ks: two files sharing one copy count once)
+        for (const auto& [path, weak] : shared.entries)
+            if (const auto data = weak.lock(); data != nullptr && counted.insert (data.get()).second)
+            {
+                if (data->isMapped())
+                    ++use.mappedSamples, use.mappedBytes += mappedBytesOf (*data);
+                else
+                    ++use.samples, use.sampleBytes += heldBytes (*data);
+            }
+    }
+    const std::scoped_lock l (shared.stretchLock);
+    for (const auto& [key, data] : shared.stretched)
+        if (data != nullptr)
+        {
+            ++use.stretched, use.stretchedBytes += heldBytes (*data) + mappedBytesOf (*data);
+            if (data->isMapped())
+                ++use.stretchedMapped, use.stretchedMappedBytes += mappedBytesOf (*data);
+        }
+    return use;
+}
+
 std::shared_ptr<const SampleData> SampleLibrary::decode (const juce::String& path)
 {
-    const auto file = platform::localFile (path); // FL's Windows spelling on macOS/Linux (platform/Paths.h)
+    auto file = platform::localFile (path); // FL's Windows spelling on macOS/Linux (platform/Paths.h)
 
     if (! file.existsAsFile())
         return nullptr;
+
+    // a video's sound track (round als190ka): read from its decoded WAV, which also keys the disk cache (a cache keyed on
+    // the video would outlive a better decode of the same file)
+    if (videotrack::isVideoPath (file.getFullPathName().toStdString()))
+    {
+        const auto decoder = videoSoundDecoder.load();
+        const auto wav = decoder != nullptr ? decoder (file) : juce::File();
+        if (! wav.existsAsFile())
+            return nullptr;
+        file = wav;
+    }
 
     // FL's .speech files: spoken by LYNX's speech synthesizer, one slice (marker) per word (round 168b; FL's sample
     // loader speaks them too and hands the words over as a Zero-X grid)
@@ -780,6 +1184,8 @@ std::shared_ptr<const SampleData> SampleLibrary::decode (const juce::String& pat
 
     auto data = std::make_shared<SampleData>();
     data->sampleRate = reader->sampleRate;
+    data->bitsPerSample = (int) reader->bitsPerSample;
+    data->floatData = reader->usesFloatingPointData;
     data->left.assign (buffer.getReadPointer (0), buffer.getReadPointer (0) + frames);
     // the file's own loop (WAV smpl, first loop; JUCE gives the end frame inclusive)
     {
@@ -798,5 +1204,31 @@ std::shared_ptr<const SampleData> SampleLibrary::decode (const juce::String& pat
     readWavExtras (file, *data);
 
     return data;
+}
+
+// Round 190kx: what the loop analysis reads (see the header)
+bool SampleLibrary::readForAnalysis (const juce::File& file, double seconds, SampleData& out, double& totalSeconds)
+{
+    out = SampleData {};
+    totalSeconds = 0.0;
+    const auto reader = createReader (file);
+    if (reader == nullptr || reader->sampleRate <= 0.0 || reader->numChannels == 0 || reader->lengthInSamples <= 0)
+        return false;
+    totalSeconds = (double) reader->lengthInSamples / reader->sampleRate;
+    out.sampleRate = reader->sampleRate;
+    const auto frames = (int) juce::jmin (reader->lengthInSamples, (juce::int64) (seconds * reader->sampleRate), (juce::int64) 1 << 26);
+    const auto channels = (int) juce::jmin (reader->numChannels, 8u);
+    juce::AudioBuffer<float> buffer (channels, frames);
+    if (! reader->read (&buffer, 0, frames, 0, true, true))
+        return false;
+    out.left.assign ((std::size_t) frames, 0.0f);
+    for (int c = 0; c < channels; ++c)
+    {
+        const auto* data = buffer.getReadPointer (c);
+        for (int i = 0; i < frames; ++i)
+            out.left[(std::size_t) i] += data[i] / (float) channels;
+    }
+    readWavExtras (file, out);
+    return true;
 }
 } // namespace lynx

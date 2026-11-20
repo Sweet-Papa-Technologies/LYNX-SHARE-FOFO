@@ -11,7 +11,8 @@
 //  - tempo, time signature, markers (→ locators), the song loop, mixer and tempo automation.
 //  - the clip grid (round 181c) → Session view: one scene per grid row, grid clips in their tracks' clip slots with
 //    their launch settings and follow actions, stop buttons, scene names / tempo / meter, the global quantisation.
-// LYNX's own instruments and effects are not converted yet (N3): they are listed in `notes`.
+// LYNX's own instruments and effects are not converted yet (N3): they are listed in `notes`. Round 190ec: a Drum Rack goes
+// out as Live's Drum Rack (pads, choke groups, sends, return chains), the Samplers on its pads as Simplers.
 
 #include <cstdint>
 #include <functional>
@@ -38,6 +39,9 @@ struct AlsExportOptions
     std::function<std::string (const std::string& path, bool& relative)> samplePath;
     // A sample's length in seconds (for the warp markers); 0 = unknown (the markers then span one second).
     std::function<double (const std::string& path)> sampleSeconds;
+    // A sample's length in frames and its rate (round 190ec: a Drum Rack pad's Simpler region, SampleStart / SampleEnd in
+    // frames); false = unknown (the whole file is written, a region is listed)
+    std::function<bool (const std::string& path, double& frames, double& rate)> sampleFormat;
     // A loaded plugin's record (format, ids, state in FL's layout: PluginHost::flWrapperRecord). A plugin LYNX has
     // loaded no longer carries its `foreign` record; without this callback only unloaded records are exported.
     std::function<std::optional<ForeignPlugin> (const PluginRef& ref, bool instrument)> pluginRecord;
@@ -51,6 +55,15 @@ struct AlsExportResult
 };
 
 AlsExportResult exportAls (const Song& song, const AlsExportOptions& options = {});
+
+// (round 190hr, racks-068) A LYNX rack (an Audio Effect, Instrument, MIDI Effect or Drum Rack) as Live's rack preset
+// (.adg, gzip XML): GroupDevicePreset with the rack device and one branch preset per chain, as Live 12.4 saves them
+// (docs/analise/ALS_FORMAT.md §26). What a set export carries of a rack goes in (chains, zones, chain mixers, macros and
+// their mappings, variations, the selector, nested racks, a Drum Rack's pads, Simplers, choke groups, sends and return
+// chains); LYNX's own built-in devices have no Live device yet, and plugins stay out (Live 12.4 closed on a VST3 in a
+// LYNX-written preset [LIVE]): both are listed in `notes`.
+// Empty `bytes`: `rack` is not a rack.
+AlsExportResult exportLiveRackPreset (const PatcherDoc& rack, const std::string& name, const AlsExportOptions& options = {});
 
 // True when Live can't read a sample file as it is and it has to be written as a plain WAV first (round 182b). Live picks
 // the decoder by the file's extension and reads WAV (PCM / float), AIFF, FLAC, Ogg and MP3 only. FL ships Ogg Vorbis

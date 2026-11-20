@@ -52,6 +52,10 @@ struct NoteEvent
     float clipPitch = 0.0f;
     // audio clips: FL 2026's clip stretch (the audio plays that many times longer; round 167l)
     float clipStretch = 1.0f;
+    // audio clips, round 190gi (core/ClipEnvelope.h): the clip's envelope (an index into Song::clipEnvelopes; −1 = none
+    // or flat) and the clip time (ticks) where the note starts in it
+    std::int32_t clipEnvelope = -1;
+    double clipEnvTick = 0.0;
     // the note's Mod X / Y (0..1, 0.5 = none) and, on its "off", its release velocity (0..1) — REA round 151
     float modX = 0.5f, modY = 0.5f, release = 0.5f;
     // the note's level factor (a Layer's VOL and crossfade, round 164): the instrument scales the voice when it can,
@@ -62,6 +66,9 @@ struct NoteEvent
     // (the live queue ignores them otherwise), and a live voiceProp is that note's expression changing as it sounds
     bool expression = false;
     std::int8_t colour = 0; // the note's colour group 0…15 (FL's note colours: VFX Color Mapper, round 164b)
+    // a live note / control (round 190jl): the MIDI input it came from (AudioEngine's input number, 0 = none), so a MIDI
+    // Out channel does not send a device's own input back to it (core/Instruments.h HardwareMidi)
+    std::uint8_t source = 0;
     // A VFX channel (round 164b): −1 = an ordinary note; −2 = one its processor takes (it goes nowhere else); N ≥ 0 =
     // what the processor sent on MIDI port N (only the routes on that port take it)
     std::int16_t port = -1;
@@ -70,6 +77,11 @@ struct NoteEvent
     std::int16_t track = -1;
     std::int16_t pattern = -1;
     std::uint64_t clipUid = 0;
+    // The note's identity (round 190ej): ScheduledNotes gives each scheduled note's "on" a number and its "off" the same
+    // one (0 = none: a live key, an arpeggio, a VFX's output). FL gives every note its own voice and ends that voice at
+    // the note's end, so of two overlapping notes of one key on one channel the first "off" ends only its own voice
+    // (FL 2026 [EXEC: /R renders, round 190ej]); the instruments that keep voices by note use it (Instrument::setNextNoteId).
+    std::uint32_t noteId = 0;
 };
 
 // Fixed-capacity buffer. Events beyond capacity are dropped
@@ -120,6 +132,7 @@ public:
         overflow = false;
         clock = 0.0;
     }
+    // (the ids keep counting across clear(): an "off" sent after a stop or a jump never matches a new note's voice)
     void process (EventBuffer& events, int numSamples, double tps) noexcept;
     // The sounding notes of (channel, key) end `offsetTicks` into the next process() block at the latest. False when
     // none sounds. (A launched clip cut off, core/ClipLauncher.h.)
@@ -152,17 +165,30 @@ private:
         double end = 0.0; // on `clock`; +inf = its "off" comes from the scheduler only
         std::int16_t track = -1, pattern = -1;
         std::uint64_t clipUid = 0;
+        std::uint32_t id = 0; // the note's identity (NoteEvent::noteId), which its "off" gets too
     };
     std::array<Entry, capacity> entries {};
     int count = 0;
     bool overflow = false; // a note could not be kept: every "off" passes until the next clear()
     double clock = 0.0;    // ticks played since clear()
+    std::uint32_t nextId = 1; // (round 190ej: 1 … 2^24 − 1; the top byte is left for NoteEcho's repeats, noteEchoId)
 };
+
+// The identity of the `repeat`-th echo (1 …) of the note `id` (FL's echo delay plays each repeat as a voice of its own)
+constexpr std::uint32_t noteEchoId (std::uint32_t id, int repeat) noexcept
+{
+    return id == 0 ? 0u : (id & 0xffffffu) | ((std::uint32_t) (repeat & 0xff) << 24);
+}
 
 inline double ticksPerSample (double bpm, double sampleRate) noexcept
 {
     return bpm * ppq / (60.0 * sampleRate);
 }
+
+// An audio clip's "on" note as the song plays it at the clip's start (its key, gain, pan, fades in samples, pitch, stretch,
+// declick bits, where its file starts): the Scheduler's, and the Playlist's clip Preview through the clip's channel
+// (round 190ey, live check 190ew PL-3). `tps` = ticks per sample.
+NoteEvent audioClipNote (const Song& song, const Clip& clip, std::size_t clipIndex, double tps) noexcept;
 
 // Generates the pattern's events (playing in a loop) in the interval [startTick, startTick + numSamples * tps).
 // A note starting at t generates "on" at t and "off" at t + length.
@@ -206,7 +232,25 @@ struct ScheduleIndex
     std::vector<std::int64_t> maxNoteLength; // per pattern
     std::vector<std::int64_t> patternLength; // per pattern: effectiveLength, the period of a long clip's repeats
     std::int64_t maxShift = 0;               // the largest channel time shift (FL's Misc › Shift), ticks
+    // per Playlist clip: the next clip of the same pattern by start (the same start: later in the list), -1 = none or
+    // not a pattern clip (Song::patternClipTakeover, issue #158)
+    std::vector<int> nextOfPattern;
+    // Round 190gp: the Playlist's clips by time, so a block visits only the clips it can reach instead of every clip.
+    // Bucket b holds, in Playlist order, the clips whose [start, end + 1] meets [b · bucketTicks, (b + 1) · bucketTicks)
+    // (the first bucket also every clip that starts before 0, the last every clip that reaches past it).
+    // bucketTicks 0 = none (every clip is visited, as before). `clipCount`: the Playlist it was built for.
+    std::int64_t bucketTicks = 0;
+    std::size_t clipCount = 0;
+    std::vector<std::uint32_t> bucketFirst; // bucket b's clips: bucketClips[bucketFirst[b] … bucketFirst[b + 1])
+    std::vector<std::uint32_t> bucketClips;
 };
+
+// FL's pattern clip takeover (Song::patternClipTakeover, issue #158): the song tick from which Playlist clip `clipIndex`
+// starts no more notes — the start of the first later clip of its pattern that plays (on any track; the same start:
+// the clip later in the list wins). Muted clips, clips on muted tracks and Performance-mode zone clips take nothing
+// over. Max = never (the option off, not a pattern clip, no later clip). With an index built from this song, O(1) in
+// the usual case; without one, a scan of the Playlist.
+std::int64_t patternClipStopsAt (const Song& song, std::size_t clipIndex, const ScheduleIndex* index = nullptr) noexcept;
 
 // When a note plays (ticks within its pattern) and for how long: the swing (with the channel's swing mix), FL's
 // Misc › Time › Shift and Gate (REA round 146b). c = the note's channel (nullptr: only the swing).

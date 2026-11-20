@@ -31,8 +31,25 @@ struct SampleRef
     int stretchMode = 0;   // STR1
     double stretch = 1.0;  // STR1: time-stretch ratio
     double pitch = 0.0;    // STR1: semitones
-    std::vector<float> params; // PRMS
+    std::vector<float> params; // PRMS: the slot's eleven parameters, see samplepad (core/FlmPad.h has their laws)
+    // MAIN's tail (PROVEN-REA, round 190bs: the sample writer 0x18074a1c0 and the drum sampler's trigger 0x1807503a0)
+    bool reverse = false;     // the slot plays its sample backwards
+    double timeShift = 0.0;   // beats added to every drum note of the slot (never before the clip's start)
+    int cutGroup = 0;         // 0 = none, 1…3 = "Cut group A / B / C": a hit silences the group's other slots
+    bool polyphonic = true;   // false: a new hit silences the slot's own voices
+    // LINk: the slot's id in its drum set and the channel it plays into (−1 = its own rack)
+    int slotId = -1, outputChannel = -1;
+    bool legacyStretch = false; // the stretch and pitch came from STRC (no STR1)
+
+    float param (int index, float fallback) const noexcept { return index >= 0 && index < (int) params.size() ? params[(std::size_t) index] : fallback; }
 };
+
+// A sample slot's parameters (sample PRMS; the names PROVEN-REA 0x180748680, the defaults 0x180748120)
+namespace samplepad
+{
+constexpr int level = 0, pan = 1, speed = 2, mute = 3, solo = 4, length = 5, egAttack = 6, egDecay = 7, egSustain = 8, egRelease = 9, start = 10, count = 11;
+constexpr float defaults[count] = { 0.853125f, 0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.5f };
+} // namespace samplepad
 
 // One EVN2 record (20 bytes): FLM_FORMAT §4
 struct Event
@@ -42,6 +59,8 @@ struct Event
     int key = 0;             // MIDI key, kit sample index on drum lanes; < 0 on automation lanes
     std::uint8_t velocity = 200; // byte 14: the module's note-on velocity = byte / 255 (PROVEN-REA, round 190u)
     std::uint8_t pan = 127;      // byte 15: pan = byte / 255 (PROVEN-REA; 127 is the editors' centre)
+    // (automation lanes and audio clips: |key| − 1 is the parameter the point moves, a negative key marks a point FLM
+    // computed between two control points; PROVEN-REA, round 190bs: the song scheduler 0x180770330)
     // bytes 16–17: automation value 0…65535; notes: pitch p = u16 / 65534, 0x7FFF = centre — a drum pad plays at
     // 2^(2p − 1) of its speed, note lanes do not hand it to the module (PROVEN-REA, round 190u)
     std::uint16_t value = 0x7FFF;
@@ -76,6 +95,10 @@ struct Lane
     double swing = 0.0;    // DESc f64 at 12: the step track's swing 0…1 (odd 1/16 steps start swing / 8 of a beat late)
     std::vector<Clip> clips;
 
+    // a drum lane whose notes are held (PROVEN-REA, round 190bs: the scheduler passes a drum note's end to the pad
+    // only with this flag, the lane's second kind byte; without it every hit is a one-shot)
+    bool holdsNotes() const noexcept { return ((rawKind >> 8) & 1u) != 0; }
+
     LaneKind kind() const noexcept
     {
         switch (rawKind & 0xFF) // (one file has 0x103: a drum lane with a flag in the high byte)
@@ -99,6 +122,10 @@ struct Channel
     std::string typeName;  // "DW Sampler 3", "Audio 4"
     std::string userName;
     double order = 0.0;    // display order
+    // CHHD +1036: the channel's colour as a hue 0…1 (−1 = not in the file). FLM clamps it to 0…1 and shows
+    // HSL(frac(0.83 + 0.73·hue), 0.9, 0.63) — the theme's accent saturation and lightness (round 190fn, PROVEN-REA on the
+    // 5.0.3 library: CSeqChannel::SetState / MakeChannelColor, CColor::SetHSL, Theme::accentSaturation / accentLightness)
+    float hue = -1.0f;
     int channelId = -1;
     std::vector<std::vector<std::uint32_t>> sends; // SEND chunks, raw 32-bit words (F2)
     std::vector<Lane> lanes;
@@ -125,6 +152,14 @@ struct Rack
     std::vector<std::uint8_t> pads; // RSMP's PADS
     std::vector<SampleRef> kit;     // RSMP's samples (drum lanes play kit[key])
     std::vector<Module> modules;    // in slot order
+    // --- round 190dw item 4: CCLK, the rack's controller links (FLM_FORMAT §3: writer 0x18059af42, lookup 0x18059fa60,
+    // the base CC handler 0x180799210): a MIDI CC n sets parameter `param` of module instance `module` to its value
+    struct CcLink
+    {
+        int cc = 0, module = 0, param = 0;
+    };
+    std::vector<CcLink> ccLinks;
+    // --- end of round 190dw item 4
 };
 
 struct Project
@@ -132,20 +167,26 @@ struct Project
     std::string title;
     double tempo = 120.0;
     int numerator = 4, denominator = 4; // TDIV: beats per bar, the grid's steps per beat (also the modules' tick rate, 384 / it)
-    std::uint32_t scale = 0, root = 0; // the "key locker" (FLM_FORMAT §2)
+    std::uint32_t root = 0, scale = 0; // the "key locker" (FLM_FORMAT §2): HEAD +344 root 0..11, +348 FLM's scale index
     std::string appVersion; // "5.0.4"
     std::string created, saved, author, originalName;
+    std::string notes;        // META: the song's notes / description (round 190fn)
+    double editSeconds = 0.0; // META: the time spent on the song, seconds (round 190fn)
     std::string chordSetJson; // KEYB
     std::vector<Rack> racks;
     std::vector<Channel> channels; // channels[i] belongs to racks[i]
     int unknownChunks = 0;         // top-level chunks this reader skipped
 };
 
+// A channel hue (Channel::hue) as FLM draws it: 0xFFRRGGBB (round 190fn)
+std::uint32_t channelColour (float hue) noexcept;
+
 // True when the bytes start like an FLM project ("10LF" and a first chunk that fits).
 bool isFlmData (const std::uint8_t* data, std::size_t size) noexcept;
 
 // The whole project, or nullopt with `error` (not an FLM file, or a chunk that runs past the end of the file).
-std::optional<Project> parse (std::span<const std::uint8_t> bytes, std::string* error = nullptr);
+// `racksOnly` (round 190fn): the FL Studio Mobile Rack plugins' state, an FLM body with racks and no channels
+std::optional<Project> parse (std::span<const std::uint8_t> bytes, std::string* error = nullptr, bool racksOnly = false);
 
 // Module registry (FLM_FORMAT §7)
 enum class ModuleCategory : int { unknown = 0, generator = 1, delayReverb = 2, dynamics = 3, eqFilter = 4, modulation = 5, noteEffect = 6 };

@@ -1,6 +1,8 @@
 #include "core/TakeRecording.h"
 
 #include "core/Comping.h"
+#include "core/NoteEdit.h"
+#include "core/PlaylistOps.h"
 
 #include <algorithm>
 #include <cmath>
@@ -124,26 +126,88 @@ std::vector<Part> loopPasses (const Placement& p, std::int64_t loopStart, std::i
     return out;
 }
 
-int takeTrack (const Song& song, int insert, std::int64_t start, std::int64_t end)
+int playbackInsert (const Song& song, int recordedOn, RecordSource point)
 {
-    const auto freeAt = [&] (int track) {
-        return std::none_of (song.playlist.begin(), song.playlist.end(), [&] (const Clip& c) { return c.track == track && c.start < end && c.end() > start; });
-    };
+    const auto inserts = (int) song.mixer.size();
+    if (recordedOn <= 0 || recordedOn >= inserts)
+        return -1;
+    if (point == RecordSource::externalInput)
+        return recordedOn;
+    // a Playlist audio track linked to the insert (FL looks in the current arrangement: LYNX's tracks are shared by all)
+    if (std::any_of (song.playlistTracks.begin(), song.playlistTracks.end(),
+                     [recordedOn] (const PlaylistTrack& pt) { return pt.mode == PlaylistTrackMode::audio && pt.mixerTrack == recordedOn; }))
+        return recordedOn;
+    // LYNX's "Link Playlist tracks to mixer tracks" (round 190gz): the insert's own track takes the take and becomes its
+    // audio track, so the clip plays through the insert as on any linked audio track
+    if (autolink::pairedTakeTrack (song, recordedOn) >= 0)
+        return recordedOn;
+    const auto& mt = song.mixer[(std::size_t) recordedOn];
+    if (mt.toMaster)
+        return 0;
+    auto lowest = -1;
+    for (const auto& send : mt.sends)
+        if (send.target > 0 && send.target < inserts && send.target != recordedOn && (lowest < 0 || send.target < lowest))
+            lowest = send.target;
+    return lowest > 0 ? lowest : 0;
+}
+
+namespace
+{
+bool trackFreeAt (const Song& song, int track, std::int64_t start, std::int64_t end)
+{
+    return std::none_of (song.playlist.begin(), song.playlist.end(), [&] (const Clip& c) { return c.track == track && c.start < end && c.end() > start; });
+}
+
+struct TakeTrackChoice
+{
+    int track = 0;
+    int parent = -1;        // a sub-track of this linked audio track (FL: "sub-tracks to this parent")
+    bool insertNew = false; // a new track goes in at `track` (the tracks from there on move down)
+};
+
+// FL 2026 (FLEngine FUN_012aa4d0 picks the take's Playlist track, FUN_00e50990 the free one; REA round 190ev, and the
+// online manual's "Recording audio" page, round 190ir):
+//   - the audio track linked to the recording insert, when the take does not overlap anything there;
+//   - else one of its sub-tracks (the grouped tracks right under it) where the take fits, or a new sub-track at the end
+//     of that group ("Subsequent recordings, made on the same Mixer Input, will appear as sub-tracks to this parent");
+//   - with no linked audio track, "the first Playlist Track where it won't overlap with existing content" (from the top).
+// LYNX kept the last rule as "a new track after the last one used", so every take, wherever it was recorded, went to
+// yet another track (Discord report 2026-11-15: "it keeps making new tracks").
+TakeTrackChoice chooseTakeTrack (const Song& song, int insert, std::int64_t start, std::int64_t end)
+{
+    const auto count = (int) song.playlistTracks.size();
     if (insert > 0)
-        for (int t = 0; t < (int) song.playlistTracks.size(); ++t)
+        for (int t = 0; t < count; ++t)
         {
             const auto& pt = song.playlistTracks[(std::size_t) t];
-            if (pt.mode == PlaylistTrackMode::audio && pt.mixerTrack == insert && freeAt (t))
-                return t;
+            if (pt.mode != PlaylistTrackMode::audio || pt.mixerTrack != insert)
+                continue;
+            if (trackFreeAt (song, t, start, end))
+                return { t, -1, false };
+            auto u = t + 1;
+            for (; u < count && song.playlistTracks[(std::size_t) u].grouped; ++u)
+                if (trackFreeAt (song, u, start, end) && song.playlistTracks[(std::size_t) u].mode == PlaylistTrackMode::unassigned)
+                    return { u, t, false };
+            // a new sub-track under the group (past the last track: nothing below has to move)
+            return { u, t, u < count };
         }
-    int next = 0;
-    for (const auto& c : song.playlist)
-        next = std::max (next, c.track + 1);
-    // (a track linked to another insert or a channel, or a member of a group, is not reused for this take)
-    while (next < (int) song.playlistTracks.size()
-           && (song.playlistTracks[(std::size_t) next].mode != PlaylistTrackMode::unassigned || song.playlistTracks[(std::size_t) next].grouped))
-        ++next;
-    return next;
+    // LYNX's "Link Playlist tracks to mixer tracks" (round 190gz): insert N's take goes to Track N when it is still empty
+    if (const auto paired = insert > 0 ? autolink::pairedTakeTrack (song, insert) : -1; paired >= 0)
+        return { paired, -1, false };
+    // (a track linked to another insert or a channel, or a member of a group, is not used for this take)
+    for (int t = 0;; ++t)
+    {
+        if (t < count && (song.playlistTracks[(std::size_t) t].mode != PlaylistTrackMode::unassigned || song.playlistTracks[(std::size_t) t].grouped))
+            continue;
+        if (trackFreeAt (song, t, start, end))
+            return { t, -1, false };
+    }
+}
+} // namespace
+
+int takeTrack (const Song& song, int insert, std::int64_t start, std::int64_t end)
+{
+    return chooseTakeTrack (song, insert, start, end).track;
 }
 
 void linkTakeTrack (Song& song, int track, int insert)
@@ -204,10 +268,14 @@ void placeTakeClips (Song& song, const std::vector<TakeFile>& files, const std::
         c.instrument = InstrumentKind::audioClip;
         c.sampler.declickMode = audioClipDeclickMode; // FL's AudioTrack.fst
         c.samplePath = f.path;
-        c.mixerTrack = f.insert > 0 && f.insert < (int) song.mixer.size() ? f.insert : song.claimFreeInsert();
+        c.mixerTrack = f.insert >= 0 && f.insert < (int) song.mixer.size() ? f.insert : song.claimFreeInsert();
         song.channels.push_back (c);
         const auto channel = (int) song.channels.size() - 1;
-        const auto insert = c.mixerTrack;
+        // the recording insert's audio track holds the take; the track is linked only to an insert the clip plays
+        // through (a take that plays through Master or a bus leaves its track as it was, as FL)
+        const auto recorded = f.recordedOn >= 0 ? f.recordedOn : c.mixerTrack;
+        const auto insert = recorded;
+        const auto linkTo = recorded == c.mixerTrack ? recorded : -1;
 
         const auto add = [&] (const Part& part, int track, bool muted) {
             Clip clip;
@@ -233,10 +301,24 @@ void placeTakeClips (Song& song, const std::vector<TakeFile>& files, const std::
             std::int64_t from = parts.front().start, to = 0;
             for (const auto& part : parts)
                 from = std::min (from, part.start), to = std::max (to, part.start + part.length);
-            const auto track = takeTrack (song, insert, from, to);
+            const auto choice = chooseTakeTrack (song, insert, from, to);
+            const auto track = choice.track;
+            if (choice.parent >= 0)
+            {
+                // a sub-track of the insert's audio track: in its group, named after it (FL shows it under its parent)
+                if (choice.insertNew)
+                    noteedit::insertTrack (song, track);
+                if ((int) song.playlistTracks.size() <= track)
+                    song.playlistTracks.resize ((std::size_t) track + 1);
+                auto& pt = song.playlistTracks[(std::size_t) track];
+                pt.grouped = true;
+                if (pt.name.empty())
+                    pt.name = song.playlistTracks[(std::size_t) choice.parent].name;
+            }
             for (const auto& part : parts)
                 add (part, track, false);
-            linkTakeTrack (song, track, insert);
+            if (choice.parent < 0)
+                linkTakeTrack (song, track, linkTo);
             continue;
         }
 
@@ -254,7 +336,7 @@ void placeTakeClips (Song& song, const std::vector<TakeFile>& files, const std::
                 if (top < 0)
                 {
                     top = track;
-                    linkTakeTrack (song, track, insert);
+                    linkTakeTrack (song, track, linkTo);
                 }
                 else
                     contiguous = contiguous && track == previous + 1;
@@ -951,7 +1033,8 @@ std::string journalText (const Journal& j)
     std::ostringstream s;
     s.precision (17);
     s << "lynxrec=1\nwav=" << j.wav << "\nfirstTick=" << j.firstTick << "\nticksPerSample=" << j.ticksPerSample << "\nsampleRate=" << j.sampleRate
-      << "\nlatency=" << j.latency << "\ninsert=" << j.insert << "\nplaylistTrack=" << j.playlistTrack << "\nproject=" << j.project << "\n";
+      << "\nlatency=" << j.latency << "\ninsert=" << std::max (0, j.insert) << "\nplaysThrough=" << j.insert << "\nplaylistTrack=" << j.playlistTrack
+      << "\nproject=" << j.project << "\n";
     return s.str();
 }
 
@@ -959,7 +1042,7 @@ bool parseJournal (const std::string& text, Journal& j)
 {
     std::istringstream in (text);
     std::string line;
-    bool any = false;
+    bool any = false, through = false;
     while (std::getline (in, line))
     {
         if (! line.empty() && line.back() == '\r')
@@ -982,8 +1065,10 @@ bool parseJournal (const std::string& text, Journal& j)
                 j.sampleRate = std::stod (v);
             else if (key == "latency")
                 j.latency = std::stoi (v);
-            else if (key == "insert")
-                j.insert = std::stoi (v);
+            else if (key == "insert" && ! through) // (older journals: 0 = a new insert)
+                j.insert = std::stoi (v) > 0 ? std::stoi (v) : -1;
+            else if (key == "playsThrough")
+                j.insert = std::stoi (v), through = true;
             else if (key == "playlistTrack")
                 j.playlistTrack = std::stoi (v);
             else if (key == "project")

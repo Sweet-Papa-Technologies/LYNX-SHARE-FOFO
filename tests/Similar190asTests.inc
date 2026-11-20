@@ -7,7 +7,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -110,7 +112,26 @@ struct Disk
     std::string saved;
     int saves = 0;
     int decodeMs = 0;
-    std::function<void (const std::string&)> beforeDecode; // (on the worker thread: lets a test hold the pass)
+    // Decoding this file waits until release(): the test knows the pass is in the middle of it (round 190dc: no
+    // sleeps that guess how far a lowest-priority thread got on a busy machine)
+    std::string hold;
+    std::mutex gateLock;
+    std::condition_variable gate;
+    bool holding = false, released = false;
+
+    bool waitHeld (int timeoutMs)
+    {
+        std::unique_lock<std::mutex> g (gateLock);
+        return gate.wait_for (g, std::chrono::milliseconds (timeoutMs), [this] { return holding; });
+    }
+    void release()
+    {
+        {
+            const std::lock_guard<std::mutex> g (gateLock);
+            released = true;
+        }
+        gate.notify_all();
+    }
 
     Disk()
     {
@@ -152,9 +173,14 @@ struct Disk
             return true;
         };
         cb.decode = [this] (const std::string& path, double, std::vector<float>& mono, double& rate) {
-            if (beforeDecode)
-                beforeDecode (path);
             ++decodes;
+            if (! hold.empty() && path == hold)
+            {
+                std::unique_lock<std::mutex> g (gateLock);
+                holding = true;
+                gate.notify_all();
+                gate.wait (g, [this] { return released; });
+            }
             if (decodeMs > 0)
                 std::this_thread::sleep_for (std::chrono::milliseconds (decodeMs));
             if (kindOf (path) == 'x')
@@ -416,32 +442,18 @@ TEST (similar190as_query_first_pause_and_close)
     using namespace s190as;
     Disk disk;
     disk.decodeMs = 40; // a slow disk: the whole pass takes more than a second
-    // The pass is held at fixed points instead of timed: its first file waits until the query has been sent, every
-    // later one until the answer has been checked; the clicked file is never held. A service that did not serve the
-    // query before going on with the pass would block here until the time limit and fail the checks below.
-    const std::string clicked = "/lib/loops/l3.wav";
-    std::atomic<bool> passStarted { false }, asked { false }, checked { false };
-    std::atomic<int> passDecodes { 0 };
-    const auto waitFor = [] (const std::atomic<bool>& flag) {
-        const auto began = std::chrono::steady_clock::now();
-        while (! flag && std::chrono::steady_clock::now() - began < std::chrono::seconds (10))
-            std::this_thread::sleep_for (std::chrono::milliseconds (1));
-    };
-    disk.beforeDecode = [&] (const std::string& path) {
-        if (path == clicked)
-            return;
-        passStarted = true;
-        waitFor (++passDecodes == 1 ? asked : checked);
-    };
+    disk.hold = "/lib/kicks/k1.wav";
     Inbox inbox;
     {
         lynx::similarity::Service service (disk.callbacks());
         service.refresh ({ "/lib" });
-        waitFor (passStarted);
-        // a query while the pass runs is served first, for a file the pass has not reached (loops come last)
+        CHECK (service.status().busy); // (at once, before the worker starts)
+        // (the pass is lowest priority: on a busy machine it may start late; no answer below depends on when)
+        CHECK (disk.waitHeld (60000)); // the pass is in the middle of its second file
+        // a query while the pass runs is served first, for a file the pass has not reached (loops come last), and
+        // at once: not after the file being analysed (still held here) nor after a slow lowest-priority thread
+        const auto id = service.findSimilar ("/lib/loops/l3.wav", {}, 3, inbox.sink());
         const auto began = std::chrono::steady_clock::now();
-        const auto id = service.findSimilar (clicked, {}, 3, inbox.sink());
-        asked = true;
         std::vector<lynx::similarity::Result> got;
         while (got.empty() && std::chrono::steady_clock::now() - began < std::chrono::seconds (10))
         {
@@ -449,9 +461,8 @@ TEST (similar190as_query_first_pause_and_close)
             got = inbox.take();
         }
         CHECK (got.size() == 1 && got[0].id == id && ! got[0].failed && got[0].partial); // partial: the pass goes on
-        // after the file being analysed and the clicked one, not after the whole pass
-        CHECK (service.status().busy && disk.decodes == 2);
-        checked = true;
+        CHECK (service.status().busy && disk.decodes == 3); // k0, k1 (still in progress) and the clicked file
+        disk.release();
 
         // a newer query replaces one still waiting: only the newest is answered
         service.findSimilar ("/lib/kicks/k1.wav", {}, 3, inbox.sink());
@@ -491,20 +502,31 @@ TEST (similar190as_query_first_pause_and_close)
         CHECK (service.status().files == 24);
     }
 
-    // closing in the middle of a pass returns quickly (between two files), saves what was analysed, kills nothing
+    // closing in the middle of a pass waits for the file being analysed (kills nothing), saves what was analysed and
+    // does not go on with the pass
     {
         Disk third;
         third.decodeMs = 40;
+        third.hold = "/lib/kicks/k2.wav";
+        auto service = std::make_unique<lynx::similarity::Service> (third.callbacks());
+        service->refresh ({ "/lib" });
+        CHECK (third.waitHeld (60000)); // the pass is in the middle of its third file
+        std::atomic<bool> closed { false };
         const auto began = std::chrono::steady_clock::now();
-        {
-            lynx::similarity::Service service (third.callbacks());
-            service.refresh ({ "/lib" });
-            std::this_thread::sleep_for (std::chrono::milliseconds (150));
-        }
+        std::thread closer ([&] {
+            service.reset();
+            closed = true;
+        });
+        std::this_thread::sleep_for (std::chrono::milliseconds (100));
+        CHECK (! closed); // (still analysing k2: closing never abandons a file)
+        third.release();
+        closer.join();
         const auto took = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - began).count();
         CHECK (took < 5000.0); // (the whole pass would take over a second even on an idle machine)
-        CHECK (third.decodes > 0 && third.decodes < 28);
+        CHECK (third.decodes >= 3 && third.decodes < 28);
         lynx::similarity::Index saved;
-        CHECK (saved.fromBytes (third.saved) && saved.size() > 0 && saved.size() < 28);
+        CHECK (saved.fromBytes (third.saved) && saved.size() >= 3 && saved.size() < 28);
+        const auto* k2 = saved.find ("/lib/kicks/k2.wav");
+        CHECK (k2 != nullptr && k2->valid); // the file being analysed when closing was asked was finished and saved
     }
 }

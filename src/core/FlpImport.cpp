@@ -1,4 +1,6 @@
+#include "core/FlCurve.h"
 #include "core/FlpImport.h"
+#include "core/FlmImport.h" // round 190fn: the FL Studio Mobile Rack generator
 #include "core/FruityDance.h"
 #include "core/FlpExport.h"
 
@@ -52,6 +54,7 @@
 #include "core/PoiZone.h"
 #include "core/Toxic.h"
 #include "core/ThreeOsc.h"
+#include "core/FlmNoteFx.h" // round 190jv: an FL Studio Mobile Rack's note effects on FL's notes
 #include "core/TimeStretch.h"
 #include "core/HarmlessFx.h"
 #include "core/SytrusEngine.h"
@@ -73,6 +76,7 @@
 #include "core/SoundFont.h"
 #include "core/SynthPresets.h"
 #include "core/NewtoneFx.h"
+#include "core/NoteRepeat.h"
 
 #include <algorithm>
 #include <cstring>
@@ -296,6 +300,14 @@ std::optional<std::pair<int, int>> flRawRange (flp::ControlId id, const std::str
     {
         if (p == 0 || p == 1) // volume 0..12800 (10000 = default), pan 0..12800 (6400 = centre)
             return std::pair { 0, 12800 };
+        // Levels adjustment (round 190dz, TPluginForm OfsLevelsPanel): pan offset ±6400, volume multiplier 0..25600,
+        // Mod X / Y offsets ±256
+        if (p == 0x10)
+            return std::pair { -6400, 6400 };
+        if (p == 0x11)
+            return std::pair { 0, 25600 };
+        if (p == 0x13 || p == 0x14)
+            return std::pair { -256, 256 };
     }
     else if (id.isMixer())
     {
@@ -355,6 +367,11 @@ AutomationTarget automationTargetFor (flp::ControlId id, const std::map<int, int
             t.kind = AutomationTargetKind::channelVolume;
         else if (p == 1)
             t.kind = AutomationTargetKind::channelPan;
+        else if (p >= 0x10 && p <= 0x14 && leveladjust::valid (p - 0x10)) // Levels adjustment (round 190dz)
+        {
+            t.kind = AutomationTargetKind::channelAdjust;
+            t.param = p - 0x10;
+        }
         else if (p >= flp::ControlId::pluginParamBase)
         {
             t.kind = AutomationTargetKind::channelParam;
@@ -530,7 +547,10 @@ void applyFlStretchPanel (SamplerSettings& s, int mode, int pitchCents, int mul,
     }
 
     if (timeTicks <= 0.0f && mul != 0 && sampleSeconds > 0.0 && bpm > 0.0)
+    {
         s.stretchBeats = std::clamp ((float) (sampleSeconds * std::pow (2.0, mul / 10000.0) * bpm / 60.0), 0.0f, 4096.0f);
+        s.stretchMul = std::clamp (mul, -20000, 20000); // (round 190dh: the page shows TIME = the sample's beats, and MUL)
+    }
 }
 
 ChannelDef drumPadChannel (const ChannelDef& original, const DrumPad& pad, int channel)
@@ -643,7 +663,7 @@ void splitDrumChannel (Song& song, int channel, const std::vector<DrumPad>& pads
 
     song.forEachTarget ([&] (AutomationTarget& t) {
         if ((t.kind == AutomationTargetKind::channelVolume || t.kind == AutomationTargetKind::channelPan
-             || t.kind == AutomationTargetKind::channelParam) && t.index >= 0)
+             || t.kind == AutomationTargetKind::channelParam || t.kind == AutomationTargetKind::channelAdjust) && t.index >= 0)
             t.index = shift (t.index);
     });
 }
@@ -936,9 +956,11 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
     song.performanceMode = project.performanceMode; // (round 165m)
     song.autoCrossfades = project.autoCrossfades;   // FL's Playlist "Automatic crossfades" (round 167a)
     song.beatsPerBar = std::clamp (project.beatsPerBar, 1, 32);
+    song.beatUnit = meterUnit (project.beatUnit); // (round 190fg; 4 in every demo project)
     song.swing = std::clamp (project.swing / 128.0f, 0.0f, 1.0f);
     song.playTruncatedNotes = project.playTruncatedNotes; // 0x1E (REA round 167g)
     song.muteRunsEffects = true;                          // FL's muted insert (round 190y)
+    song.patternClipTakeover = true;                      // FL's pattern clip takeover (issue #158)
     song.fastDeclick = project.fastDeclick;               // 0x28 (REA round 167h)
     song.panTriangular = (project.panLaw >> 1) == 1;       // 0x17: FL saves 2 × its pan-law mode (REA round 167j §1)
     song.flPluginLevels = true; // hosted plugins at Fruity Wrapper's level and velocity law (REA_rodada190ad.md)
@@ -946,6 +968,7 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
     // highlighting 0xF3, the data folder 0xCA
     song.autoPdc = project.autoPdc;
     song.compensateAutomations = project.compensateAutomations;
+    song.compensateMixerLevels = false; // (round 190hq: FL's own scope, mixer effect parameters only)
     song.timeSignatureMode = project.timeSignatureMode;
     if (project.hasScaleHighlight)
         song.scaleHighlight = { project.scaleHighlight >= -3 && project.scaleHighlight < 256 ? project.scaleHighlight : -2,
@@ -1002,6 +1025,22 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         auto inData = resolveFlPath ("%FLStudioFactoryData%\\Data" + path, options.roots);
         return inData.empty() ? path : inData;
     };
+
+    // round 190fn: the FL Studio Mobile Racks' own inserts (LYNX channel → the rack's level, pan and effects)
+    std::vector<std::pair<int, MixerTrack>> flmRackInserts;
+    // round 190jv: the FL Studio Mobile Racks with several instruments (a Layer, its instruments right after it as LYNX
+    // channels, the rack's insert and parts placed once the mixer exists)
+    struct FlmRackLayer
+    {
+        int layer = 0;
+        std::vector<int> children, childPart;
+        std::vector<FlmRackChannel::Part> parts;
+        MixerTrack insert;
+        bool insertUsed = false;
+    };
+    std::vector<FlmRackLayer> flmRackLayers;
+    // round 190jv: the racks' note effects (LYNX channel → the modules in the rack's order), run over FL's notes below
+    std::vector<std::pair<int, std::vector<std::pair<std::uint32_t, std::vector<float>>>>> flmRackNoteFx;
 
     for (const auto& c : project.channels)
     {
@@ -1080,15 +1119,15 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         // level adjustments (0xE5): FL multiplies the channel volume by the adjustment through the same curve
         // (gain = f(volume)·f(volAdj), REA_rodada3 §2 [DECOMP]; an FL render of one channel with volAdj 7286 vs 12800
         // differs by −10.4 dB, f() gives −10.7 dB, a linear factor −4.9 dB) and adds the pan adjustment to the pan.
+        // Since round 190dz they are the channel's own Levels adjustment (Misc tab), no longer folded into its knobs: the
+        // knobs read as in FL and Automate's clips (channel parameters 0x10 / 0x11) move them.
         if (c.hasLevelAdjust)
         {
-            if (c.volAdj != 12800)
-            {
-                const auto g = channelGain (def.volume) * channelGain (std::clamp (c.volAdj / 12800.0f, 0.0f, 1.0f));
-                def.volume = std::clamp ((float) (std::log (10.0 * g + 1.0) / std::log (11.0)), 0.0f, 1.0f);
-            }
-            if (c.panAdj != 0)
-                def.pan = std::clamp (def.pan + c.panAdj / 6400.0f, -1.0f, 1.0f);
+            auto& l = def.misc.levels;
+            l.pan = std::clamp (c.panAdj / 6400.0f, -1.0f, 1.0f);
+            l.volume = std::clamp (c.volAdj / 12800.0f, 0.0f, 2.0f);
+            l.modX = std::clamp (c.modXAdj / 256.0f, -1.0f, 1.0f);
+            l.modY = std::clamp (c.modYAdj / 256.0f, -1.0f, 1.0f);
         }
 
         // sample root note: our sampler plays at the original pitch at C5 (60)
@@ -1207,8 +1246,11 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         }
 
         // FL's whole native sampler voice (REA_rodada76): the five articulator records as stored (a missing one keeps
-        // the plugins' default record), Mod X/Y, filter type, PPQ
-        if (c.type == flp::ChannelType::sampler && def.instrument == InstrumentKind::sampler)
+        // the plugins' default record), Mod X/Y, filter type, PPQ.
+        // Round 190lq (issue #204): an audio clip channel's notes play through it too — FL's renders of the same notes on
+        // an audio clip channel and on a Sampler are bit-identical (its Playlist clips keep the clip voice)
+        if ((c.type == flp::ChannelType::sampler && def.instrument == InstrumentKind::sampler)
+            || (isAudioClip && def.instrument == InstrumentKind::audioClip))
         {
             const auto defaults = flvp::defaultSnapshot();
             def.sampler.flChannel.assign (90, 0);
@@ -2172,17 +2214,28 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
             p.clip = (c.fxFlags & 4) != 0;
             def.sampler.useLoopPoints = c.useLoopPoints();
             def.sampler.declickMode = std::clamp (c.declickMode, 0, 5);
+            // round 190dh: the Content options (0x8F; kept for the way back) and the loop points of FL's loop knobs (0xFB)
+            if (c.sampleFlags >= 0)
+            {
+                def.sampler.keepOnDisk = (c.sampleFlags & 0x100) != 0;
+                def.sampler.resampleOnLoad = (c.sampleFlags & 1) != 0;
+                def.sampler.loadRegions = (c.sampleFlags & 2) != 0;
+                def.sampler.loadSliceMarkers = (c.sampleFlags & 4) != 0;
+            }
+            def.sampler.loopStart = c.loopStart;
+            def.sampler.loopEnd = c.loopEnd;
         }
 
         // time-stretch: the sample lasts TIME/192 beats × MUL
         if (c.stretchTime > 0.0f)
         {
             def.sampler.stretchBeats = (float) (c.stretchTime / 192.0 * std::pow (2.0, c.stretchMul / 10000.0));
+            def.sampler.stretchMul = std::clamp (c.stretchMul, -20000, 20000); // (the page's MUL; round 190dh)
             def.sampler.keepPitch = c.stretchMode != 0; // only FL's "Resample" changes the pitch
             def.sampler.stretchMethod = stretchMethodForFlMode (c.stretchMode);
             // Fruity Granulizer: FL hands the plugin TIME as its beat count, without MUL (REA_rodada165g-flgran165 §3)
             if (def.instrument == InstrumentKind::granulizer)
-                def.sampler.stretchBeats = (float) (c.stretchTime / 192.0);
+                def.sampler.stretchBeats = (float) (c.stretchTime / 192.0), def.sampler.stretchMul = 0;
         }
 
         // FL's time-stretching panel on a sample channel or an audio clip [FL: measured, REA_rodada164e-clippitch §2]:
@@ -2196,8 +2249,126 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
             applyFlStretchPanel (def.sampler, c.stretchMode, c.stretchPitch, c.stretchMul, c.stretchTime,
                                  needsLength ? options.sampleSeconds (def.samplePath) : 0.0, song.bpm);
         }
+        // Round 190fn (FLM coverage instruments-0022): the "FL Studio Mobile Rack" generator (FLM's own FLP export writes
+        // every instrument track as one) on the .flm importer's engines: the rack's instrument on this channel, the
+        // rack's level, pan and effects on an insert of their own in front of the channel's FL insert (placed below,
+        // once the mixer exists). FL's channel settings stay FL's. What LYNX cannot rebuild keeps the stand-in (listed).
+        const auto flmRack = c.type == flp::ChannelType::instrument && c.pluginName == "FL Studio Mobile Rack" && ! c.pluginState.empty();
+        std::vector<ChannelDef> flmRackChildren; // round 190jv: a rack's instruments, pushed right after this channel
+        if (flmRack)
+        {
+            FlmImportOptions flmOptions;
+            flmOptions.common = options;
+            flmOptions.resourceRoot = flmResourceRootIn (options.roots.factoryData);
+            flmOptions.userResourceRoots = options.flmResourceRoots;
+            std::string why;
+            // the rack's instrument on FL's channel: the engine and its settings, FL's channel settings on top
+            // (round 190jv: also each instrument of a rack with several, on a copy of FL's channel)
+            const auto onFlChannel = [] (ChannelDef& to, const ChannelDef& r) {
+                to.instrument = r.instrument;
+                to.pluginState = r.pluginState;
+                to.modelParams = r.modelParams;
+                to.samplePath = r.samplePath;
+                to.zones = r.zones;
+                {
+                    // the engine's sampler settings, with FL's channel pitch and porta on top
+                    const auto porta = to.sampler.porta;
+                    const auto portaBeats = to.sampler.portaBeats;
+                    const auto pitch = to.sampler.pitch;
+                    to.sampler = r.sampler;
+                    to.sampler.porta = to.sampler.porta || porta;
+                    to.sampler.portaBeats = portaBeats;
+                    to.sampler.pitch = std::clamp (to.sampler.pitch + pitch, -24.0f, 24.0f);
+                }
+                to.synth.porta = to.synth.porta || r.synth.porta;
+                if (r.synth.porta)
+                    to.synth.portaBeats = r.synth.portaBeats;
+                to.misc.pitchRange = r.misc.pitchRange;
+                // round 190gw (live check 190gu B6): the module's own Gate (3x Osc MISC › Poly › Gate, a .flm import's
+                // Time › Gate) shortens the notes it plays inside FL as well: the shorter of it and FL's channel gate.
+                // (FL's render of 190fe's all-0.5 rack: notes ~70 ms long; without this LYNX held the whole beat, ~10 dB louder)
+                if (r.misc.gateBeats > 0.0f)
+                    to.misc.gateBeats = to.misc.gateBeats > 0.0f ? std::min (to.misc.gateBeats, r.misc.gateBeats) : r.misc.gateBeats;
+                if (r.maxPolyphony > 0 && (to.maxPolyphony == 0 || r.maxPolyphony < to.maxPolyphony))
+                    to.maxPolyphony = r.maxPolyphony;
+                // the module's key range inside FL's key region
+                to.keyLow = std::max (to.keyLow, r.keyLow);
+                to.keyHigh = std::max (to.keyLow, std::min (to.keyHigh, r.keyHigh));
+                // the instrument's wrapper (Enable, Post Gain, Mix, Wet Pan; FLM_FORMAT §7.4): on FL's channel knobs
+                to.muted = to.muted || r.muted;
+                if (std::abs (r.volume - 1.0f) > 1.0e-4f)
+                {
+                    // (LYNX's channel curve gain = (11^v − 1) / 10; its inverse)
+                    const auto gain = (double) channelGain (to.volume) * channelGain (r.volume) / channelGain (1.0f);
+                    to.volume = (float) std::clamp (std::log (10.0 * std::max (0.0, gain) + 1.0) / std::log (11.0), 0.0, 1.0);
+                }
+                to.pan = std::clamp (to.pan + r.pan, -1.0f, 1.0f);
+            };
+            if (auto rack = importFlmRackState (c.pluginState, flmOptions, song.bpm, def.name, &why); rack && ! rack->children.empty())
+            {
+                // round 190jv (FLM_FORMAT §8.2): several instruments. Every one of them plays every note inside its key
+                // range, as in a .flm: the channel becomes a Layer at 0 dB, centred, unpitched (it only hands its notes
+                // on), and each child is the rack's instrument on FL's channel exactly as a one-instrument rack would be
+                // (FL's volume, pan, pitch, porta, gate, polyphony and key region with the module's own on top), named
+                // after the module
+                FlmRackLayer group;
+                group.layer = (int) song.channels.size();
+                for (std::size_t k = 0; k < rack->children.size(); ++k)
+                {
+                    auto child = def;
+                    onFlChannel (child, rack->children[k]);
+                    child.name = rack->children[k].name;
+                    child.layer = {};
+                    child.flOrigin = {};
+                    child.mixerTrack = def.mixerTrack; // (its part of the rack: placed below, once the mixer exists)
+                    flmRackChildren.push_back (std::move (child));
+                }
+                def.instrument = InstrumentKind::layer;
+                def.layer = {};
+                def.plugin = {};
+                def.pluginState.clear();
+                def.modelParams = {};
+                def.samplePath.clear();
+                def.zones.clear();
+                def.volume = 1.0f;
+                def.pan = 0.0f;
+                def.sampler.pitch = 0.0f;
+                def.misc.rootNote = 60;
+                def.misc.levels = {};
+                // (a note's Time › Gate is the Layer's: the instruments' common gate, the shorter of it and FL's)
+                if (const auto gate = rack->channel.misc.gateBeats; gate > 0.0f)
+                    def.misc.gateBeats = def.misc.gateBeats > 0.0f ? std::min (def.misc.gateBeats, gate) : gate;
+                def.muted = def.muted || rack->channel.muted;
+                group.childPart = std::move (rack->childPart);
+                group.parts = std::move (rack->parts);
+                group.insertUsed = rack->insertUsed || ! group.parts.empty();
+                group.insert = std::move (rack->insert);
+                group.insert.name = def.name + " (FL Studio Mobile Rack)";
+                flmRackLayers.push_back (std::move (group));
+                if (! rack->noteEffects.empty())
+                    flmRackNoteFx.push_back ({ (int) song.channels.size(), std::move (rack->noteEffects) });
+                if (options.report != nullptr)
+                    ++options.report->converted["FL Studio Mobile Rack"];
+            }
+            else if (rack)
+            {
+                onFlChannel (def, rack->channel);
+                if (rack->insertUsed)
+                {
+                    rack->insert.name = def.name + " (FL Studio Mobile Rack)";
+                    flmRackInserts.push_back ({ (int) song.channels.size(), std::move (rack->insert) });
+                }
+                if (! rack->noteEffects.empty()) // round 190jv
+                    flmRackNoteFx.push_back ({ (int) song.channels.size(), std::move (rack->noteEffects) });
+                if (options.report != nullptr)
+                    ++options.report->converted["FL Studio Mobile Rack"];
+            }
+            else if (options.report != nullptr)
+                ++options.report->unsupported[why + "; played with a LYNX SHARE synth preset"];
+        }
+
         // report: what happened to this channel's generator/sample
-        if (options.report != nullptr)
+        if (options.report != nullptr && ! flmRack)
         {
             auto& r = *options.report;
             const auto plugin = lowercase (c.pluginName);
@@ -2252,13 +2423,16 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
                 const auto note = flextra::inertPluginNote (c.pluginName); // round 165g: ReWired, Video Player, FL Studio Mobile
                 if (c.pluginName == "ReWired")
                     def.muted = true; // no sound of their own in LYNX: the stand-in synth must not play their notes
-                ++r.unsupported[note.empty() ? c.pluginName : note]; // (Keyboard Controller only sends notes to other channels)
+                // (Keyboard Controller only sends notes to other channels). Round qafix190kq: ReWired stays silent, so it is
+                // "not reproduced", not "played with a synth preset"
+                ++(c.pluginName == "ReWired" ? r.notReproduced : r.unsupported)[note.empty() ? c.pluginName : note];
             }
         }
 
         // Export to FL Studio (round 171e): the original generator, written back while LYNX leaves it as imported (an FPC
         // becomes several channels and a wrapped plugin travels as its plugin reference: neither keeps one)
-        if (c.type == flp::ChannelType::instrument && ! c.pluginName.empty() && c.pluginName != "Fruity Wrapper" && c.pluginName != "FPC")
+        if (c.type == flp::ChannelType::instrument && ! c.pluginName.empty() && c.pluginName != "Fruity Wrapper" && c.pluginName != "FPC"
+            && flmRackChildren.empty()) // (round 190jv: a FL Studio Mobile Rack that became a Layer and its instruments)
         {
             def.flOrigin.plugin = c.pluginName;
             if (def.pluginState != c.pluginState)
@@ -2266,11 +2440,17 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         }
 
         song.channels.push_back (std::move (def));
+        for (auto& child : flmRackChildren) // round 190jv
+        {
+            flmRackLayers.back().children.push_back ((int) song.channels.size());
+            song.channels.push_back (std::move (child));
+        }
     }
 
     // Layer children: FL's channel indices → LYNX's (children that did not become channels are dropped)
     for (auto& def : song.channels)
-        if (def.instrument == InstrumentKind::layer)
+        if (def.instrument == InstrumentKind::layer
+            && std::none_of (flmRackLayers.begin(), flmRackLayers.end(), [&] (const FlmRackLayer& g) { return &song.channels[(std::size_t) g.layer] == &def; }))
         {
             std::vector<int> mapped;
             for (const auto k : def.layer.children)
@@ -2340,6 +2520,8 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         // 0x9A "Audio input source" (REA round 157c): resolved against the open device when the project opens
         // (AudioEngine::setSong). FL plays an insert's input through it whether the insert is armed or not, stopped or
         // playing ([FL] FL Studio 2026, meters of unarmed inserts with an input): monitoring On
+        // (no input and no 0xA6: "Auto", as these files always opened; round 190ev changed only new inserts' default)
+        track.monitor = InputMonitor::automatic;
         if (insert.input >= 0)
         {
             track.flInput = insert.input;
@@ -3006,6 +3188,13 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
                     made->plugin.foreign = std::move (foreign);
                     made->plugin.detached = flDetached (slot.wrapperFlags); // (0xD4 flag 0x4, issue #116)
                 }
+                else if (slot.plugin == "FL Studio Mobile Rack FX")
+                {
+                    // round 190fn (FLM coverage effects-0048): the rack's effect modules on the .flm importer's engines
+                    made = flmRackFxSlot (slot.state, options.report);
+                    if (! made)
+                        continue; // (an empty rack, or nothing that maps: listed by flmRackFxSlot)
+                }
                 else
                 {
                     made = effectFromFl (slot.plugin, slot.state, song.bpm, flData); // native effect with the saved settings (REA_rodada7)
@@ -3267,6 +3456,73 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
                     send.level = faderGain (control.value / 16000.0f);
     }
 
+    // round 190fn: each FL Studio Mobile Rack's level, pan and effects on an insert of their own after FL's (FLM's rack
+    // applies them inside the generator, before FL's channel and insert), sending into the channel's FL insert. When the
+    // mixer has no room, the effects go on the channel's FL insert if nothing else uses it; else they are listed.
+    for (auto& [index, insert] : flmRackInserts)
+    {
+        auto& channel = song.channels[(std::size_t) index];
+        const auto target = channel.mixerTrack;
+        if ((int) song.mixer.size() < maxMixerTracks)
+        {
+            insert.toMaster = target == 0;
+            song.mixer.push_back (std::move (insert));
+            const auto added = (int) song.mixer.size() - 1;
+            if (target > 0)
+                song.setRoute (added, target, true, 1.0f);
+            channel.mixerTrack = added;
+            continue;
+        }
+        const auto shared = std::any_of (song.channels.begin(), song.channels.end(), [&] (const ChannelDef& other) {
+            return &other != &channel && other.mixerTrack == target;
+        });
+        auto& own = song.mixer[(std::size_t) target];
+        if (target > 0 && ! shared && own.effects.empty())
+        {
+            own.effects = std::move (insert.effects);
+            own.volume = faderPosition (std::min (faderGain (insert.volume) * faderGain (own.volume), maxFaderGain));
+            own.pan = std::clamp (own.pan + insert.pan, -1.0f, 1.0f);
+        }
+        else if (options.report != nullptr)
+            ++options.report->droppedEffects["FL Studio Mobile Rack: the rack's effects and level (the mixer is full)"];
+    }
+    // round 190jv: each FL Studio Mobile Rack with several instruments: the Layer's children linked; the rack's insert
+    // after FL's as for one instrument (also when only its parts need it); the rack's parts in front of it, each sending
+    // into the next part or into the rack's insert at the level the .flm import gives it; each instrument on its part.
+    // When the mixer has no room, every instrument plays into the channel's FL insert (listed).
+    for (auto& g : flmRackLayers)
+    {
+        auto& layer = song.channels[(std::size_t) g.layer];
+        layer.layer.children = g.children;
+        const auto target = layer.mixerTrack;
+        if ((int) song.mixer.size() + (g.insertUsed ? 1 : 0) + (int) g.parts.size() > maxMixerTracks)
+        {
+            if (options.report != nullptr && g.insertUsed)
+                ++options.report->droppedEffects["FL Studio Mobile Rack: the rack's effects and level (the mixer is full)"];
+            continue;
+        }
+        auto rackInsert = target;
+        if (g.insertUsed)
+        {
+            g.insert.toMaster = target == 0;
+            song.mixer.push_back (std::move (g.insert));
+            rackInsert = (int) song.mixer.size() - 1;
+            if (target > 0)
+                song.setRoute (rackInsert, target, true, 1.0f);
+            layer.mixerTrack = rackInsert;
+        }
+        const auto first = (int) song.mixer.size();
+        for (auto& p : g.parts)
+        {
+            p.insert.toMaster = false;
+            song.mixer.push_back (std::move (p.insert));
+        }
+        for (std::size_t k = 0; k < g.parts.size(); ++k)
+            song.setRoute (first + (int) k, g.parts[k].into < 0 ? rackInsert : first + g.parts[k].into, true, g.parts[k].level);
+        for (std::size_t k = 0; k < g.children.size() && k < g.childPart.size(); ++k)
+            song.channels[(std::size_t) g.children[k]].mixerTrack = g.childPart[k] < 0 ? rackInsert : first + g.childPart[k];
+    }
+
     // the FL template routes every insert to the send tracks at level 0; that makes no sound, only wastes CPU
     for (auto& t : song.mixer)
         t.sends.erase (std::remove_if (t.sends.begin(), t.sends.end(), [] (const MixerSend& s) { return s.level <= 0.0f; }),
@@ -3337,6 +3593,11 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
             note.porta = n.porta();
             note.colour = n.extra & 0x0F;
             note.group = n.group;
+            // the graph editor's other per-note levels (issue #208): release velocity, Mod X / Mod Y and repeat
+            note.release = std::clamp (n.release / 128.0f, 0.0f, 1.0f);
+            note.modX = std::clamp (n.modX / 256.0f, 0.0f, 1.0f);
+            note.modY = std::clamp (n.modY / 256.0f, 0.0f, 1.0f);
+            note.repeat = n.repeats <= noterepeat::rateCount ? (int) n.repeats : 0;
             p.notes.push_back (note);
         }
 
@@ -3346,6 +3607,49 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         {
             patternMap[src.index] = (int) song.patterns.size();
             song.patterns.push_back (std::move (p));
+        }
+    }
+
+    // round 190jv (FLM_FORMAT §7.2, §8.2): an FL Studio Mobile Rack's Transpose, Scale and Randomizer act on every note
+    // FL sends it, before its instruments: the same chain the .flm import runs over a lane's notes (core/FlmNoteFx.h),
+    // here over the channel's notes in every pattern (a Scale without Snap drops the notes it does not play, as FLM
+    // does; the Randomizer draws once, in pattern order)
+    for (const auto& [channel, modules] : flmRackNoteFx)
+    {
+        flmnotefx::Chain chain;
+        for (const auto& [type, params] : modules)
+            chain.add (type, params);
+        int dropped = 0;
+        for (auto& p : song.patterns)
+        {
+            std::vector<Note> kept;
+            kept.reserve (p.notes.size());
+            for (auto n : p.notes)
+            {
+                if (n.channel == channel)
+                {
+                    flmnotefx::Note played { n.key, n.velocity, 0.5f * (n.pan + 1.0f) };
+                    if (! chain.apply (played))
+                    {
+                        ++dropped;
+                        continue;
+                    }
+                    n.key = std::clamp (played.key, 0, 127);
+                    n.velocity = std::clamp (played.velocity, 0.0f, 1.0f);
+                    n.pan = std::clamp (2.0f * played.pan - 1.0f, -1.0f, 1.0f);
+                }
+                kept.push_back (n);
+            }
+            p.notes = std::move (kept);
+            p.sortNotes();
+        }
+        if (options.report != nullptr)
+        {
+            ++options.report->converted["FL Studio Mobile Rack: note effects (on the channel's notes)"];
+            if (dropped > 0)
+                options.report->converted["FL Studio Mobile: notes a note effect holds back (silent in FLM too)"] += dropped;
+            if (chain.random())
+                ++options.report->partialEffects["FL Studio Mobile: Randomizer (drawn once at import; FLM draws at every playback)"];
         }
     }
 
@@ -3480,7 +3784,7 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         };
         auto note = [&] (const std::string& what) {
             if (options.report != nullptr)
-                ++options.report->unsupported["Pattern events: " + what];
+                ++options.report->notReproduced["Pattern events: " + what];
         };
         // FL value → our 0..1 for a target (nothing when the target or its scale is not reproduced)
         auto convertor = [&] (flp::ControlId id, AutomationTarget& target) -> std::function<float (std::int32_t)> {
@@ -3575,6 +3879,12 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
         }
     }
 
+    // an FL point's curve (the segment that ends at it) onto LYNX's point where that segment starts
+    const auto flCurveOnto = [] (AutomationPoint& previous, const flp::AutomationPoint& p) {
+        previous.mode = p.curve < flcurve::modeCount ? p.curve : (std::uint8_t) flcurve::singleCurve;
+        previous.tension = std::isfinite (p.tension) ? std::clamp (0.0f - p.tension, -1.0f, 1.0f) : 0.0f;
+    };
+
     // Automation clips: one Automation per FL automation channel, with the target from the 0xE3 link.
     std::map<int, int> automationMap; // FL channel -> index into song.automations
 
@@ -3585,6 +3895,8 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
 
         Automation a;
         a.name = c.name.empty() ? "Automation " + std::to_string (c.index + 1) : c.name;
+        if (c.colour != 0) // (round 190ig: the clip's colour in FL's Playlist is its channel's)
+            a.colour = 0xFF000000u | c.colour;
         std::function<float (float)> valueMap; // FL normalized value -> ours (effect parameters)
 
         for (const auto& link : project.automationLinks)
@@ -3615,16 +3927,10 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
             else if (valueMap)
                 value = std::clamp (valueMap (value), 0.0f, 1.0f);
 
-            // FL's curve belongs to the segment ending at the point; ours sits on the left point
+            // FL's curve mode and tension belong to the segment ending at the point; ours sit on the left point, the
+            // tension with the opposite sign (round 190bw: every mode, played by FL's own law)
             if (i > 0)
-            {
-                auto& previous = a.points.back();
-
-                if (p.curve == 0 || p.curve == 1) // single/double curve: exponential by tension
-                    previous.tension = std::clamp (-p.tension, -1.0f, 1.0f);
-                else if (p.curve == 2 && tick - previous.tick > 1) // hold: step right before the point
-                    a.points.push_back ({ tick - 1, previous.value, 0.0f });
-            }
+                flCurveOnto (a.points.back(), p);
 
             a.points.push_back ({ tick, value, 0.0f });
         }
@@ -3649,13 +3955,7 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
                 const auto& p = f.points[i];
                 const auto tick = (std::int64_t) std::llround (p.position * ppq);
                 if (i > 0)
-                {
-                    auto& previous = lfo.amp.back();
-                    if (p.curve == 0 || p.curve == 1)
-                        previous.tension = std::clamp (-p.tension, -1.0f, 1.0f);
-                    else if (p.curve == 2 && tick - previous.tick > 1)
-                        lfo.amp.push_back ({ tick - 1, previous.value, 0.0f });
-                }
+                    flCurveOnto (lfo.amp.back(), p);
                 lfo.amp.push_back ({ tick, (float) std::clamp (p.value, 0.0, 1.0), 0.0f });
             }
             if (lfo.amp.empty())
@@ -3897,7 +4197,8 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
             clips.push_back (clip);
         }
 
-        std::sort (clips.begin(), clips.end(), [] (const Clip& a, const Clip& b) { return a.start < b.start; });
+        // stable: on the same start the file's order stays, and the clip later in it wins a pattern clip takeover (issue #158)
+        std::stable_sort (clips.begin(), clips.end(), [] (const Clip& a, const Clip& b) { return a.start < b.start; });
 
         Arrangement a;
         a.name = arrangement.name.empty() ? "Arrangement " + std::to_string (song.arrangements.size() + 1) : arrangement.name;
@@ -3967,9 +4268,10 @@ Song importFlp (const flp::Project& input, const FlpImportOptions& options)
 
                     auto& track = song.playlistTracks[(std::size_t) t.index];
                     track = { t.name, ! t.enabled, 0, coloured ? 0xFF000000u | t.colour : 0u };
-                    // FL's size is relative to its default row; LYNX keeps the same proportion of its own default
+                    // FL's size factor: a row is 16 px + size × (default − 16) (FUN_00ea0b30, round 190ft) on FL's
+                    // 48 px default row (live check 190gu B1, round 190gw)
                     if (sized)
-                        track.height = polish::clampTrackHeight ((int) std::lround (polish::defaultTrackHeight * t.heightScale));
+                        track.height = polish::heightForFlSize (t.heightScale, song.playlistRowHeight);
                     track.grouped = t.index > 0 && t.grouped;
                     track.performance = performance; // Performance mode's track settings (round 165m)
                     track.collapsed = ! t.expanded;

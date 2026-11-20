@@ -173,7 +173,8 @@ double noteToHz (double note, double a4) noexcept { return a4 * std::exp2 ((note
 // Pitch detector
 
 PitchDetector::PitchDetector()
-    : full ((std::size_t) maxFull, 0.0f), deci ((std::size_t) maxDecimated, 0.0f), diff ((std::size_t) maxDecimated, 0.0f)
+    : full ((std::size_t) maxFull, 0.0f), deci ((std::size_t) maxDecimated, 0.0f), diff ((std::size_t) maxDecimated, 0.0f),
+      lin ((std::size_t) maxFull, 0.0f), sums ((std::size_t) maxDecimated, 0.0)
 {
 }
 
@@ -258,16 +259,32 @@ void PitchDetector::analyse() noexcept
         energy += (double) at (j) * at (j);
     est.level = (float) std::sqrt (energy / window);
 
+    // Round 190li (CPU only, the same result to the bit): the window is copied out of the ring first and the lags are
+    // summed side by side (j outer, lag inner) — every lag's sum still adds its terms in the same order, but the lags
+    // no longer wait on one another's additions and the inner loop runs over contiguous memory
+    const auto span = window + tauMax + 1;
+    for (int j = 0; j < span; ++j)
+        lin[(std::size_t) j] = at (j);
+    std::fill (sums.begin(), sums.begin() + tauMax + 1, 0.0);
+    {
+        const float* x = lin.data();
+        double* sd = sums.data();
+        for (int j = 0; j < window; ++j)
+        {
+            const auto xj = (double) x[j];
+            const float* xt = x + j;
+            for (int tau = 1; tau <= tauMax; ++tau)
+            {
+                const auto e = xj - xt[tau];
+                sd[tau] += e * e;
+            }
+        }
+    }
     diff[0] = 1.0f;
     double running = 0.0;
     for (int tau = 1; tau <= tauMax; ++tau)
     {
-        double d = 0.0;
-        for (int j = 0; j < window; ++j)
-        {
-            const auto e = (double) at (j) - at (j + tau);
-            d += e * e;
-        }
+        const auto d = sums[(std::size_t) tau];
         running += d;
         diff[(std::size_t) tau] = running > 0.0 ? (float) (d * tau / running) : 1.0f;
     }
@@ -354,19 +371,27 @@ void PitchDetector::analyse() noexcept
             auto y = [&] (std::int64_t j) { return full[(std::size_t) ((start + j) & fm)]; };
             std::array<double, 64> d {};
             const auto count = std::min (hi - lo + 1, 64);
-            int bestK = 0;
-            for (int k = 0; k < count; ++k)
+            // (round 190li: the same sums, the lags side by side over a linear copy — see the YIN step above)
+            const auto need = wf + lo + count;
+            for (int j = 0; j < need; ++j)
+                lin[(std::size_t) j] = y (j);
             {
-                double s = 0.0;
+                const float* x = lin.data();
                 for (int j = 0; j < wf; ++j)
                 {
-                    const auto e = (double) y (j) - y (j + lo + k);
-                    s += e * e;
+                    const auto xj = (double) x[j];
+                    const float* xt = x + j + lo;
+                    for (int k = 0; k < count; ++k)
+                    {
+                        const auto e = xj - xt[k];
+                        d[(std::size_t) k] += e * e;
+                    }
                 }
-                d[(std::size_t) k] = s;
-                if (s < d[(std::size_t) bestK])
-                    bestK = k;
             }
+            int bestK = 0;
+            for (int k = 0; k < count; ++k)
+                if (d[(std::size_t) k] < d[(std::size_t) bestK])
+                    bestK = k;
             if (bestK > 0 && bestK < count - 1)
                 period = lo + bestK + refine (d[(std::size_t) bestK - 1], d[(std::size_t) bestK], d[(std::size_t) bestK + 1]);
         }
@@ -419,22 +444,28 @@ std::vector<PitchFrame> analysePitch (const float* x, int n, double sampleRate, 
 // ---------------------------------------------------------------------------------------------------------------------
 // TD-PSOLA
 
-Psola::Psola() : env ((std::size_t) ringSize, 0.0f), wsum ((std::size_t) ringSize, 0.0f)
+Psola::Psola() : env ((std::size_t) ringSize, 0.0f), wsum ((std::size_t) ringSize, 0.0f), markLin ((std::size_t) ringSize / 2, 0.0f),
+                 markScore ((std::size_t) ringSize / 8, 0.0)
 {
     for (int c = 0; c < 2; ++c)
     {
         in[c].assign ((std::size_t) ringSize, 0.0f);
         acc[c].assign ((std::size_t) ringSize, 0.0f);
     }
+    envCoef = (float) (1.0 - std::exp (-2.0 * pi * 900.0 / sr)); // (the default rate until prepare())
 }
 
 void Psola::prepare (double sampleRate, double maxPeriod, int latency) noexcept
 {
     sr = sampleRate > 0.0 ? sampleRate : 44100.0;
+    envCoef = (float) (1.0 - std::exp (-2.0 * pi * 900.0 / sr)); // (round 190li: once here, no longer per sample)
     maxP = std::clamp (maxPeriod, 16.0, ringSize / 8.0);
     delay = std::clamp (latency, 8, ringSize / 2);
     lag = 0;
     unvoicedHop = std::clamp ((int) std::lround (128.0 * sr / 44100.0), 4, std::max (4, (delay - 4) / 2));
+    // round 190dp: the shifted unvoiced grains' hop (longer: their joins modulate the sound at the grain rate, and a
+    // slower rate keeps that modulation's sidebands next to what made them instead of under a voice's lowest band)
+    shiftHop = std::clamp ((int) std::lround (unvoicedShiftHopMs * 0.001 * sr), 4, std::max (4, (delay - 4) / 3));
     reset();
 }
 
@@ -507,7 +538,8 @@ void Psola::placeMarks() noexcept
             markHead = (markHead + 1) % maxMarks;
             --markCount;
         }
-        marks[(std::size_t) ((markHead + markCount) % maxMarks)] = { pos, p, v, (float) ratio, (float) formant };
+        // round 190ho (setUnvoicedPlain): an unvoiced mark placed then keeps the source's own formants
+        marks[(std::size_t) ((markHead + markCount) % maxMarks)] = { pos, p, v, (float) ratio, ! v && unvoicedPlain ? 1.0f : (float) formant };
         ++markCount;
     };
 
@@ -541,13 +573,29 @@ void Psola::placeMarks() noexcept
             const auto pm = (std::int64_t) std::lround (prev);
             // long periods: every other sample (or fewer) of the window — the low-passed signal is smooth there
             const auto stride = std::max (1, span / 256);
+            // Round 190li (CPU only, the same result to the bit): with the correlation, every candidate's sum is formed at
+            // once (the window's offsets outer, the candidates inner, over linear copies): each sum still adds its terms
+            // in the same order, but the candidates no longer wait on one another's additions
+            const auto cands = (int) (to - from + 1);
+            if (corr && cands > 0)
+            {
+                const auto len = cands + span;
+                for (int k = 0; k <= len; ++k)
+                    markLin[(std::size_t) k] = env[(std::size_t) ((from - span + k) & m)];
+                std::fill (markScore.begin(), markScore.begin() + cands, 0.0);
+                double* sc = markScore.data();
+                for (int j = -span; j <= 0; j += stride)
+                {
+                    const auto ref = (double) env[(std::size_t) ((pm + j) & m)];
+                    const float* xs = markLin.data() + (j + span);
+                    for (int c = 0; c < cands; ++c)
+                        sc[c] += (double) xs[c] * ref;
+                }
+            }
             auto score = [&] (std::int64_t i) {
                 if (! corr)
                     return (double) env[(std::size_t) (i & m)];
-                double sxy = 0.0;
-                for (int j = -span; j <= 0; j += stride)
-                    sxy += (double) env[(std::size_t) ((i + j) & m)] * (double) env[(std::size_t) ((pm + j) & m)];
-                return sxy;
+                return markScore[(std::size_t) (i - from)];
             };
             // prefer the predicted position a little: ties and flat tops do not make the marks wander
             const auto pen = corr ? 0.0 : 1e-4;
@@ -598,9 +646,8 @@ void Psola::process (const float* x, float* y, int channels) noexcept
     for (int c = 0; c < channels; ++c)
         in[c][(std::size_t) (now & m)] = std::isfinite (x[c]) ? x[c] : 0.0f;
     const auto mono = channels == 2 ? 0.5f * (in[0][(std::size_t) (now & m)] + in[1][(std::size_t) (now & m)]) : in[0][(std::size_t) (now & m)];
-    // a gentle low-pass (one pole near 900 Hz) of the input: the marks lock to its peaks
-    const auto a = (float) (1.0 - std::exp (-2.0 * pi * 900.0 / sr));
-    envZ += a * (mono - envZ);
+    // a gentle low-pass (one pole near 900 Hz) of the input: the marks lock to its peaks (envCoef: prepare())
+    envZ += envCoef * (mono - envZ);
     if (! std::isfinite (envZ))
         envZ = 0.0f;
     env[(std::size_t) (now & m)] = envZ;
@@ -638,10 +685,15 @@ void Psola::process (const float* x, float* y, int channels) noexcept
 
         const Mark* mk = best >= 0 ? &marks[(std::size_t) ((markHead + best) % maxMarks)] : nullptr;
         const auto isVoiced = mk != nullptr && mk->voiced;
-        const auto f = isVoiced ? (double) mk->formant : 1.0;
+        // round 190dp (setUnvoicedShift, off by default): an unvoiced grain is read at the formant factor too — the
+        // same window and spacing on the output, a source span `fu` times as long — so noise, breath and what lies
+        // above the detector's range move with the formants instead of passing unshifted. fu = 1 = the old grains
+        const auto fu = ! isVoiced && unvoicedShift && mk != nullptr ? (double) mk->formant : 1.0;
+        const auto f = isVoiced ? (double) mk->formant : fu;
         const auto r = isVoiced ? (double) mk->ratio : 1.0;
-        const auto ha = isVoiced ? (double) mk->period : (double) unvoicedHop; // analysis half-length
-        const auto hs = ha / f;                                                // synthesis half-length
+        // analysis half-length (a shifted unvoiced grain: its own longer hop, `fu` times as much source), synthesis half-length
+        const auto ha = isVoiced ? (double) mk->period : (fu != 1.0 ? (double) shiftHop * fu : (double) unvoicedHop);
+        const auto hs = ha / f;
         // a voiced onset starts on its mark: the voice is not displaced in time from the input
         if (isVoiced && ! lastVoiced && mk->pos - hs > (double) e - 1.0)
             nextSynth = mk->pos;
@@ -652,29 +704,50 @@ void Psola::process (const float* x, float* y, int channels) noexcept
 
         // unvoiced: read around the synthesis time itself (plain overlap-add, transparent); voiced: around the mark
         const auto ta = isVoiced ? mk->pos : ts;
-        if (! isVoiced && ts + hs + 2.0 > last)
+        if (! isVoiced && ts + std::max (hs, ha) + 2.0 > last)
             break; // not in yet (only with a very short latency)
 
-        const auto gain = (float) std::clamp (f / r, 0.25, 4.0);
+        const auto gain = (float) std::clamp (isVoiced ? f / r : 1.0, 0.25, 4.0);
         const auto o0 = std::max<std::int64_t> ((std::int64_t) std::ceil (ts - hs), e);
         const auto o1 = std::min<std::int64_t> ((std::int64_t) std::floor (ts + hs), e + ringSize - 1);
         const auto invHs = 1.0 / hs;
-        for (auto o = o0; o <= o1; ++o)
+        if (fu != 1.0)
         {
-            const auto u = ((double) o - ts) * invHs;
-            if (u <= -1.0 || u >= 1.0)
-                continue;
-            const auto w = gain * (float) (0.5 + 0.5 * std::cos (pi * u));
-            const auto src = ta + ((double) o - ts) * f;
-            for (int c = 0; c < channels; ++c)
-                acc[c][(std::size_t) (o & m)] += w * readIn (c, src);
-            wsum[(std::size_t) (o & m)] += w;
+            // round 190dp: a resampled unvoiced grain overlaps its neighbour with the source `hs · (fu − 1)` apart, which
+            // combs noise where the two windows meet (3 ms Hann grains at +2 st: a notch near 1.4 kHz): a flat-topped window whose
+            // raised-cosine ramps take only `unvoicedTaper` of the hop keeps the sum at 1 with that overlap only there
+            const auto flat = 0.5 * hs * (1.0 - unvoicedTaper), ramp = unvoicedTaper * hs;
+            const auto q0 = std::max<std::int64_t> ((std::int64_t) std::ceil (ts - flat - ramp), e);
+            const auto q1 = std::min<std::int64_t> ((std::int64_t) std::floor (ts + flat + ramp), e + ringSize - 1);
+            for (auto o = q0; o <= q1; ++o)
+            {
+                const auto d = std::abs ((double) o - ts) - flat;
+                if (d >= ramp)
+                    continue;
+                const auto w = d <= 0.0 ? 1.0f : (float) (0.5 + 0.5 * std::cos (pi * d / ramp));
+                const auto src = ta + ((double) o - ts) * f;
+                for (int c = 0; c < channels; ++c)
+                    acc[c][(std::size_t) (o & m)] += w * readIn (c, src);
+                wsum[(std::size_t) (o & m)] += w;
+            }
         }
+        else
+            for (auto o = o0; o <= o1; ++o)
+            {
+                const auto u = ((double) o - ts) * invHs;
+                if (u <= -1.0 || u >= 1.0)
+                    continue;
+                const auto w = gain * (float) (0.5 + 0.5 * std::cos (pi * u));
+                const auto src = ta + ((double) o - ts) * f;
+                for (int c = 0; c < channels; ++c)
+                    acc[c][(std::size_t) (o & m)] += w * readIn (c, src);
+                wsum[(std::size_t) (o & m)] += w;
+            }
         // unshifted voiced grains drift toward their marks, so a voice already on its note comes out as the input
         // itself (delayed), not displaced by up to half a period. Round 148: faded in over the last 3.4 cents of
         // shift and at most 0.05 % of a period per grain (~0.9 c) — the on / off switch at 1.7 cents (0.15 %) turned
         // into a 0.5 c wobble on held notes whose correction hovers around zero
-        auto hop = isVoiced ? ha / r : ha;
+        auto hop = isVoiced ? ha / r : hs;
         if (isVoiced && std::abs (f - 1.0) < 1e-3)
         {
             const auto w = std::max (0.0, 1.0 - std::abs (r - 1.0) / 2e-3);

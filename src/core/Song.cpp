@@ -7,8 +7,12 @@
 #include "core/PatternBlocks.h"
 #include "core/MidiControls.h"
 #include "core/SessionIds.h"
+#include "core/FlCurve.h"
+#include "core/SynthParams.h"
+#include "core/SoundFont.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <iterator>
 #include <cmath>
 #include <functional>
@@ -22,12 +26,12 @@ void Pattern::sortNotes()
     std::stable_sort (notes.begin(), notes.end(), [] (const Note& a, const Note& b) { return a.start < b.start; });
 }
 
-std::int64_t Pattern::effectiveLength (int beatsPerBar) const noexcept
+std::int64_t Pattern::effectiveLength (Meter meter) const noexcept
 {
     if (lengthTicks > 0)
         return lengthTicks;
 
-    const std::int64_t bar = (std::int64_t) ppq * std::max (1, beatsPerBar);
+    const std::int64_t bar = meter.bar();
     std::int64_t end = 0;
 
     for (auto& n : notes)
@@ -78,7 +82,7 @@ void Pattern::toggleStep (int channel, int step, bool muteRemoved)
 
 std::int64_t Song::songLength() const noexcept
 {
-    const std::int64_t bar = (std::int64_t) ppq * std::max (1, beatsPerBar);
+    const std::int64_t bar = barTicks();
     std::int64_t end = 0;
 
     for (const auto& c : playlist)
@@ -95,7 +99,7 @@ std::int64_t Song::songLength() const noexcept
 
     // an empty Playlist (e.g. recording the first take in Song mode) loops the current pattern's length, not one bar
     if (! arranged && currentPattern >= 0 && currentPattern < (int) patterns.size())
-        end = patterns[(std::size_t) currentPattern].effectiveLength (beatsPerBar);
+        end = patterns[(std::size_t) currentPattern].effectiveLength (meter());
 
     // FL: Song mode loops at the exact end of the last clip (a clip ending at 3:05 loops at 3:05), not at the bar end
     if (arranged && end > 0)
@@ -120,7 +124,7 @@ void followPatternLengths (const std::vector<std::int64_t>& before, Song& song)
 
     for (std::size_t i = 0; i < before.size(); ++i)
     {
-        const auto now = song.patterns[i].effectiveLength (song.beatsPerBar);
+        const auto now = song.patterns[i].effectiveLength (song.meter());
         if (now == before[i] || before[i] <= 0)
             continue;
 
@@ -208,7 +212,7 @@ std::vector<std::int64_t> patternLengths (const Song& song)
     std::vector<std::int64_t> lengths;
     lengths.reserve (song.patterns.size());
     for (const auto& p : song.patterns)
-        lengths.push_back (p.effectiveLength (song.beatsPerBar));
+        lengths.push_back (p.effectiveLength (song.meter()));
     return lengths;
 }
 
@@ -238,10 +242,37 @@ void Song::removePattern (int index)
         else if (c.loopStarterPattern > index)
             --c.loopStarterPattern;
 
-    if (patterns.empty())
-        patterns.emplace_back().name = "Pattern 1";
+    if (currentPattern > index)
+        --currentPattern;
+    keepOnePattern(); // (the last one: an empty "Pattern 1" stays, as in FL)
+}
 
-    currentPattern = std::clamp (currentPattern > index ? currentPattern - 1 : currentPattern, 0, (int) patterns.size() - 1);
+bool Song::keepOnePattern()
+{
+    bool changed = false;
+    if (patterns.empty())
+    {
+        patterns.emplace_back().name = "Pattern 1";
+        changed = true;
+    }
+    const auto clamped = std::clamp (currentPattern, 0, (int) patterns.size() - 1);
+    changed = changed || clamped != currentPattern;
+    currentPattern = clamped;
+    return changed;
+}
+
+const Pattern& Song::activePattern() const noexcept
+{
+    static const Pattern none;
+    if (patterns.empty())
+        return none;
+    return patterns[(std::size_t) std::clamp (currentPattern, 0, (int) patterns.size() - 1)];
+}
+
+Pattern& Song::activePattern()
+{
+    keepOnePattern();
+    return patterns[(std::size_t) currentPattern];
 }
 
 std::vector<MixerTrack> Song::defaultMixer (int inserts)
@@ -372,7 +403,7 @@ void Song::removeChannel (int index)
 
     forEachTarget ([index] (AutomationTarget& t) {
         const auto onChannel = t.kind == AutomationTargetKind::channelVolume || t.kind == AutomationTargetKind::channelPan
-                               || t.kind == AutomationTargetKind::channelParam;
+                               || t.kind == AutomationTargetKind::channelParam || t.kind == AutomationTargetKind::channelAdjust;
 
         if (onChannel && t.index == index)
             t.kind = AutomationTargetKind::none;
@@ -416,6 +447,11 @@ void Song::removeDeadMidiLinks()
     initialValues.erase (std::remove_if (initialValues.begin(), initialValues.end(),
                                          [] (const InitialValue& v) { return v.target.kind == AutomationTargetKind::none; }),
                          initialValues.end());
+    remoteMappings.erase (std::remove_if (remoteMappings.begin(), remoteMappings.end(), // (round 190ef)
+                                          [] (const RemoteMapping& m) {
+                                              return m.action == RemoteAction::parameter && m.target.kind == AutomationTargetKind::none;
+                                          }),
+                          remoteMappings.end());
 }
 
 std::vector<MidiLink> linksWithGlobal (const std::vector<MidiLink>& project, const std::vector<MidiLink>& global)
@@ -424,12 +460,73 @@ std::vector<MidiLink> linksWithGlobal (const std::vector<MidiLink>& project, con
     for (const auto& g : global)
     {
         const auto overridden = std::any_of (project.begin(), project.end(), [&] (const MidiLink& p) {
-            return p.target == g.target || (p.cc == g.cc && (p.channel < 0 || g.channel < 0 || p.channel == g.channel));
+            return p.target == g.target || (p.cc == g.cc && p.port == g.port && (p.channel < 0 || g.channel < 0 || p.channel == g.channel));
         });
         if (! overridden && g.target.kind != AutomationTargetKind::none)
             out.push_back (g);
     }
     return out;
+}
+
+bool linkOmniAvailable (AutomationTargetKind kind) noexcept
+{
+    return kind == AutomationTargetKind::channelVolume || kind == AutomationTargetKind::channelPan || kind == AutomationTargetKind::channelParam
+        || kind == AutomationTargetKind::channelAdjust || kind == AutomationTargetKind::mixerVolume || kind == AutomationTargetKind::mixerPan || kind == AutomationTargetKind::effectParam
+        || kind == AutomationTargetKind::effectMix;
+}
+
+AutomationTarget linkOmniTarget (const MidiLink& link, int selectedChannel, int selectedMixerTrack) noexcept
+{
+    auto t = link.target;
+    if (! link.omni || ! linkOmniAvailable (t.kind))
+        return t;
+    const auto channelControl = t.kind == AutomationTargetKind::channelVolume || t.kind == AutomationTargetKind::channelPan
+                                || t.kind == AutomationTargetKind::channelParam || t.kind == AutomationTargetKind::channelAdjust;
+    const auto index = channelControl ? selectedChannel : selectedMixerTrack;
+    if (index >= 0)
+        t.index = index;
+    return t;
+}
+
+int countLinkConflicts (const std::vector<MidiLink>& links, const MidiLink& link)
+{
+    if (link.cc < 0)
+        return 0;
+    return (int) std::count_if (links.begin(), links.end(), [&] (const MidiLink& l) { return ! (l.target == link.target) && sameController (l, link); });
+}
+
+int setTargetLinks (std::vector<MidiLink>& links, const AutomationTarget& target, std::vector<MidiLink> edited, bool removeConflicts)
+{
+    edited.erase (std::remove_if (edited.begin(), edited.end(), [] (const MidiLink& l) { return l.cc < 0; }), edited.end());
+    for (auto& l : edited)
+        l.target = target;
+    int removed = 0;
+    if (removeConflicts)
+    {
+        const auto before = links.size();
+        links.erase (std::remove_if (links.begin(), links.end(),
+                                     [&] (const MidiLink& l) {
+                                         return ! (l.target == target)
+                                             && std::any_of (edited.begin(), edited.end(), [&] (const MidiLink& e) { return sameController (l, e); });
+                                     }),
+                     links.end());
+        removed = (int) (before - links.size());
+    }
+    // the control's links keep the place of its first one
+    const auto first = std::find_if (links.begin(), links.end(), [&] (const MidiLink& l) { return l.target == target; });
+    const auto at = (std::size_t) (first - links.begin());
+    std::vector<MidiLink> out;
+    for (std::size_t i = 0; i < links.size(); ++i)
+    {
+        if (i == at)
+            out.insert (out.end(), edited.begin(), edited.end());
+        if (! (links[i].target == target))
+            out.push_back (links[i]);
+    }
+    if (at >= links.size())
+        out.insert (out.end(), edited.begin(), edited.end());
+    links = std::move (out);
+    return removed;
 }
 
 int Song::findInitialValue (const AutomationTarget& target) const noexcept
@@ -791,8 +888,12 @@ std::vector<bool> Song::soloAudible() const
     if (n > 0)
         audible[0] = true;
 
-    // downstream: the signal path from the soloed tracks to Master
+    // downstream: the signal path from the soloed tracks to Master; a track with its state locked (FL's Shift+click
+    // on the mute switch, round 190kn) is not silenced by a solo elsewhere, so its path stays too
     std::vector<int> stack = soloed;
+    for (std::size_t t = 1; t < n; ++t)
+        if (mixer[t].lockState && ! mixer[t].solo)
+            stack.push_back ((int) t);
 
     while (! stack.empty())
     {
@@ -965,7 +1066,7 @@ std::vector<Bar> Song::barsBetween (std::int64_t from, std::int64_t to) const
         return std::max<std::int64_t> (1, (std::int64_t) ppq * 4 * std::max (1, numerator) / std::max (1, denominator));
     };
 
-    Bar bar { 0, barLength (beatsPerBar, 4), 1 };
+    Bar bar { 0, barLength (beatsPerBar, beatUnit), 1 };
     const auto& list = markers();
     std::size_t next = 0;
 
@@ -1002,7 +1103,7 @@ std::vector<Bar> Song::barsBetween (std::int64_t from, std::int64_t to) const
 Bar Song::barAt (std::int64_t tick) const
 {
     const auto bars = barsBetween (std::max<std::int64_t> (0, tick), std::max<std::int64_t> (0, tick) + 1);
-    return bars.empty() ? Bar { 0, (std::int64_t) ppq * std::max (1, beatsPerBar), 1 } : bars.front();
+    return bars.empty() ? Bar { 0, barTicks(), 1 } : bars.front();
 }
 
 void Song::selectArrangement (int index)
@@ -1166,7 +1267,10 @@ void set (SamplerSettings& s, int param, float value) noexcept
     }
     // like editing the knob by hand: the envelope / filter replace FL's imported voice (REA_rodada69 §3, REA_rodada76)
     if (param <= release)
+    {
         s.flVolumeEnvelope.clear();
+        s.flmPad.clear();
+    }
     if (param <= resonance)
         s.flChannel.clear();
 }
@@ -1181,6 +1285,14 @@ float Song::targetValue (const AutomationTarget& t) const noexcept
     {
         case AutomationTargetKind::channelVolume: return validChannel ? channels[(std::size_t) t.index].volume : -1.0f;
         case AutomationTargetKind::channelPan: return validChannel ? (channels[(std::size_t) t.index].pan + 1.0f) * 0.5f : -1.0f;
+        case AutomationTargetKind::channelAdjust:
+        {
+            if (! validChannel || ! leveladjust::valid (t.param))
+                return -1.0f;
+            const auto& l = channels[(std::size_t) t.index].misc.levels;
+            return t.param == leveladjust::volume ? l.volume * 0.5f
+                                                  : ((t.param == leveladjust::pan ? l.pan : t.param == leveladjust::modX ? l.modX : l.modY) + 1.0f) * 0.5f;
+        }
         case AutomationTargetKind::mixerVolume: return validTrack ? mixer[(std::size_t) t.index].volume : -1.0f;
         case AutomationTargetKind::mixerPan: return validTrack ? (mixer[(std::size_t) t.index].pan + 1.0f) * 0.5f : -1.0f;
         case AutomationTargetKind::effectParam:
@@ -1207,6 +1319,12 @@ float Song::targetValue (const AutomationTarget& t) const noexcept
             // the Sampler's knobs (issue #12)
             if (channels[(std::size_t) t.index].instrument == InstrumentKind::sampler && t.param >= 0 && t.param < samplerparam::count)
                 return samplerparam::get (channels[(std::size_t) t.index].sampler, t.param);
+            // LYNX Soundfont's knobs (issue #152, round 190he: a linked controller moved nothing)
+            if (channels[(std::size_t) t.index].instrument == InstrumentKind::soundfont && sf::automatable (t.param))
+                return sf::normalise (t.param, sf::readParams (channels[(std::size_t) t.index].modelParams)[(std::size_t) t.param]);
+            // LYNX Synth's knobs (issue #152, round 190he; core/SynthParams.h)
+            if (channels[(std::size_t) t.index].instrument == InstrumentKind::synth && synthparam::valid (t.param))
+                return synthparam::get (channels[(std::size_t) t.index].synth, synthparam::indexOf (t.param));
             // a MIDI Out's patch and knobs (round 167i)
             if (channels[(std::size_t) t.index].instrument == InstrumentKind::midiOut && t.param >= 0 && t.param <= midiout::controlCount)
                 return midiout::paramValue (midiout::stateOf (channels[(std::size_t) t.index].pluginState), t.param);
@@ -1221,12 +1339,21 @@ float Song::targetValue (const AutomationTarget& t) const noexcept
                        ? mixer[(std::size_t) t.index].effects[(std::size_t) t.slot].mix
                        : -1.0f;
         case AutomationTargetKind::tempo: return valueFromTempo (bpm);
+        case AutomationTargetKind::crossfader: return std::clamp ((crossfader + 1.0f) * 0.5f, 0.0f, 1.0f); // (round 190kc)
         case AutomationTargetKind::vcaLevel:
             return t.index >= 0 && t.index < (int) vcas.size() ? vcas[(std::size_t) t.index].level : -1.0f;
         case AutomationTargetKind::none: break;
     }
 
     return -1.0f;
+}
+
+float Song::modulationBase (const AutomationTarget& t) const noexcept
+{
+    if (! soundfontModBaseReal && t.kind == AutomationTargetKind::channelParam && t.index >= 0 && t.index < (int) channels.size()
+        && channels[(std::size_t) t.index].instrument == InstrumentKind::soundfont)
+        return 0.5f; // (a project saved before round 190he: every Soundfont knob's value read 0.5 then)
+    return targetValue (t);
 }
 
 bool Song::setTargetValue (const AutomationTarget& t, float v) noexcept
@@ -1239,9 +1366,18 @@ bool Song::setTargetValue (const AutomationTarget& t, float v) noexcept
     {
         case AutomationTargetKind::channelVolume: if (! validChannel) return false; channels[(std::size_t) t.index].volume = v; return true;
         case AutomationTargetKind::channelPan: if (! validChannel) return false; channels[(std::size_t) t.index].pan = v * 2.0f - 1.0f; return true;
+        case AutomationTargetKind::channelAdjust:
+        {
+            if (! validChannel || ! leveladjust::valid (t.param))
+                return false;
+            auto& l = channels[(std::size_t) t.index].misc.levels;
+            (t.param == leveladjust::volume ? l.volume : t.param == leveladjust::pan ? l.pan : t.param == leveladjust::modX ? l.modX : l.modY) = v * 2.0f - (t.param == leveladjust::volume ? 0.0f : 1.0f);
+            return true;
+        }
         case AutomationTargetKind::mixerVolume: if (! validTrack) return false; mixer[(std::size_t) t.index].volume = v; return true;
         case AutomationTargetKind::mixerPan: if (! validTrack) return false; mixer[(std::size_t) t.index].pan = v * 2.0f - 1.0f; return true;
         case AutomationTargetKind::tempo: bpm = tempoFromValue (v); return true;
+        case AutomationTargetKind::crossfader: crossfader = v * 2.0f - 1.0f; return true; // (round 190kc)
         case AutomationTargetKind::vcaLevel:
             if (t.index < 0 || t.index >= (int) vcas.size())
                 return false;
@@ -1292,6 +1428,19 @@ bool Song::setTargetValue (const AutomationTarget& t, float v) noexcept
                 && t.param < samplerparam::count)
             {
                 samplerparam::set (channels[(std::size_t) t.index].sampler, t.param, v);
+                return true;
+            }
+            if (validChannel && channels[(std::size_t) t.index].instrument == InstrumentKind::soundfont && sf::automatable (t.param))
+            {
+                auto& c = channels[(std::size_t) t.index]; // (issue #152, round 190he)
+                auto params = sf::readParams (c.modelParams);
+                params[(std::size_t) t.param] = sf::denormalise (t.param, v);
+                c.modelParams.assign (params.begin(), params.end());
+                return true;
+            }
+            if (validChannel && channels[(std::size_t) t.index].instrument == InstrumentKind::synth && synthparam::valid (t.param))
+            {
+                synthparam::set (channels[(std::size_t) t.index].synth, synthparam::indexOf (t.param), v); // (issue #152, round 190he)
                 return true;
             }
             if (validChannel && channels[(std::size_t) t.index].instrument == InstrumentKind::midiOut && t.param >= 0
@@ -1395,6 +1544,34 @@ float Automation::valueAt (double tick) const noexcept
     return automationCurveAt (points, tick);
 }
 
+double automationSegmentShape (const std::vector<AutomationPoint>& points, std::size_t k, double x) noexcept
+{
+    if (k + 1 >= points.size())
+        return x;
+    const auto& a = points[k];
+    const auto& b = points[k + 1];
+    if (a.mode == AutomationPoint::legacyCurve) // LYNX's law before round 190bw: a power curve
+        return a.tension != 0.0f ? std::pow (x, std::pow (2.0, (double) a.tension * 3.0)) : x;
+    if (a.mode != flcurve::smooth)
+        return flcurve::shape (a.mode, -a.tension, x);
+
+    // Smooth: the slopes come from the neighbouring segments that are Smooth too
+    flcurve::SmoothSide before, after;
+    if (k > 0 && points[k - 1].mode == flcurve::smooth)
+    {
+        before.smooth = true;
+        before.dx = (double) (a.tick - points[k - 1].tick);
+        before.y = (double) points[k - 1].value;
+    }
+    if (k + 2 < points.size() && b.mode == flcurve::smooth)
+    {
+        after.smooth = true;
+        after.dx = (double) (points[k + 2].tick - b.tick);
+        after.y = (double) points[k + 2].value;
+    }
+    return flcurve::evaluate (flcurve::prepareSmooth (-a.tension, (double) (b.tick - a.tick), (double) a.value, (double) b.value, before, after), x);
+}
+
 float automationCurveAt (const std::vector<AutomationPoint>& points, double tick) noexcept
 {
     if (points.empty())
@@ -1411,17 +1588,81 @@ float automationCurveAt (const std::vector<AutomationPoint>& points, double tick
         if (tick < (double) b.tick)
         {
             const auto span = (double) std::max<std::int64_t> (1, b.tick - a.tick);
-            auto t = (float) ((tick - (double) a.tick) / span);
-
-            // tension: curve exponent (positive = rises slowly then accelerates)
-            if (a.tension != 0.0f)
-                t = std::pow (t, std::pow (2.0f, a.tension * 3.0f));
-
-            return a.value + (b.value - a.value) * t;
+            const auto x = (tick - (double) a.tick) / span;
+            if (a.mode == AutomationPoint::legacyCurve || (a.mode == 0 && a.tension == 0.0f))
+            {
+                // a straight segment, or an older project's bend: the same float arithmetic as before round 190bw
+                auto t = (float) x;
+                if (a.tension != 0.0f)
+                    t = std::pow (t, std::pow (2.0f, a.tension * 3.0f));
+                return a.value + (b.value - a.value) * t;
+            }
+            return (float) ((double) a.value + ((double) b.value - (double) a.value) * automationSegmentShape (points, i - 1, x));
         }
     }
 
     return points.back().value;
+}
+
+int automationPointMode (const std::vector<AutomationPoint>& points, int point) noexcept
+{
+    if (point < 1 || point >= (int) points.size())
+        return -1;
+    const auto m = points[(std::size_t) point - 1].mode;
+    return m < flcurve::modeCount ? (int) m : -1;
+}
+
+void setAutomationPointMode (std::vector<AutomationPoint>& points, int point, int mode) noexcept
+{
+    if (point < 1 || point >= (int) points.size() || mode < 0 || mode >= flcurve::modeCount)
+        return;
+    points[(std::size_t) point - 1].mode = (std::uint8_t) mode;
+}
+
+int insertAutomationPoint (std::vector<AutomationPoint>& points, AutomationPoint p, int mode, float tension)
+{
+    const auto at = std::upper_bound (points.begin(), points.end(), p.tick, [] (std::int64_t t, const AutomationPoint& q) { return t < q.tick; });
+    const auto index = (int) (at - points.begin());
+    const auto m = (std::uint8_t) std::clamp (mode, 0, (int) flcurve::modeCount - 1);
+    p.mode = 0;
+    p.tension = 0.0f;
+    if (index > 0)
+    {
+        auto& before = points[(std::size_t) index - 1];
+        if (index < (int) points.size()) // splitting a segment: its curve stays on the part after the new point
+        {
+            p.mode = before.mode;
+            p.tension = before.tension;
+        }
+        before.mode = m;
+        before.tension = std::clamp (tension, -1.0f, 1.0f);
+    }
+    points.insert (points.begin() + index, p);
+    return index;
+}
+
+void eraseAutomationPoint (std::vector<AutomationPoint>& points, int point)
+{
+    if (point < 0 || point >= (int) points.size())
+        return;
+    if (point > 0)
+    {
+        auto& before = points[(std::size_t) point - 1];
+        const auto last = point + 1 == (int) points.size();
+        before.mode = last ? (std::uint8_t) 0 : points[(std::size_t) point].mode;
+        before.tension = last ? 0.0f : points[(std::size_t) point].tension;
+    }
+    points.erase (points.begin() + point);
+}
+
+void setAutomationSegmentTension (std::vector<AutomationPoint>& points, int segment, float tension) noexcept
+{
+    if (segment < 0 || segment >= (int) points.size())
+        return;
+    auto& p = points[(std::size_t) segment];
+    p.tension = std::clamp (tension, -1.0f, 1.0f);
+    if (p.mode == AutomationPoint::legacyCurve)
+        p.mode = 0;
 }
 
 // --- FL's automation clip LFO (REA round 177b; FUN_00ba1700, FUN_00ba0710, FUN_00ba03d0, FUN_00677660/820) ---------
@@ -1633,7 +1874,8 @@ bool EffectSlot::operator== (const EffectSlot& o) const
     if (kind != o.kind || enabled != o.enabled || params != o.params || mix != o.mix || ! (plugin == o.plugin) || sidechain != o.sidechain
         || sidechain2 != o.sidechain2 || sendTracks != o.sendTracks || state != o.state || samplePath != o.samplePath || ! (substituteFor == o.substituteFor)
         || presetName != o.presetName || abOther != o.abOther || abShowingB != o.abShowingB || branches.size() != o.branches.size()
-        || links.size() != o.links.size() || ! (patcher == o.patcher) || row != o.row || look != o.look || ! (flOrigin == o.flOrigin)
+        || links.size() != o.links.size() || ! (patcher == o.patcher) || row != o.row || look != o.look || goal != o.goal
+        || goalAmount != o.goalAmount || displayView != o.displayView || lockState != o.lockState || ! (flOrigin == o.flOrigin) || engineRev != o.engineRev
         || recorderDocument != o.recorderDocument)
         return false;
     for (std::size_t i = 0; i < branches.size(); ++i)
@@ -1653,6 +1895,24 @@ float channelGain (float volume) noexcept
 {
     const auto v = std::clamp (volume, 0.0f, 1.0f);
     return (std::pow (11.0f, v) - 1.0f) / 10.0f;
+}
+
+float levelAdjustGain (float multiplier) noexcept
+{
+    const auto x = std::clamp (multiplier, 0.0f, 2.0f);
+    return x == 1.0f ? 1.0f : (std::pow (11.0f, x) - 1.0f) / 10.0f;
+}
+
+std::string levelVolumeText (float multiplier)
+{
+    const auto x = std::clamp (multiplier, 0.0f, 2.0f);
+    const auto gain = levelAdjustGain (x);
+    char text[64];
+    if (gain <= 1.0e-6f)
+        std::snprintf (text, sizeof (text), "%d%%  -INF dB  0.00", (int) std::lround (x * 100.0f));
+    else
+        std::snprintf (text, sizeof (text), "%d%%  %.1fdB  %.2f", (int) std::lround (x * 100.0f), 20.0 * std::log10 ((double) gain), (double) gain);
+    return text;
 }
 
 float faderGain (float position) noexcept
@@ -1681,7 +1941,7 @@ Song makeExportSong (const Song& song, bool wholeSong, std::int64_t tailTicks, s
         const auto index = std::clamp (out.currentPattern, 0, (int) out.patterns.size() - 1);
         Clip clip;
         clip.pattern = index;
-        clip.length = out.patterns[(std::size_t) index].effectiveLength (out.beatsPerBar);
+        clip.length = out.patterns[(std::size_t) index].effectiveLength (out.meter());
         out.playlist = { clip };
         musicLength = clip.length;
     }
@@ -1697,7 +1957,7 @@ Song makeExportSong (const Song& song, bool wholeSong, std::int64_t tailTicks, s
     // because the last rendered block goes slightly past the end and must not wrap to the start.
     if (tailTicks > 0)
     {
-        tailTicks += (std::int64_t) ppq * std::max (1, out.beatsPerBar);
+        tailTicks += out.barTicks();
         out.patterns.emplace_back().name = "(tail)";
         Clip tail;
         tail.pattern = (int) out.patterns.size() - 1;
@@ -1728,6 +1988,100 @@ Song makeBounceSong (const Song& song, int track)
                                // route on the new insert; rendering it too played a route at 50 % at 25 %, round 186b)
     insert.muted = false;
     insert.solo = true; // it and whatever feeds it are audible
+
+    // Round 190gj (owner decision 2026-11-14, FL's split render): what the insert's effects listen to (a side-chain key,
+    // a hosted effect's Connections) plays as it does in the mix, unheard — so a ducked bass stays ducked in its stem and
+    // the stems add up to the mix. Those inserts (with their own sources and keys) are soloed too, and their routes out
+    // of that set are cut, so nothing of them reaches the Master. (Until 0.1.27 they were silenced: no ducking.)
+    {
+        const auto n = (int) out.mixer.size();
+        auto feedersOf = [&out, n] (int u) {
+            std::vector<int> f;
+            for (int src = 1; src < n; ++src)
+            {
+                if (src == u)
+                    continue;
+                auto feeds = out.routes (src, u);
+                for (const auto& fx : out.mixer[(std::size_t) src].effects)
+                    for (int o = 0; o < maxSlotSends && ! feeds; ++o)
+                        feeds = slotSendTarget (fx, o) == u;
+                for (const auto& tap : fruitySendsOf (out, src))
+                    feeds = feeds || tap.target == u;
+                if (feeds)
+                    f.push_back (src);
+            }
+            return f;
+        };
+        auto keysOf = [&out, n] (int u) {
+            std::vector<int> k;
+            for (const auto& fx : out.mixer[(std::size_t) u].effects)
+            {
+                const auto c = slotConnections (out, u, fx);
+                for (const auto source : { fx.sidechain, fx.sidechain2, c.routed ? c.mainSource : -1, c.routed ? c.sideSource : -1 })
+                    if (source > 0 && source < n && source != u)
+                        k.push_back (source);
+            }
+            return k;
+        };
+        const auto heard = out.soloAudible();
+        // the keys of whatever the stem hears that feeds the insert, then everything that reaches those keys
+        std::vector<char> inSet ((std::size_t) n, 0);
+        std::vector<int> stack;
+        for (int u = 1; u < n; ++u)
+            if (heard[(std::size_t) u])
+                for (const auto k : keysOf (u))
+                    if (! heard[(std::size_t) k] && ! inSet[(std::size_t) k])
+                    {
+                        inSet[(std::size_t) k] = 1;
+                        stack.push_back (k);
+                    }
+        while (! stack.empty())
+        {
+            const auto u = stack.back();
+            stack.pop_back();
+            auto more = feedersOf (u);
+            const auto k = keysOf (u);
+            more.insert (more.end(), k.begin(), k.end());
+            for (const auto src : more)
+                if (! inSet[(std::size_t) src] && ! heard[(std::size_t) src])
+                {
+                    inSet[(std::size_t) src] = 1;
+                    stack.push_back (src);
+                }
+        }
+        if (std::any_of (inSet.begin(), inSet.end(), [] (char c) { return c != 0; }))
+        {
+            for (int u = 1; u < n; ++u)
+                if (inSet[(std::size_t) u])
+                {
+                    auto& m = out.mixer[(std::size_t) u];
+                    m.solo = true;
+                    m.soloSources = true;
+                }
+            // the newly heard inserts send nowhere outside the keys' set (not to the Master, not into the stem's own
+            // path: the insert and its sources stay as they were)
+            for (int pass = 0; pass < 4; ++pass)
+            {
+                const auto now = out.soloAudible();
+                auto changed = false;
+                for (int u = 1; u < n; ++u)
+                {
+                    if (! now[(std::size_t) u] || heard[(std::size_t) u])
+                        continue;
+                    auto& m = out.mixer[(std::size_t) u];
+                    changed = changed || m.toMaster;
+                    m.toMaster = false;
+                    const auto before = m.sends.size();
+                    m.sends.erase (std::remove_if (m.sends.begin(), m.sends.end(),
+                                                   [&inSet, n] (const MixerSend& s) { return s.target <= 0 || s.target >= n || ! inSet[(std::size_t) s.target]; }),
+                                   m.sends.end());
+                    changed = changed || m.sends.size() != before;
+                }
+                if (! changed)
+                    break;
+            }
+        }
+    }
 
     // the Master neutral: the render plays through the song's Master again (Render to audio), so nothing of it may be in
     // the file — effects, fader, pan, separation, phase / swap, EQ and its automation (round 186b, as StandIns' stems)

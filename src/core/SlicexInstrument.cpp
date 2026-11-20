@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "core/FlResampler.h"
+#include "core/FlSettings.h"
+#include "core/HostSlide.h"
 #include "core/SlicexEngine.h"
 
 namespace lynx
@@ -118,7 +120,9 @@ public:
         const auto rendering = offlineRendering();
         sampleRate = sr > 0.0 ? sr : 44100.0;
         engine.setRate ((int) std::lround (sr), rendering);
-        engine.setInterpolation (rendering ? flrs::renderQuality : flrs::liveQuality);
+        // (playback: Settings › Audio › "Resampling quality", round 190bx; FL tells its plugins the method when it
+        // changes, FUN_01366a70. Here it is taken when the engine is prepared.)
+        engine.setInterpolation (rendering ? flrs::renderQuality : flsettings::options().interpolation.load (std::memory_order_relaxed));
     }
 
     void configure (const ChannelDef& channel, double bpm) noexcept override
@@ -204,20 +208,56 @@ public:
             auto& slot = freeSlot();
             slot.id = id;
             slot.key = k;
+            slot.noteId = startingNoteId();
             slot.volFactor = initVol;
             slot.pan = nextPan;
             slot.cents = nextCents;
+            // (FL's channel porta: the voice glides from the previous note's pitch, HostSlide::pendingGlide)
+            slot.slide.anchor (NAN);
         }
         nextPan = 0.0f, nextCents = 0.0f, nextModX = 0.0f, nextModY = 0.0f, nextColour = 0;
     }
 
     void noteOff (int key) noexcept override
     {
+        // (round 190ej: the note's own voice — FL hands Slicex the ending note's voice, Voice_Release 0x883970 releases that
+        // voice only: REA_rodada190h §6 / VMT slot 10)
         for (auto& n : notes)
-            if (n.id >= 0 && n.key == key && ! n.released)
+            if (n.id >= 0 && endsVoice (n.key, n.noteId, key) && ! n.released)
             {
                 engine.release (n.id);
                 n.released = true;
+            }
+    }
+
+    // Slide notes and the channel's porta (#157). Slicex reads its voices' Final.Pitch from the host at every render
+    // call and adds it to the region's pitch (REA_rodada190h Part 3, Gen_Render 0x880740: cents = region pitch +
+    // (60 − key) · 100 + FinalLevels.Pitch + master pitch), so FL's slide notes and porta, which move that pitch, bend
+    // a sounding slice; its key (the region it plays) stays the note's own (round 190hg, REA_rodada190hg §1).
+    // FL's renders of slide notes on Slicex (§1.1): the host moves the pitch once per tick of the project (1/96 beat), in
+    // n + 1 equal steps for a slide n ticks long, the first one at the slide's start, the last one at its end.
+    bool followsChannelPorta() const noexcept override { return true; }
+    void slideTo (int key, float cents, float samples) noexcept override
+    {
+        const auto to = 100.0 * (std::clamp (key, 0, 127) - 60) + (double) pitchCents.load() + (double) cents;
+        const auto tick = sampleRate * 60.0 / ((double) std::max (1.0f, tempo) * (double) flTicksPerBeat);
+        const auto ticks = std::max (1, (int) std::lround ((double) samples / tick));
+        // the steps fall on the song's tick grid, each at the frame nearest to its tick (FL's renders: §1.1)
+        const auto now = songTicks / (double) ppq * 60.0 / (double) std::max (1.0f, tempo) * sampleRate + (double) sinceBlock;
+        const auto firstTick = std::llround (now / tick);
+        const auto nowFrame = std::llround (now);
+        for (auto& n : notes)
+            if (n.id >= 0 && ! n.released)
+            {
+                auto& st = n.stepped;
+                st.from = st.cents;
+                st.to = (float) (to - (100.0 * (n.key - 60) + (double) pitchCents.load() + (double) n.cents)) - n.slide.target; // (the porta glide ends at its target)
+                st.steps = ticks + 1;
+                st.done = 0;
+                st.tick = tick;
+                st.firstTick = firstTick;
+                st.startFrame = nowFrame;
+                st.sinceStart = 0.0;
             }
     }
 
@@ -237,6 +277,8 @@ public:
     }
 
     bool idle() const noexcept override { return engine.idle(); }
+    // the editor's play line (round 190jd)
+    slicex::Engine::PlayMark playMark() const noexcept { return engine.playMark(); }
 
     void render (float* left, float* right, int n, float gl, float gr) noexcept override
     {
@@ -258,15 +300,48 @@ public:
                         note.id = -1;
                         continue;
                     }
-                    engine.setNoteLevels (note.id, (float) (vol * (double) note.volFactor),
-                                          (float) std::clamp ((double) note.pan + pan, -1.0, 1.0),
-                                          (float) (100.0 * (note.key - 60) + pitch + (double) note.cents));
+                    setLevels (note);
                 }
         }
         sinceBlock += n;
         if (engine.idle())
+        {
+            engine.clearPlayMark();
             return;
-        engine.render (left, right, n);
+        }
+        if (! std::any_of (notes.begin(), notes.end(), [] (const Held& h) { return h.id >= 0 && (h.slide.moving() || h.stepped.active()); }))
+        {
+            engine.render (left, right, n);
+            return;
+        }
+        // a slide or porta glide is moving: the host's Final.Pitch reaches the voices before the frames it covers (a
+        // render call of FL's own) — a slide note's next step at its tick, a porta glide every slideChunk frames
+        for (int done = 0; done < n;)
+        {
+            int len = std::min (slideChunk, n - done);
+            for (auto& note : notes)
+                if (note.id >= 0 && note.stepped.active())
+                {
+                    if (note.stepped.due())
+                    {
+                        note.stepped.step();
+                        setLevels (note);
+                    }
+                    if (note.stepped.active())
+                        len = std::min (len, std::max (1, note.stepped.untilNext()));
+                }
+            for (auto& note : notes)
+                if (note.id >= 0 && note.slide.moving())
+                {
+                    note.slide.advance ((float) len);
+                    setLevels (note);
+                }
+            engine.render (left + done, right + done, len);
+            for (auto& note : notes)
+                if (note.id >= 0 && note.stepped.active())
+                    note.stepped.sinceStart += len;
+            done += len;
+        }
     }
 
 private:
@@ -283,7 +358,38 @@ private:
         int id = -1, key = 60;
         bool released = false;
         float volFactor = 1.0f, pan = 0.0f, cents = 0.0f;
+        std::uint32_t noteId = 0; // the LYNX note that started it (round 190ej)
+        HostSlide slide {};       // the channel's porta moving the note's Final.Pitch (round 190hg)
+        // a slide note moving it: FL's host steps it once per tick (round 190hg, REA_rodada190hg §1.1)
+        struct Stepped
+        {
+            float from = 0.0f, to = 0.0f, cents = 0.0f; // (cents from the note's own pitch)
+            int steps = 0, done = 0;                    // n + 1 steps for a slide of n ticks; how many are applied
+            double tick = 1.0, sinceStart = 0.0;        // samples a tick, samples since the slide started
+            std::int64_t firstTick = 0, startFrame = 0; // the song's tick of the first step, the song's frame at the start
+            bool active() const noexcept { return done < steps; }
+            // the frame of step k from the slide's start: tick firstTick + k of the song, to the nearest frame
+            double at (int k) const noexcept { return (double) (std::llround ((double) (firstTick + k) * tick) - startFrame); }
+            bool due() const noexcept { return active() && sinceStart >= at (done); }
+            int untilNext() const noexcept { return (int) std::ceil (at (done) - sinceStart); }
+            void step() noexcept
+            {
+                ++done;
+                cents = from + (to - from) * (float) done / (float) steps;
+            }
+        } stepped {};
     };
+
+    static constexpr int slideChunk = 256;
+    static constexpr int flTicksPerBeat = 96; // (FL's default project PPQ; the slide steps run on its ticks)
+
+    void setLevels (const Held& note) noexcept
+    {
+        engine.setNoteLevels (note.id, (float) (channelVol * (double) note.volFactor),
+                              (float) std::clamp ((double) note.pan + channelPan, -1.0, 1.0),
+                              (float) (100.0 * (note.key - 60) + channelPitch + (double) note.cents + (double) note.slide.cents
+                                       + (double) note.stepped.cents));
+    }
 
     void take() noexcept
     {
@@ -339,4 +445,16 @@ std::unique_ptr<Instrument> makeSlicexInstrument (std::shared_ptr<const SampleDa
 {
     return std::make_unique<SlicexInstrument> (std::move (deckA), std::move (deckB));
 }
+
+namespace slicex
+{
+PlayLine playLine (const Instrument* instrument) noexcept
+{
+    const auto* x = dynamic_cast<const SlicexInstrument*> (instrument);
+    if (x == nullptr)
+        return {};
+    const auto m = x->playMark();
+    return { m.deck, m.frame };
+}
+} // namespace slicex
 } // namespace lynx

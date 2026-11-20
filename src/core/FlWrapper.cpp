@@ -1,5 +1,7 @@
 #include "core/FlWrapper.h"
 
+#include "flp/Flp.h"
+
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -405,6 +407,8 @@ const std::vector<WrapperOption>& wrapperOptions()
         // issue #108 (a LYNX addition; FL's wrapper has no MPE switch): beside the other per-note MIDI options
         { "MIDI", "MPE", "MIDI Polyphonic Expression: each note on its own MIDI channel with its fine pitch, Mod X (timbre) and Mod Y (pressure)", &PluginRef::mpe, true, false },
         { "MIDI", "Send All Notes Off when playback stops", "Off: only the notes still held get their note off", &PluginRef::allNotesOffOnStop, true, false },
+        // GitHub #198 (round 190ks; a LYNX addition): the notes the plugin plays from its own window are recorded
+        { "MIDI", "Record notes from the plugin window", "While recording, the notes the plugin plays from its own window (pads or keys clicked in it) are recorded on its channel", &PluginRef::recordOwnNotes, false, false },
         { "Compatibility", "Reset plugin when LYNX resets", "Reset the plugin before an export and on panic (clears its tails and held notes)", &PluginRef::resetOnFlush, true, false },
         { "Compatibility", "Send loop position", "Let the plugin know about loop start and end points", &PluginRef::sendLoopPosition, true, false },
         { "Compatibility", "Use fixed size buffers", "Constant 2 ms blocks, for plugins that need equal buffers (adds latency)", &PluginRef::fixedBuffers, true, false },
@@ -442,5 +446,21 @@ void resetOutputOffsets (std::vector<PluginOutputRoute>& routes, int count)
 int outputTargetTrack (int channelTrack, const PluginOutputRoute& route, bool pluginDefault) noexcept
 {
     return route.isActive (pluginDefault) ? channelTrack + route.offset : -1;
+}
+
+bool foreignFromFlPreset (const std::vector<std::uint8_t>& fileBytes, ForeignPlugin& out)
+{
+    try
+    {
+        // a channel or effect preset holds one plugin record: its name (0xC9) and state (0xD5), as a channel
+        const auto project = flp::parseProject (fileBytes, true);
+        if (project.channels.empty() || project.channels.front().pluginName != "Fruity Wrapper")
+            return false;
+        return parseFlWrapper (project.channels.front().pluginState, out) && ! out.name.empty();
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
 }
 } // namespace lynx

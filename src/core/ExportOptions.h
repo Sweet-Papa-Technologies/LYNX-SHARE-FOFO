@@ -7,10 +7,16 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "core/Song.h"
+
+namespace lynx
+{
+class DelayLine;
+}
 
 namespace lynx::exportopts
 {
@@ -19,8 +25,15 @@ enum class Format : int
     wav,
     mp3,
     ogg,
-    flac
+    flac,
+    // owner decision D5 (round als190ka-export): AIFF (16 / 24-bit integer, JUCE's writer) and AAC in an MPEG-4 (.m4a)
+    // container, encoded by the operating system's own AAC encoder (engine/AacEncoder.h: Media Foundation on Windows,
+    // AudioToolbox on macOS; none on Linux, where M4A is not offered). FL's render window has an M4A box (bit 9 of its
+    // LastExportedFormats mask, REA round 139); AIFF is LYNX's own. Appended, so the remembered numbers stay what they were.
+    aiff,
+    aac
 };
+constexpr int formatCount = 6;
 
 enum class TailMode : int
 {
@@ -68,6 +81,8 @@ struct Options
     int flacLevel = 5;         // compression 0 (fastest) .. 8 (smallest)
     int mp3Kbps = 320;         // constant bitrate
     int oggKbps = 256;         // nominal bitrate
+    int aiffBits = 24;         // 16 or 24 (integer; JUCE's AIFF writer has no float)
+    int aacKbps = 192;         // M4A (AAC-LC): 96, 128, 160 or 192 (what Windows' AAC encoder takes)
     double sampleRate = 44100.0;
     DitherMode dither = DitherMode::shaped;
     TailMode tail = TailMode::leave;
@@ -93,8 +108,8 @@ struct Options
     // FL's "Disable maximum polyphony" (on by default; REA round 139, FLEngine FUN_00d1a…: every channel's Max
     // polyphony is set to 0 for the render): the channels' polyphony limits are lifted in the exported song
     bool disableMaxPolyphony = true;
-    // more formats written from the same render (FL's WAV / MP3 / OGG / FLAC boxes can be ticked together): a mask of
-    // `1 << Format`, besides `format` (whose settings window shows); 0 = only `format`
+    // more formats written from the same render (FL's WAV / MP3 / OGG / FLAC / M4A boxes can be ticked together, LYNX adds
+    // AIFF): a mask of `1 << Format`, besides `format` (whose settings window shows); 0 = only `format`
     std::uint32_t moreFormats = 0;
     Channels channels = Channels::stereo;
     // FL's "Extra data" (WAVRenderForm AcidBox / LoopMarkersBox / PlaylistMarkersBox, REA_rodada167l §3), WAV files
@@ -112,6 +127,8 @@ struct Options
     // markers and each section becomes a file named after its marker ("<name> - 02 Verse"); with stems, each section
     // gets its stems. Song range only (markerSections).
     bool sections = false;
+    // Issue #215 (round 190ng): the file name's template with wildcards (core/ExportNaming.h; "$project" = as before)
+    std::string nameTemplate = "$project";
 
     bool operator== (const Options&) const = default;
 };
@@ -119,44 +136,60 @@ struct Options
 // Choices offered by the window.
 const std::vector<int>& mp3Bitrates();  // kbps
 const std::vector<int>& oggBitrates();  // kbps (JUCE's Vorbis encoder's settings)
+const std::vector<int>& aacBitrates();  // kbps (Media Foundation's AAC encoder: 96, 128, 160, 192)
 const std::vector<double>& sampleRates();
 
-// ".wav", ".mp3", ".ogg", ".flac"
+// ".wav", ".mp3", ".ogg", ".flac", ".aif", ".m4a"
 const char* extension (Format format);
+// The name the window shows: "WAV", "MP3", "OGG", "FLAC", "AIFF", "M4A" (FL's name for its AAC box)
+const char* formatName (Format format);
 
-// Every format the export writes, `format` first, then the others of `moreFormats` in WAV, MP3, OGG, FLAC order.
+// Every format the export writes, `format` first, then the others of `moreFormats` in WAV, MP3, OGG, FLAC, AIFF, M4A
+// order.
 std::vector<Format> formatsOf (const Options& o);
 
 // FL's "LastExportedFormats" (REA round 139, FLEngine FUN_011dd840 / the render window's close): a mask of the ticked
 // format boxes, bit 3 WAV, 4 MP3, 5 OGG, 6 FLAC, 7 MIDI, 9 M4A; 8 (WAV) when nothing valid was saved (< 8 or > 0x3FF).
 // The File › Export entries open the window with one format (WAV 3, MP3 4, OGG 5, FLAC 6, MIDI 7, M4A 9) or, with
 // "Last exported format(s)", the boxes of that mask.
+// AIFF has no box in FL (0: it is left out of the mask).
 constexpr std::uint32_t flFormatBit (Format f) noexcept
 {
-    return f == Format::wav ? 0x8u : f == Format::mp3 ? 0x10u : f == Format::ogg ? 0x20u : 0x40u;
+    return f == Format::wav ? 0x8u : f == Format::mp3 ? 0x10u : f == Format::ogg ? 0x20u : f == Format::flac ? 0x40u : f == Format::aac ? 0x200u : 0u;
 }
 std::uint32_t flLastExportedMask (const Options& o) noexcept; // the mask of the formats `o` writes
 Options withFlLastExported (Options o, std::uint32_t mask);    // `o` with the formats of an FL mask (invalid → WAV)
 Options withSingleFormat (Options o, Format f);                // what an FL File › Export › "<format> file..." entry opens
 
-// Bits per sample written to the file (32 = float WAV; MP3/OGG encode floats and report 16).
+// Bits per sample written to the file (32 = float WAV; MP3/OGG/M4A encode from floats or 16 bits and report 16).
 int fileBits (const Options& o) noexcept;
 
-// Whether dither is applied: integer output of 16 or 24 bits with dither on (MP3/OGG/float never).
+// Whether dither is applied: integer output of 16 or 24 bits (WAV, FLAC, AIFF) with dither on (MP3/OGG/M4A/float never).
 bool usesDither (const Options& o) noexcept;
 
 // MP3 is limited to MPEG-1 rates: higher project rates are encoded at 48 kHz (44.1 kHz family → 44.1 kHz).
 double mp3SampleRate (double rate) noexcept;
 
+// M4A (AAC): the platform encoders take 44.1 or 48 kHz. The render is brought there by halving its rate (88.2 → 44.1,
+// 96 / 192 → 48, 176.4 → 44.1): aacSampleRate is the file's rate (0 = a rate that is not 44.1 / 48 kHz times a power of
+// two, which M4A cannot take), aacDecimation the factor (1, 2 or 4...; 0 = not possible).
+double aacSampleRate (double rate) noexcept;
+int aacDecimation (double rate) noexcept;
+// Lowers the rate of `x` (sampled at `rate`) by `factor` (a power of two), in halving stages: each a linear-phase
+// Kaiser-windowed sinc low-pass (≥ 90 dB stop band, flat to 20 kHz) taking every second sample, aligned so the output
+// keeps the input's timing (no delay; output length ceil (n / factor) per stage). factor 1 = unchanged.
+std::vector<float> decimate (const std::vector<float>& x, double rate, int factor);
+
 // What the render window shows before the export (FL: "Length: 144 bars  Total time: 3'57''  Disk space: 38.76 MB"):
 // the music's length in bars and the file size the options give for `seconds` (one file; the tail not counted;
 // FLAC and the lossy formats are estimates).
-double lengthInBars (double seconds, double bpm, int beatsPerBar) noexcept;
+double lengthInBars (double seconds, double bpm, Meter meter) noexcept;
 std::int64_t estimatedBytes (const Options& o, double seconds) noexcept;
 
 // The notes FL's File › Export › "MIDI file..." writes (REA round 139): in song mode, each pattern clip's part of its
 // pattern placed at the clip (notes from `offset` to `offset + length`, cut at the clip's end; muted clips / notes /
-// playlist tracks left out), sorted; in pattern mode or with no pattern clip, the current pattern's notes.
+// playlist tracks left out; with Song::patternClipTakeover, none from where a later clip of the same pattern starts —
+// issue #158, as playback), sorted; in pattern mode or with no pattern clip, the current pattern's notes.
 std::vector<Note> midiExportNotes (const Song& song);
 
 // Remembered between sessions as "key=value" lines; unknown or bad values fall back to the defaults (clamped).
@@ -175,7 +208,10 @@ Song makeRenderSong (const Song& song, const Options& o, std::int64_t tailTicks,
 // The selection exists (loop region set and inside the song).
 bool hasSelection (const Song& song) noexcept;
 
-// Inserts that get sound: a channel goes to them or another insert sends to them (Master excluded).
+// Inserts that get sound: a channel goes to them or another insert sends to them (Master excluded). Round 190gh (B7):
+// also the inserts fed only by extra outputs — a hosted multi-output instrument's Connections (as the engine plays
+// them, "Process inactive inputs and outputs" included), FPC pads with their own mixer offset, a generator Patcher's
+// "To LYNX" outputs, and an effect slot's sends (Fruity Send, Transmitter, a hosted effect's Connections).
 std::vector<int> stemTracks (const Song& song);
 // FL's Mixer › Disk recording › "Render armed / selected tracks to wave file(s)" (REA round 165f-mixer): the inserts
 // of `only` (each once, in mixer order, the Master excluded) whether or not they get sound; empty = stemTracks (song).
@@ -192,6 +228,51 @@ Song makeChannelStemSong (const Song& song, int channel, bool dry = false);
 
 // "<base> - <number> <name><ext>" with characters that are illegal in file names replaced.
 std::string stemFileName (const std::string& base, int number, const std::string& name, const char* ext);
+
+// --- "Split mixer tracks" in one render (round 190gj, P9) -----------------------------------------------------------
+// FL renders the split mixer tracks in one pass (TRENDERFORM, REA_rodada84 §1). LYNX's stem of an insert is the render
+// of makeBounceSong (song, insert): that insert alone (soloed with its sources), straight to a neutral Master. The same
+// samples come out of one render of the whole song when that render's insert outputs are tapped: the stem render's
+// Master adds up its own channels and the routes that carry sound into it — the insert, and whatever feeds it that
+// also goes to the Master — each delayed by that render's delay compensation, and its neutral Master passes the sum
+// as it is. planStemTap says how (or why not: then the stem is rendered alone, as before).
+struct StemTap
+{
+    bool ok = false;
+    std::string why; // when not ok: what the stem's own render does differently
+    struct Input
+    {
+        int track = 0;      // an insert whose output is tapped
+        float level = 1.0f; // its route level into the Master (the stem render's)
+        int delay = 0;      // the stem render's delay on that route (samples)
+    };
+    std::vector<Input> inputs; // in the order the stem render's Master adds them (after its own channels)
+    int latency = 0;           // the stem render's delay compensation total (its export trims that much)
+};
+
+// The stem of insert `track` from a render of `shared` (the song that render plays: solos cleared), whose instruments
+// and effects report these latencies (the layout of computePdc; an engine's after its plugin warm-up).
+StemTap planStemTap (const Song& shared, int track, const std::vector<int>& channelLatency,
+                     const std::vector<std::vector<int>>& slotLatency, double sampleRate);
+
+// What a stem render's Master adds up, made from the taps of the shared render, one block after another (the blocks in
+// order, the same sizes as that render's): its own channels' sum (`masterL/R`, the shared render's Master input before
+// its routes; nullptr = silence) then each input of the plan through its delay line, exactly as the stem render's Master
+// (RackRenderer::pullInputs) does.
+class StemMixer
+{
+public:
+    explicit StemMixer (const StemTap& plan);
+    StemMixer (StemMixer&&) noexcept;
+    ~StemMixer();
+    // `tapLeft / tapRight (input index)`: that input's tap for this block (n samples)
+    void mix (const float* masterL, const float* masterR, const float* const* tapLeft, const float* const* tapRight, float* outL,
+              float* outR, int n) noexcept;
+
+private:
+    StemTap plan;
+    std::vector<std::unique_ptr<DelayLine>> lines; // per input (nullptr = no delay)
+};
 
 // --- one file per marker section (round 190ap) ----------------------------------------------------------------------
 // A stretch of the song between two Playlist markers.

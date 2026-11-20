@@ -42,7 +42,39 @@ namespace quell
 // `matched` (appended, round 124): the engine fitted to the measured NS1 trial (REA_rodada124 §6) — a zero-latency
 // chain whose open state is exactly the reference's all-pass (60 Hz / 16 kHz), a cascade of peaking cuts on seven
 // octave bands and gain-reduced low / high bands; off (older projects) = the 6-band expander of round 119
-enum Param { amount, listen, output, matched, paramCount };
+// `law` (appended, round 190dp; Measured for new instances, Classic for projects saved before): the matched engine's
+// noise-floor tracker (below). Off = round 124's fixed thresholds
+enum Param
+{
+    amount, listen, output, matched, law, paramCount,
+    // round 190lf, hidden (not in the info: no control, no text; saved while non-zero): the matched engine's zero law.
+    // [REA + black box, the NS1 trial's DSP, saved states and renders] at 0 % the reference is exactly its all-pass pair
+    // (60 Hz / 16 kHz; the refcap182 programme to −40 … −71 dB ESR, pink-noise steps −50 … −20 dBFS to −55 … −60 dB):
+    // nothing dynamic, no shelf. On (the NS1 translator sets it): Amount 0 is that bare pair, and up to 20 % (the first
+    // measured setting, where the engine's fit holds) the engine's output fades in over it — both run on the same
+    // all-pass skeleton, so the fade is phase-coherent. 0 = off: new instances and every project saved before, bit for bit
+    zeroLaw = paramCount,
+    // round 190mg (ns1), hidden (saved while non-zero): the NS1 law. [REA of the NS1 trial's DSP for the structure,
+    // our own probes and renders for every number; REA_rodada190mg_ns1.md] at Amount > 0 a new engine with the
+    // reference's own layout replaces round 124's: a zero-latency front end of two complementary all-pass splits whose
+    // low / high parts are cut as the Amount rises (corners and cuts move with it), six bands of three cascaded
+    // Regalia–Mitra cuts sharing one gain, each band's gain from a slewing noise-floor tracker and level follower, a
+    // threshold between them, a soft fourth-power weight, opening / closing smoothing and a voice-activity flag that
+    // lifts the thresholds in pauses. Amount 0 runs the same engine's open all-pass pair (round 190mm; was the zero law's pair). 0 = off: new instances and
+    // every project saved before; the NS1 translator sets it
+    ns1Law
+};
+// round 190lf: the Amount up to which zeroLaw fades the engine in over the bare all-pass pair
+constexpr double zeroFade = 0.2;
+// round 190mg (ns1): the NS1 law's layout at an Amount (0..1): split corners (Hz; the outer band centres too), the
+// cut of the parts below / above them (dB, ≤ 0) and the threshold's position between the floor and the level. A law
+// through the reference's five saved states (0 / 20 / 35 / 50 / 100 %), linear in between (corners in log)
+struct Ns1Layout
+{
+    double minFc = 60.0, maxFc = 16000.0, cutDb = 0.0, position = 0.0;
+    double q2 = 0.8992; // the high split's second-order Q (measured per setting on our probes / renders)
+};
+Ns1Layout ns1Layout (double amount) noexcept;
 constexpr int bands = 6;
 // crossover frequencies (Hz) between the six bands
 constexpr double split[bands - 1] { 105.0, 311.0, 921.0, 2727.0, 8075.0 };
@@ -67,6 +99,33 @@ const Tuning& defaultTuning() noexcept;
 double reductionDb (const Tuning& t, int band, double levelDb, double amount) noexcept;
 // an engine with explicit tuning (tests and the fitting harness)
 std::unique_ptr<Effect> make (const Tuning& t);
+
+// Round 190dp: the matched engine's noise-floor tracker. [black-box, the NS1 trial's renders] the reference does not
+// work from fixed thresholds: at a high setting a steady programme is taken down more and more over the first seconds
+// (a dense mix by 10 … 24 dB at 100 %, nothing at 35 … 50 %), the signature of a noise floor estimated from the
+// signal itself. Here (minimum statistics, R. Martin, "Noise power spectral density estimation based on optimal
+// smoothing and minimum statistics", IEEE TSAP 9(5), 2001 — the minimum of the smoothed band power over a sliding
+// window, kept as the minima of `subWindows` sub-windows) each band's floor sets a second expander threshold, `off`
+// dB above it; the larger of its reduction and the fixed law's is applied. Latency stays 0.
+// The constants below are fitted (round 190dp, /mnt/e/lynx-work/vqe190dp/qfit) on the reference's programme renders at
+// 0 / 20 / 35 / 50 / 100 % and its stimulus captures at 0 … 100 %: band-envelope distance 4.15 → 2.95 dB; then the
+// tracker got its own Q 8.5 bands (a tone sweeping by is not taken for its own floor), on the channels' mean and
+// evaluated every 16 samples (its cost: within 10 % of the fixed law's), with off1 17 → 16 dB to match.
+struct Track
+{
+    double smoothMs = 22.5;   // band power smoothing ahead of the minimum (ms)
+    double windowS = 1.1;     // the minimum's window (s)
+    double off0 = -30.0, off1 = 16.0, offPow = 2.0; // threshold above the floor: off0 + (off1 − off0) · amount^offPow
+    double slope = 0.8875, knee = 32.5;             // dB of reduction per dB under it, soft knee (dB)
+    double range0 = 0.0, range1 = 17.0;             // the tracker's largest reduction (dB) at amount 0 / 1
+    double bias = 1.5;                              // the minimum's bias: added to it (dB; a minimum reads low)
+    double q = 8.5;   // the tracker's own band-pass Q on the seven middle bands (0 = the expander's detectors): a
+                      // narrower view, so that a tone sweeping past is not taken for its own floor
+};
+constexpr int subWindows = 8;
+const Track& measuredTrack() noexcept;
+// the matched engine with an explicit tracker (tests and the fitting harness); `params` as the Effect sees them
+std::unique_ptr<Effect> makeTracked (const Track& t);
 } // namespace quell
 
 namespace gemini
@@ -83,7 +142,16 @@ enum Param
     // round 165w (appended): the shelves' law — 1 = measured on the 17.1 trials (gain −88 … +12 dB, two first-order
     // sections), 0 = round 124's (−30 … +12 dB, one first-order section): a project saved before keeps it
     eqLaw,
-    paramCount
+    // round 190do (appended): the voices' read head with Align off — 1 = measured (one head that jumps back by a fixed
+    // range), 0 = two crossfaded taps half a window apart (projects saved before)
+    headLaw,
+    paramCount,
+    // round 190mg, hidden (not in the info: no control, no text; saved while non-zero): the splice law of the Waves
+    // doubler's read head with Align off (REA of its DSP, docs/analise/REA_rodada190mg_voc.md). On (only the Waves
+    // translator sets it): the head drifts inside ±256 samples of the delay and jumps by the best of 20 candidate lags
+    // (a running autocorrelation of the voice's source) at a quiet moment or a zero crossing with good correlation,
+    // forced 32 samples further. 0 = the head law above (new instances and every project saved before, bit for bit)
+    spliceLaw = paramCount
 };
 enum VoiceParam { vOn, vGain, vPan, vDelay, vFeedback, vDetune, vDepth, vRate, vOctave, vSource, voiceParams };
 inline int voiceParam (int voice, VoiceParam p) noexcept { return voice1 + voice * voiceParams + (int) p; }

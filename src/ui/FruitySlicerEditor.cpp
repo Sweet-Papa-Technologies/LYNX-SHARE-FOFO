@@ -1,4 +1,7 @@
 #include "ui/FruitySlicerEditor.h"
+
+#include <optional>
+#include <utility>
 #include "ui/FileChoosers.h"
 
 #include <algorithm>
@@ -11,6 +14,7 @@
 #include "core/Song.h"
 #include "engine/AudioEngine.h"
 #include "engine/SampleLibrary.h"
+#include "ui/FrameTicker.h"
 #include "ui/I18n.h"
 #include "ui/Theme.h"
 #include "ui/ValueControl.h"
@@ -49,6 +53,7 @@ public:
     std::function<std::shared_ptr<const SampleData>()> sample;
     std::function<std::vector<std::int32_t>()> starts; // where the slices start in the shown (processed) sample
     std::function<int()> selected;
+    std::function<int()> playing; // round 190lx (DP-53): the slice that sounds now while ANIMATE is on (−1: none)
     std::function<void (int)> select;
     std::function<void (int, std::int32_t)> moveSlice;   // slice, new start
     std::function<void (int, std::int32_t)> menu;        // slice under the mouse, frame under the mouse
@@ -74,6 +79,14 @@ public:
             const auto end = sel + 1 < (int) at.size() ? (double) at[(std::size_t) sel + 1] : frames;
             const auto x0 = xOf (at[(std::size_t) sel], frames), x1 = xOf (end, frames);
             g.setColour (theme::colour::accent.withAlpha (0.18f));
+            g.fillRect (juce::Rectangle<float> (x0, r.getY(), std::max (1.0f, x1 - x0), r.getHeight()));
+        }
+        // round 190lx (DP-53, FL manual "Animate — Shows a visual cue for the slice that is currently playing")
+        if (const auto now = playing ? playing() : -1; now >= 0 && now < (int) at.size())
+        {
+            const auto end = now + 1 < (int) at.size() ? (double) at[(std::size_t) now + 1] : frames;
+            const auto x0 = xOf (at[(std::size_t) now], frames), x1 = xOf (end, frames);
+            g.setColour (juce::Colour (animateCue));
             g.fillRect (juce::Rectangle<float> (x0, r.getY(), std::max (1.0f, x1 - x0), r.getHeight()));
         }
         // the wave: min / max per pixel column
@@ -138,6 +151,23 @@ public:
     }
 
     void mouseUp (const juce::MouseEvent&) override { dragging = -1; }
+
+    // (the playing slice's cue, capture 190lx A5 fl-fslicer-animate.png: its ground ~21 % lighter, (57,68,90) -> (97,108,130))
+    static constexpr std::uint32_t animateCue = 0x36ffffff;
+    // the columns of slice `i` (for a repaint of just them)
+    juce::Rectangle<int> sliceBounds (int i) const
+    {
+        const auto data = sample ? sample() : nullptr;
+        if (data == nullptr || data->frames() == 0 || i < 0 || ! starts)
+            return {};
+        const auto at = starts();
+        if (i >= (int) at.size())
+            return {};
+        const auto frames = (double) data->frames();
+        const auto end = i + 1 < (int) at.size() ? (double) at[(std::size_t) i + 1] : frames;
+        const auto x0 = (int) std::floor (xOf (at[(std::size_t) i], frames)), x1 = (int) std::ceil (xOf (end, frames));
+        return { x0 - 1, 0, x1 - x0 + 2, getHeight() };
+    }
 
     static int sliceAt (const std::vector<std::int32_t>& at, std::int32_t frame)
     {
@@ -294,6 +324,7 @@ public:
         scope.sample = [this] { return processed; };
         scope.starts = [this] { return original != nullptr ? fslicer::playedStarts (state, (std::int64_t) original->frames()) : std::vector<std::int32_t>(); };
         scope.selected = [this] { return selected; };
+        scope.playing = [this] { return playingSlice; };
         scope.select = [this] (int i) {
             selected = i;
             refresh();
@@ -448,6 +479,10 @@ public:
         if (! files.isEmpty())
             loadSample (files[0]);
     }
+
+    // round 190gk: the Sampler waveform menu's "Open in new Fruity Slicer channel" (FL's SBONewMenuClick 0x11f8330:
+    // the plugin's template channel, then the sample loaded into it as the plugin's own Load does)
+    void loadSampleNow (const juce::String& path) { loadSample (path); }
 
 private:
     const ChannelDef* def() const { return locate ? locate (const_cast<Song&> (engine.getSong())) : nullptr; }
@@ -882,6 +917,25 @@ private:
     juce::Slider pitch, stretch, fadeIn, fadeOut, autoLow, autoHigh;
     std::vector<Wheel> wheels;
     Scope scope;
+    // Round 190lx (DP-53): ANIMATE's cue. A FrameTicker step (only while the editor shows; idle once nothing sounds):
+    // the channel's newest voice's place in the sample → the slice; only that slice's columns repaint on a change.
+    int playingSlice = -1;
+    bool animateStep()
+    {
+        auto now = -1;
+        if (state.animate != 0 && isShowing() && processed != nullptr && processed->frames() > 0)
+            if (const auto inst = engine.getChannelInstrument (channel))
+                if (const auto pos = inst->playPosition(); pos >= 0.0f)
+                    now = Scope::sliceAt (fslicer::playedStarts (state, original != nullptr ? (std::int64_t) original->frames() : 0),
+                                          (std::int32_t) std::floor ((double) pos * (double) processed->frames()));
+        if (now == playingSlice)
+            return false;
+        const auto was = std::exchange (playingSlice, now);
+        scope.repaint (scope.sliceBounds (was));
+        scope.repaint (scope.sliceBounds (now));
+        return true;
+    }
+    ui::FrameTicker animateFrames { *this, [this] (double) { return animateStep(); }, 60.0 };
     juce::Slider tempo, beats;           // FL's TempoSelect / LengthSelect (shown at run time)
     juce::Label tempoLabel, beatsLabel;
     SliceView sliceView;
@@ -889,8 +943,29 @@ private:
 };
 } // namespace
 
+static std::optional<std::pair<int, juce::String>>& pendingSample()
+{
+    static std::optional<std::pair<int, juce::String>> pending;
+    return pending;
+}
+
+void loadSampleWhenOpened (int channel, const juce::String& path)
+{
+    if (channel >= 0)
+        pendingSample() = std::make_pair (channel, path);
+    else
+        pendingSample().reset();
+}
+
 std::unique_ptr<juce::Component> makeFruitySlicerEditor (AudioEngine& engine, std::function<ChannelDef* (Song&)> locate, int channel)
 {
-    return std::make_unique<FruitySlicerEditor> (engine, std::move (locate), channel);
+    auto editor = std::make_unique<FruitySlicerEditor> (engine, std::move (locate), channel);
+    if (auto& p = pendingSample(); p.has_value() && channel >= 0 && p->first == channel)
+    {
+        const auto path = p->second;
+        p.reset();
+        editor->loadSampleNow (path);
+    }
+    return editor;
 }
 } // namespace lynx

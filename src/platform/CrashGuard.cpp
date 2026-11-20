@@ -1,4 +1,5 @@
 #include "platform/CrashGuard.h"
+#include "platform/CvWait.h"
 #include "core/CrashReport.h"
 
 #include <algorithm>
@@ -33,9 +34,17 @@
  #include <mmsystem.h>
 #else
  #include <signal.h>
+ #include <fcntl.h>
+ #include <setjmp.h>
  #include <unistd.h>
  #include <pthread.h>
  #include <dlfcn.h>
+ #include <unwind.h>
+ #if defined(__APPLE__)
+  #include <sys/ucontext.h>
+ #else
+  #include <ucontext.h>
+ #endif
  #if defined(__GLIBC__) || defined(__APPLE__)
   #include <execinfo.h>
   #define LYNX_EXECINFO 1
@@ -67,6 +76,432 @@ std::uint32_t call (void (*fn) (void*), void* context) noexcept
         const auto code = (std::uint32_t) GetExceptionCode();
         return code != 0 ? code : 1u;
     }
+}
+#elif ! defined(_WIN32)
+// Round 190dt (issue #155 follow-up): Linux / macOS. A fault is a signal there; see CrashGuard.h for what is caught,
+// what is not, and why.
+namespace
+{
+constexpr std::uint32_t cppExceptionCode = 0xE06D7363u; // (Windows' code for a C++ exception: describe() names it)
+constexpr std::uint32_t signalCodeBase = 0x4C590000u;   // | the signal number ("LY" + signal: describe() names it)
+constexpr int guardedSignals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+constexpr int guardedCount = (int) (sizeof (guardedSignals) / sizeof (guardedSignals[0]));
+
+// One armed call on this thread (a stack of them when a guarded call makes another one)
+struct GuardFrame
+{
+    sigjmp_buf env;
+    GuardFrame* prev = nullptr;
+    volatile std::uint32_t code = 0;     // written by the handler before it jumps back
+    volatile sig_atomic_t handling = 0;  // the handler is looking at a fault of this frame (a fault inside it is not caught)
+};
+
+// The armed frame of this thread. The handler reads it, so it must not allocate on first use: Linux' thread_local
+// pointer in the executable is static TLS (initial-exec); macOS' thread_local may allocate lazily, so a pthread key.
+// LYNX's exported plugins (this file is in their runtime, cmake/LynxPlugins.cmake, the only build that defines
+// LYNX_EXPORT_VERSION) are modules a host loads with dlopen: there one initial-exec variable makes the module's whole
+// TLS block static (DF_STATIC_TLS), glibc keeps only a small reserve for that, and hosts on glibc 2.35 failed to load
+// the 0.1.27 Linux plugins ("cannot allocate memory in static TLS block", round 190fp). They use the key as well
+// (pthread_getspecific does not allocate; scripts/check-linux-compat.sh fails a plugin that asks for static TLS).
+#if defined(LYNX_EXPORT_VERSION)
+ #define LYNX_GUARD_FRAME_KEY 1
+#endif
+#if defined(__APPLE__) || defined(LYNX_GUARD_FRAME_KEY)
+pthread_key_t frameKey;
+GuardFrame* currentFrame() noexcept { return static_cast<GuardFrame*> (pthread_getspecific (frameKey)); }
+void setCurrentFrame (GuardFrame* f) noexcept { pthread_setspecific (frameKey, f); }
+#else
+__attribute__ ((tls_model ("initial-exec"))) thread_local GuardFrame* tlsFrame = nullptr;
+GuardFrame* currentFrame() noexcept { return tlsFrame; }
+void setCurrentFrame (GuardFrame* f) noexcept { tlsFrame = f; }
+#endif
+
+std::atomic<int> guardState { 0 }; // 0 = not installed, 1 = being installed, 2 = installed
+struct sigaction previousAction[guardedCount];
+const void* ownImage = nullptr; // where LYNX's executable (LYNX's and JUCE's code) is loaded
+
+// A fault the kernel raised for an instruction of this thread (not a signal sent by kill / raise / sigqueue)
+bool synchronousFault (const siginfo_t* info) noexcept
+{
+#if defined(__APPLE__)
+    return info != nullptr && info->si_code > 0 && info->si_code < 0x10000; // (SI_USER and friends are 0x1000x)
+#else
+    return info != nullptr && info->si_code > 0; // (SI_USER 0, SI_TKILL / SI_QUEUE negative; SI_KERNEL 0x80 is a fault)
+#endif
+}
+
+std::uintptr_t programCounter (const void* context) noexcept
+{
+    const auto* uc = static_cast<const ucontext_t*> (context);
+#if defined(__APPLE__) && defined(__x86_64__)
+    return (std::uintptr_t) uc->uc_mcontext->__ss.__rip;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    return (std::uintptr_t) __darwin_arm_thread_state64_get_pc (uc->uc_mcontext->__ss);
+#elif defined(__linux__) && defined(__x86_64__)
+    return (std::uintptr_t) uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__linux__) && defined(__aarch64__)
+    return (std::uintptr_t) uc->uc_mcontext.pc;
+#else
+    (void) uc;
+    return 0; // (unknown: nothing is caught)
+#endif
+}
+
+// Where the faulting function was called from, when the faulting address is in no module (a call through a null or
+// stale function pointer): x86-64 has just pushed the return address, ARM64 holds it in the link register.
+std::uintptr_t callerOfUnknownCode (const void* context) noexcept
+{
+    const auto* uc = static_cast<const ucontext_t*> (context);
+#if defined(__APPLE__) && defined(__x86_64__)
+    return *reinterpret_cast<const std::uintptr_t*> (uc->uc_mcontext->__ss.__rsp);
+#elif defined(__APPLE__) && defined(__aarch64__)
+    return (std::uintptr_t) __darwin_arm_thread_state64_get_lr (uc->uc_mcontext->__ss);
+#elif defined(__linux__) && defined(__x86_64__)
+    return *reinterpret_cast<const std::uintptr_t*> (uc->uc_mcontext.gregs[REG_RSP]);
+#elif defined(__linux__) && defined(__aarch64__)
+    return (std::uintptr_t) uc->uc_mcontext.regs[30];
+#else
+    (void) uc;
+    return 0;
+#endif
+}
+
+// The C / C++ runtime and the system's own libraries: a fault inside them belongs to whoever called them (a plugin's
+// memcpy from a null pointer faults in libc), so the walk goes on to their caller.
+bool runtimeLibrary (const char* path) noexcept
+{
+    if (path == nullptr)
+        return false;
+    const char* name = path;
+    for (const char* p = path; *p != 0; ++p)
+        if (*p == '/')
+            name = p + 1;
+    static const char* const prefixes[] = { "libc.so", "libc-", "libm.so", "libm-", "libmvec", "libstdc++", "libgcc_s", "ld-linux",
+                                            "ld64.so", "libpthread", "libdl.so", "libdl-", "librt.so", "librt-", "libc++", "libunwind",
+                                            "libsystem_", "libdyld", "libobjc", "libSystem" };
+    for (const auto* prefix : prefixes)
+        if (std::strncmp (name, prefix, std::strlen (prefix)) == 0)
+            return true;
+    return false;
+}
+
+enum class Owner { unknown, lynx, runtime, other };
+
+Owner ownerOf (std::uintptr_t address) noexcept
+{
+    Dl_info info {};
+    if (address == 0 || dladdr (reinterpret_cast<const void*> (address), &info) == 0 || info.dli_fbase == nullptr)
+        return Owner::unknown;
+    if (info.dli_fbase == ownImage)
+        return Owner::lynx;
+    return runtimeLibrary (info.dli_fname) ? Owner::runtime : Owner::other;
+}
+
+struct Walk
+{
+    std::uintptr_t frames[64];
+    int count = 0;
+};
+
+_Unwind_Reason_Code collectFrame (_Unwind_Context* context, void* arg)
+{
+    auto& walk = *static_cast<Walk*> (arg);
+    if (walk.count >= 64)
+        return _URC_END_OF_STACK;
+    int beforeInstruction = 0;
+    const auto ip = (std::uintptr_t) _Unwind_GetIPInfo (context, &beforeInstruction);
+    if (ip == 0)
+        return _URC_END_OF_STACK;
+    // a return address points after its call: one byte back is inside the call (the faulting frame's is exact)
+    walk.frames[walk.count++] = beforeInstruction != 0 ? ip : ip - 1;
+    return _URC_NO_REASON;
+}
+
+// Whose fault it is: the first frame, from the faulting instruction outwards, that is neither the system's runtime
+// nor code outside every module decides. A plugin's module (or anything else LYNX did not build) = the plugin's;
+// LYNX's executable, or no frame that tells = LYNX's own (never caught).
+bool faultIsAPlugins (std::uintptr_t pc, const void* context) noexcept
+{
+    if (ownImage == nullptr)
+        return false;
+    Walk walk; // (the unwinder walks through the signal frame into the interrupted code)
+    if (pc != 0) // (a call through a null pointer: the unwinder stops there; its caller below)
+        _Unwind_Backtrace (collectFrame, &walk);
+    int start = -1;
+    for (int i = 0; i < walk.count && start < 0; ++i)
+        if (walk.frames[i] == pc || walk.frames[i] == pc - 1)
+            start = i;
+    std::uintptr_t fallback[2] = { pc, 0 };
+    const std::uintptr_t* frames = fallback;
+    int count = 1;
+    if (start >= 0)
+    {
+        frames = walk.frames + start;
+        count = walk.count - start;
+    }
+    else if (ownerOf (pc) == Owner::unknown || ownerOf (pc) == Owner::runtime)
+    {
+        // the unwinder did not find the faulting frame: its caller only (a leaf: the return address)
+        fallback[1] = callerOfUnknownCode (context);
+        count = 2;
+    }
+    for (int i = 0; i < count; ++i)
+        switch (ownerOf (frames[i]))
+        {
+            case Owner::lynx: return false;
+            case Owner::other: return true;
+            case Owner::unknown:
+            case Owner::runtime: break;
+        }
+    return false;
+}
+
+#if ! defined(LYNX_EXPORT_VERSION)
+ #define LYNX_PLUGIN_THREAD_GUARD 1
+#endif
+#if defined(LYNX_PLUGIN_THREAD_GUARD)
+// Round 190gg (B4): a fault on a hosted plugin's own thread (see CrashGuard.h, watchPluginModule). The app only: the
+// exported plugins' runtime never watches a module (nothing here would apply there), so it does not even have this.
+// Written by the message thread (one writer, slots never reused); the handler reads the slots that are ready.
+constexpr int watchedCapacity = 128;
+struct WatchedModule
+{
+    char path[1024] {};
+    std::atomic<int> ready { 0 };
+};
+WatchedModule watched[watchedCapacity];
+std::atomic<int> watchedCount { 0 };
+
+struct ThreadFaultSlot
+{
+    std::atomic<int> module { -1 };
+    std::atomic<std::uint32_t> code { 0 };
+    std::atomic<std::uintptr_t> offset { 0 };
+};
+constexpr int threadFaultCapacity = 16;
+ThreadFaultSlot threadFaultSlots[threadFaultCapacity];
+std::atomic<int> threadFaultTotal { 0 };
+std::atomic<int> threadFaultChecking { 0 }; // a fault is being looked at (any thread): another one is not parked
+
+// The watched module `path` is (its file, or a file inside its bundle folder), -1 = none
+int watchedModuleOf (const char* path) noexcept
+{
+    if (path == nullptr)
+        return -1;
+    const auto count = std::min (watchedCount.load (std::memory_order_acquire), watchedCapacity);
+    for (int i = 0; i < count; ++i)
+    {
+        if (watched[i].ready.load (std::memory_order_acquire) != 1)
+            continue;
+        const char* w = watched[i].path;
+        std::size_t k = 0;
+        while (w[k] != 0 && w[k] == path[k])
+            ++k;
+        if (w[k] == 0 && (path[k] == 0 || path[k] == '/' || (k > 0 && w[k - 1] == '/')))
+            return i;
+    }
+    return -1;
+}
+
+struct LongWalk
+{
+    std::uintptr_t frames[256];
+    int count = 0;
+};
+
+_Unwind_Reason_Code collectLongFrame (_Unwind_Context* context, void* arg)
+{
+    auto& walk = *static_cast<LongWalk*> (arg);
+    if (walk.count >= 256)
+        return _URC_END_OF_STACK;
+    int beforeInstruction = 0;
+    const auto ip = (std::uintptr_t) _Unwind_GetIPInfo (context, &beforeInstruction);
+    if (ip == 0)
+        return _URC_END_OF_STACK;
+    walk.frames[walk.count++] = beforeInstruction != 0 ? ip : ip - 1;
+    return _URC_NO_REASON;
+}
+
+// A fault outside every guarded call, on a thread that is a watched plugin's own: from the faulting instruction to the
+// thread's first frame (which must be reached: the C library's thread start) there is no frame of LYNX's executable,
+// and the first frame that is not the system's runtime is in a watched module. Then the fault is noted and this thread
+// waits forever (it is the plugin's: nothing of LYNX's runs on it); the app switches that plugin off. Otherwise false.
+bool parkPluginThread (int sig, const void* context) noexcept
+{
+    if (ownImage == nullptr || watchedCount.load (std::memory_order_acquire) == 0)
+        return false;
+    auto idle = 0;
+    if (! threadFaultChecking.compare_exchange_strong (idle, 1))
+        return false; // (a fault while looking at one, on this thread or another: the crash handler)
+    const auto pc = programCounter (context);
+    LongWalk walk;
+    if (pc != 0)
+        _Unwind_Backtrace (collectLongFrame, &walk);
+    int start = -1;
+    for (int i = 0; i < walk.count && start < 0; ++i)
+        if (walk.frames[i] == pc || walk.frames[i] == pc - 1)
+            start = i;
+    auto plugin = -1;
+    std::uintptr_t offset = 0;
+    auto ownFrame = false;
+    if (start >= 0 && walk.count < 256)
+    {
+        for (int i = start; i < walk.count && ! ownFrame; ++i)
+        {
+            Dl_info frame {};
+            if (dladdr (reinterpret_cast<const void*> (walk.frames[i]), &frame) == 0 || frame.dli_fbase == nullptr)
+                continue; // (generated code: judged by the frames around it)
+            if (frame.dli_fbase == ownImage)
+                ownFrame = true;
+            else if (plugin < 0 && ! runtimeLibrary (frame.dli_fname))
+            {
+                plugin = watchedModuleOf (frame.dli_fname);
+                if (plugin < 0)
+                    ownFrame = true; // (the first module that is not the runtime is somebody else's: not a plugin's)
+                offset = walk.frames[i] - (std::uintptr_t) frame.dli_fbase;
+            }
+        }
+        // the walk must end at the thread's start (the runtime's), or it cannot tell what started the thread
+        Dl_info last {};
+        if (dladdr (reinterpret_cast<const void*> (walk.frames[walk.count - 1]), &last) == 0 || ! runtimeLibrary (last.dli_fname))
+            ownFrame = true;
+    }
+    if (plugin < 0 || ownFrame)
+    {
+        threadFaultChecking.store (0);
+        return false;
+    }
+    const auto index = threadFaultTotal.load (std::memory_order_relaxed);
+    auto& slot = threadFaultSlots[index % threadFaultCapacity];
+    slot.module.store (plugin, std::memory_order_relaxed);
+    slot.code.store (signalCodeBase | (std::uint32_t) sig, std::memory_order_relaxed);
+    slot.offset.store (offset, std::memory_order_relaxed);
+    threadFaultTotal.store (index + 1, std::memory_order_release);
+    threadFaultChecking.store (0);
+    sigset_t all;
+    sigfillset (&all);
+    pthread_sigmask (SIG_SETMASK, &all, nullptr);
+    for (;;)
+        pause(); // (async-signal-safe; with every signal blocked it never returns)
+}
+#endif
+
+// The handlers that were there before (JUCE's crash handler: the crash file and the emergency save)
+void passOn (int sig, siginfo_t* info, void* context) noexcept
+{
+    int index = 0;
+    while (index < guardedCount && guardedSignals[index] != sig)
+        ++index;
+    if (index < guardedCount)
+    {
+        const auto& previous = previousAction[index];
+        if ((previous.sa_flags & SA_SIGINFO) != 0)
+        {
+            if (previous.sa_sigaction != nullptr)
+                previous.sa_sigaction (sig, info, context);
+        }
+        else if (previous.sa_handler == SIG_IGN && ! synchronousFault (info))
+            return;
+        else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN)
+            previous.sa_handler (sig);
+    }
+    // it came back (or there was none): the default action, by the fault happening again on return
+    struct sigaction fallback {};
+    fallback.sa_handler = SIG_DFL;
+    sigemptyset (&fallback.sa_mask);
+    sigaction (sig, &fallback, nullptr);
+    if (! synchronousFault (info))
+        raise (sig);
+}
+
+void onFault (int sig, siginfo_t* info, void* context)
+{
+    const auto savedErrno = errno;
+    if (auto* frame = currentFrame(); frame != nullptr && frame->handling == 0 && synchronousFault (info))
+    {
+        frame->handling = 1; // (a fault while looking at this one, e.g. in the unwinder, goes on to the crash handler)
+        if (faultIsAPlugins (programCounter (context), context))
+        {
+            frame->code = signalCodeBase | (std::uint32_t) sig;
+            // the thread's signal mask as it was before the fault (sigsetjmp did not save it: that costs a system
+            // call on every guarded call), then back to the guarded call
+            pthread_sigmask (SIG_SETMASK, &static_cast<ucontext_t*> (context)->uc_sigmask, nullptr);
+            siglongjmp (frame->env, 1);
+        }
+        // (handling stays set: the crash handler below ends the process, and a fault inside it is not caught either)
+    }
+#if defined(LYNX_PLUGIN_THREAD_GUARD)
+    else if (currentFrame() == nullptr && synchronousFault (info))
+        parkPluginThread (sig, context); // (returns only when it is not a plugin's own thread)
+#endif
+    errno = savedErrno;
+    passOn (sig, info, context);
+}
+
+void installFaultGuard() noexcept
+{
+    auto expected = 0;
+    if (! guardState.compare_exchange_strong (expected, 1))
+    {
+        while (guardState.load() == 1)
+            sched_yield();
+        return;
+    }
+    Dl_info self {};
+    if (dladdr (reinterpret_cast<const void*> (&installFaultGuard), &self) != 0)
+        ownImage = self.dli_fbase;
+#if defined(__APPLE__) || defined(LYNX_GUARD_FRAME_KEY)
+    pthread_key_create (&frameKey, nullptr);
+#endif
+    {
+        Walk warm; // (the unwinder's first use loads and sets up its tables: here, not inside a signal handler)
+        _Unwind_Backtrace (collectFrame, &warm);
+    }
+    for (int i = 0; i < guardedCount; ++i)
+    {
+        struct sigaction action {};
+        action.sa_sigaction = onFault;
+        sigemptyset (&action.sa_mask);
+        // SA_NODEFER: a fault inside the handler reaches it again (and goes on to the crash handler) instead of the
+        // kernel ending the process at once; SA_ONSTACK: the alternate stack where the thread has one (hardenSignals)
+        action.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+        sigaction (guardedSignals[i], &action, &previousAction[i]);
+    }
+    guardState.store (2, std::memory_order_release);
+}
+
+// The call itself, in a frame of its own: C++ exceptions leaving the plugin are caught here
+__attribute__ ((noinline)) bool callCatching (void (*fn) (void*), void* context) noexcept
+{
+    try
+    {
+        fn (context);
+        return false;
+    }
+    catch (...)
+    {
+        return true;
+    }
+}
+} // namespace
+
+std::uint32_t call (void (*fn) (void*), void* context) noexcept
+{
+    if (guardState.load (std::memory_order_acquire) != 2)
+        installFaultGuard();
+    GuardFrame frame;
+    frame.prev = currentFrame();
+    // (no signal mask saved: see onFault)
+    if (sigsetjmp (frame.env, 0) != 0)
+    {
+        setCurrentFrame (frame.prev); // the plugin faulted: back here from onFault
+        const std::uint32_t code = frame.code;
+        return code != 0 ? code : 1u;
+    }
+    setCurrentFrame (&frame);
+    const auto threw = callCatching (fn, context);
+    setCurrentFrame (frame.prev);
+    return threw ? cppExceptionCode : 0u;
 }
 #else
 std::uint32_t call (void (*fn) (void*), void* context) noexcept
@@ -300,6 +735,14 @@ bool processRunning (std::uint32_t pid, std::uint64_t startTime) noexcept
 
 const char* describe (std::uint32_t code) noexcept
 {
+#if ! defined(_WIN32)
+    if ((code & 0xFFFF0000u) == 0x4C590000u) // a signal caught by call() on Linux / macOS (round 190dt)
+    {
+        const auto sig = (int) (code & 0xFFu);
+        return sig == SIGSEGV ? "segmentation fault" : sig == SIGBUS ? "bus error" : sig == SIGILL ? "illegal instruction"
+             : sig == SIGFPE ? "floating-point exception" : "signal";
+    }
+#endif
     switch (code)
     {
         case 0xC0000005u: return "access violation";
@@ -771,6 +1214,132 @@ void faultForTest (bool unwalkable) noexcept
     std::_Exit (3); // (not reached)
 }
 
+namespace
+{
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__ ((noinline))
+#endif
+void copyFromNullForTest() noexcept
+{
+    // what nih-plug did in issue #155 (memcpy from a null pointer: the fault is in the C library), but called by LYNX
+    char to[64];
+    const char* volatile from = nullptr;
+    volatile std::size_t size = sizeof (to); // (a size the compiler can't see: a real call into the C library)
+    std::memcpy (to, (const char*) from, size);
+    std::fprintf (stderr, "%c", to[0]);
+}
+} // namespace
+
+std::uint32_t faultInGuardedCallForTest (bool inCLibrary) noexcept
+{
+    return run ([inCLibrary] {
+        if (inCLibrary)
+            copyFromNullForTest();
+        else
+            faultForTest (false);
+    });
+}
+
+void watchPluginModule (const std::string& fileUtf8) noexcept
+{
+#if defined(LYNX_PLUGIN_THREAD_GUARD)
+    if (fileUtf8.empty() || fileUtf8.front() != '/' || fileUtf8.size() >= sizeof (WatchedModule::path))
+        return; // (an identifier such as an LV2 URI, or a path too long: not watched)
+    auto path = fileUtf8;
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+    static std::mutex writers; // (one writer at a time; the handler never waits for it)
+    const std::lock_guard<std::mutex> lock (writers);
+    const auto count = watchedCount.load (std::memory_order_relaxed);
+    for (int i = 0; i < count; ++i)
+        if (path == watched[i].path)
+            return;
+    if (count >= watchedCapacity)
+        return;
+    std::memcpy (watched[count].path, path.c_str(), path.size() + 1);
+    watched[count].ready.store (1, std::memory_order_release);
+    watchedCount.store (count + 1, std::memory_order_release);
+    if (guardState.load (std::memory_order_acquire) != 2)
+        installFaultGuard(); // (the handler that parks the thread; hardenSignals installs it in the app anyway)
+#else
+    (void) fileUtf8;
+#endif
+}
+
+bool pluginThreadFaultsCaught() noexcept
+{
+#if defined(LYNX_PLUGIN_THREAD_GUARD) && (defined(__x86_64__) || defined(__aarch64__))
+    return true;
+#else
+    return false;
+#endif
+}
+
+int pluginThreadFaultCount() noexcept
+{
+#if defined(LYNX_PLUGIN_THREAD_GUARD)
+    return threadFaultTotal.load (std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+std::vector<PluginThreadFault> pluginThreadFaults()
+{
+    std::vector<PluginThreadFault> list;
+#if defined(LYNX_PLUGIN_THREAD_GUARD)
+    const auto total = threadFaultTotal.load (std::memory_order_acquire);
+    for (int i = std::max (0, total - threadFaultCapacity); i < total; ++i)
+    {
+        const auto& slot = threadFaultSlots[i % threadFaultCapacity];
+        const auto module = slot.module.load (std::memory_order_relaxed);
+        if (module < 0 || module >= watchedCapacity)
+            continue;
+        PluginThreadFault f;
+        f.module = watched[module].path;
+        f.code = slot.code.load (std::memory_order_relaxed);
+        char offset[40];
+        std::snprintf (offset, sizeof (offset), "+0x%llx", (unsigned long long) slot.offset.load (std::memory_order_relaxed));
+        auto name = f.module;
+        if (const auto slash = name.find_last_of ('/'); slash != std::string::npos)
+            name = name.substr (slash + 1);
+        f.where = name + offset;
+        list.push_back (std::move (f));
+    }
+#endif
+    return list;
+}
+
+void faultOnOwnThreadForTest (bool inCLibrary) noexcept
+{
+#if defined(LYNX_PLUGIN_THREAD_GUARD)
+    // the worst case: LYNX's own executable registered as if it were a plugin's module
+    Dl_info self {};
+    if (dladdr (reinterpret_cast<const void*> (&faultOnOwnThreadForTest), &self) != 0 && self.dli_fname != nullptr)
+        watchPluginModule (self.dli_fname);
+    std::thread ([inCLibrary] {
+        if (inCLibrary)
+            copyFromNullForTest();
+        else
+            faultForTest (false);
+    }).detach();
+    std::this_thread::sleep_for (std::chrono::seconds (5)); // (the crash handler ends the process long before)
+#else
+    (void) inCLibrary;
+#endif
+}
+
+bool pluginFaultsCaught() noexcept
+{
+#if defined(_WIN32) && (defined(_MSC_VER) || defined(__clang__))
+    return true; // SEH
+#elif (defined(__linux__) || defined(__APPLE__)) && (defined(__x86_64__) || defined(__aarch64__))
+    return true; // signals (programCounter knows these)
+#else
+    return false;
+#endif
+}
+
 void setUnwalkableFaultHandler (void (*handler) (void*)) noexcept
 {
 #if defined(LYNX_UNWIND)
@@ -868,7 +1437,18 @@ void onTerminate()
 
 void onAbortSignal (int sig)
 {
-    if (pureVirtualOnStack())
+#if ! defined(_WIN32)
+    // This handler runs before the crash handler, and the report below allocates. The C library's own abort (its heap
+    // checks: it may hold the heap's lock, and the heap is broken) must not get there: the watchdog first, and that
+    // abort goes on to the crash handler without a report from here (it writes the heap-corruption file itself).
+    armCrashWatchdog (nullptr);
+    const bool heapAbort = heapCorruptionCrash (reinterpret_cast<void*> (static_cast<std::intptr_t> (sig)));
+#else
+    const bool heapAbort = false;
+#endif
+    if (heapAbort)
+        ;
+    else if (pureVirtualOnStack())
         reportFatal ("pure virtual function call");
     else if (const auto exception = currentException(); ! exception.empty())
         reportFatal ("abort() with the uncaught exception " + exception);
@@ -1073,7 +1653,7 @@ void watchLoop()
     {
         {
             std::unique_lock<std::mutex> l (w.lock);
-            w.wake.wait_for (l, std::chrono::milliseconds (250), [&w] { return w.quit; });
+            cvwait::waitFor (w.wake, l, std::chrono::milliseconds (250), [&w] { return w.quit; }); // (round 190la: platform/CvWait.h)
             if (w.quit)
                 return;
         }
@@ -1166,6 +1746,8 @@ void hardenSignals() noexcept
                     sigaction (sig, &action, nullptr);
                 }
             }
+        // round 190dt: the plugin-call guard (call()), on top of the crash handler it passes LYNX's own faults to
+        installFaultGuard();
 
         if (endSignalPipe[0] < 0 && ::pipe (endSignalPipe) == 0)
         {
@@ -1307,9 +1889,32 @@ MainProfiler& mainProfiler()
 }
 
 #if defined(LYNX_UNWIND)
+// LYNX_PROFILE_SYMBOLS=1: LYNX.exe's own frames named in the process (its PDB). Off by default (round 190kz): dbghelp
+// loads the whole ~750 MB LYNX.pdb on the first such frame, which took longer than a measurement run, so no window was
+// ever written (rounds 190gr-190kr). The frames are written as "LYNX.exe+0x<rva>" and in a raw section per window that
+// scripts/profile_symbolize.py names afterwards (llvm-symbolizer with the build's PDB). Other modules keep their exports.
+bool symbolizeOwnFrames()
+{
+    static const bool on = [] {
+        const auto* v = std::getenv ("LYNX_PROFILE_SYMBOLS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
+bool inOwnModule (std::uintptr_t address)
+{
+    HMODULE module = nullptr;
+    return GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR> (address), &module)
+           && module == GetModuleHandleW (nullptr);
+}
+
 // "function" of a frame: its symbol without the offset, else the module
 std::string functionOf (std::uintptr_t address)
 {
+    if (! symbolizeOwnFrames() && inOwnModule (address))
+        return describeAddress (reinterpret_cast<const void*> (address));
     auto name = symbolOf ((DWORD64) address);
     if (const auto plus = name.rfind (" + 0x"); plus != std::string::npos)
         name.resize (plus);
@@ -1362,6 +1967,17 @@ void writeProfileWindow (const std::string& file, double fromS, double toS, long
     std::fprintf (out, "-- total (self + callees)\n");
     for (const auto& [n, k] : top (totalByName, 70))
         std::fprintf (out, "%6.1f %%  %s\n", 100.0 * (double) n / (double) std::max (1L, samples), k.c_str());
+    if (! symbolizeOwnFrames())
+    {
+        // (round 190kz) every own-module address with its weight, for scripts/profile_symbolize.py: "S|T <rva> <weight>"
+        const auto base = (std::uintptr_t) GetModuleHandleW (nullptr);
+        std::fprintf (out, "-- raw (LYNX.exe rva, weight; S = self, T = total; of %ld)\n", samples);
+        for (const auto* m : { &self, &total })
+            for (const auto& [a, n] : *m)
+                if (inOwnModule (a))
+                    std::fprintf (out, "%c %llx %ld\n", m == &self ? 'S' : 'T', (unsigned long long) (a - base), n);
+    }
+    std::fprintf (out, "-- end\n");
     std::fclose (out);
 }
 
@@ -1741,6 +2357,256 @@ void dispatchGuarded (const void* msg) noexcept
  #endif
 }
 #endif
+
+// ---- crash handler watchdog (rollup 0.1.30 step 12; CrashGuard.h) ------------------------------------------------------
+namespace
+{
+std::atomic<int> watchdogSeconds { 60 };
+std::atomic<bool> hangForTest { false };
+// the crash folder, prepared at start-up: the heap-corruption crash file is written without allocating
+#if defined(_WIN32)
+wchar_t crashFolderWide[1024] {};
+HANDLE watchdogWake = nullptr;
+std::atomic<std::uint32_t> watchdogCode { 0xC0000374u };
+DWORD WINAPI watchdogLate (LPVOID) noexcept
+{
+    Sleep ((DWORD) watchdogSeconds.load() * 1000u);
+    TerminateProcess (GetCurrentProcess(), (UINT) watchdogCode.load());
+    return 0;
+}
+DWORD WINAPI watchdogThread (LPVOID) noexcept
+{
+    WaitForSingleObject (watchdogWake, INFINITE);
+    return watchdogLate (nullptr);
+}
+#else
+char crashFolderUtf8[2048] {};
+#endif
+
+void storeFolder (const std::string& folder) noexcept
+{
+#if defined(_WIN32)
+    const auto n = MultiByteToWideChar (CP_UTF8, 0, folder.c_str(), -1, crashFolderWide, (int) (sizeof (crashFolderWide) / sizeof (wchar_t)));
+    if (n <= 0)
+        crashFolderWide[0] = 0;
+#else
+    if (folder.size() < sizeof (crashFolderUtf8))
+        std::memcpy (crashFolderUtf8, folder.c_str(), folder.size() + 1);
+    else
+        crashFolderUtf8[0] = 0;
+#endif
+}
+
+#if ! defined(_WIN32)
+// The C library aborted on its own (its heap checks: "free(): invalid next size", "corrupted double-linked list"...; its
+// fortify checks): the function that called abort() is the C library's. glibc's allocator entry points jump to static
+// functions, so their names are not among the frames (seen with glibc 2.42: free -> ?? -> ?? -> abort); only the module
+// tells. macOS: any frame in libsystem_malloc. A C++ terminate (libstdc++), LYNX's or a plugin's abort() do not count.
+bool inModule (const void* pc, const char* part, const char** symbol = nullptr) noexcept
+{
+    Dl_info info {};
+    if (pc == nullptr || dladdr (pc, &info) == 0 || info.dli_fname == nullptr)
+        return false;
+    if (symbol != nullptr)
+        *symbol = info.dli_sname;
+    const char* base = std::strrchr (info.dli_fname, '/');
+    base = base != nullptr ? base + 1 : info.dli_fname;
+    return std::strncmp (base, part, std::strlen (part)) == 0;
+}
+
+bool libraryAbort (void* const* frames, int n) noexcept
+{
+    for (int i = 0; i < n; ++i)
+    {
+ #if defined(__APPLE__)
+        if (inModule (frames[i], "libsystem_malloc"))
+            return true;
+ #else
+        const char* name = nullptr;
+        if (inModule (frames[i], "libc.so", &name) && name != nullptr && std::strcmp (name, "abort") == 0)
+            return i + 1 < n && inModule (frames[i + 1], "libc.so"); // (abort's caller)
+ #endif
+    }
+    return false;
+}
+
+// unsigned decimal into `out` (no allocation); returns the end
+char* putNumber (char* out, unsigned long long v) noexcept
+{
+    char digits[24];
+    int n = 0;
+    do
+    {
+        digits[n++] = (char) ('0' + (int) (v % 10));
+        v /= 10;
+    } while (v != 0 && n < 24);
+    while (n > 0)
+        *out++ = digits[--n];
+    return out;
+}
+
+void writeAll (int fd, const char* text) noexcept
+{
+    auto left = std::strlen (text);
+    while (left > 0)
+    {
+        const auto n = ::write (fd, text, left);
+        if (n <= 0)
+            return;
+        text += n;
+        left -= (std::size_t) n;
+    }
+}
+#endif
+} // namespace
+
+void prepareCrashWatchdog (const std::string& crashFolder) noexcept
+{
+    if (const char* v = std::getenv ("LYNX_CRASH_WATCHDOG_S"))
+        if (const auto s = std::atoi (v); s >= 1 && s <= 600)
+            watchdogSeconds = s;
+    storeFolder (crashFolder);
+#if defined(_WIN32)
+    if (watchdogWake == nullptr)
+    {
+        watchdogWake = CreateEventW (nullptr, TRUE, FALSE, nullptr);
+        if (watchdogWake != nullptr)
+            if (auto* t = CreateThread (nullptr, 64 * 1024, watchdogThread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr))
+                CloseHandle (t);
+    }
+#elif defined(LYNX_EXECINFO)
+    void* warm[4];
+    (void) backtrace (warm, 4); // (its first call loads the unwinder: an allocation, here and not in the handler)
+#endif
+}
+
+void setCrashFolder (const std::string& crashFolder) noexcept { storeFolder (crashFolder); }
+int crashWatchdogSeconds() noexcept { return watchdogSeconds.load(); }
+
+void armCrashWatchdog (void* exceptionPointers) noexcept
+{
+#if defined(_WIN32)
+    if (auto* ep = static_cast<EXCEPTION_POINTERS*> (exceptionPointers); ep != nullptr && ep->ExceptionRecord != nullptr)
+        watchdogCode = (std::uint32_t) ep->ExceptionRecord->ExceptionCode;
+    if (watchdogWake != nullptr)
+        SetEvent (watchdogWake);
+    else if (auto* t = CreateThread (nullptr, 64 * 1024, watchdogLate, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr))
+        CloseHandle (t); // (not prepared: a thread of its own now)
+#else
+    (void) exceptionPointers;
+    struct sigaction action {};
+    action.sa_handler = SIG_DFL;
+    sigemptyset (&action.sa_mask);
+    sigaction (SIGALRM, &action, nullptr);
+    sigset_t alarmOnly;
+    sigemptyset (&alarmOnly);
+    sigaddset (&alarmOnly, SIGALRM);
+    pthread_sigmask (SIG_UNBLOCK, &alarmOnly, nullptr);
+    alarm ((unsigned) watchdogSeconds.load());
+#endif
+}
+
+bool heapCorruptionCrash (void* exceptionPointers) noexcept
+{
+#if defined(_WIN32)
+    const auto* ep = static_cast<const EXCEPTION_POINTERS*> (exceptionPointers);
+    return ep != nullptr && ep->ExceptionRecord != nullptr && (std::uint32_t) ep->ExceptionRecord->ExceptionCode == 0xC0000374u;
+#elif defined(LYNX_EXECINFO)
+    if ((int) reinterpret_cast<std::intptr_t> (exceptionPointers) != SIGABRT)
+        return false;
+    void* frames[64];
+    const auto n = backtrace (frames, 64);
+    return libraryAbort (frames, n);
+#else
+    (void) exceptionPointers;
+    return false;
+#endif
+}
+
+void writeHeapCrashFile (void* exceptionPointers) noexcept
+{
+#if defined(_WIN32)
+    if (crashFolderWide[0] == 0)
+        return;
+    wchar_t path[1200];
+    const auto len = lstrlenW (crashFolderWide);
+    if (len + 64 >= (int) (sizeof (path) / sizeof (wchar_t)))
+        return;
+    lstrcpyW (path, crashFolderWide);
+    lstrcatW (path, L"\\crash heap-corruption.txt");
+    const auto file = CreateFileW (path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+    char text[256];
+    const auto* ep = static_cast<const EXCEPTION_POINTERS*> (exceptionPointers);
+    const auto code = ep != nullptr && ep->ExceptionRecord != nullptr ? (unsigned long) ep->ExceptionRecord->ExceptionCode : 0ul;
+    const auto n = wsprintfA (text, "LYNX crashed: heap corruption (exception 0x%08lx). The emergency save was skipped: the heap is broken.\r\n", code);
+    DWORD written = 0;
+    WriteFile (file, text, (DWORD) n, &written, nullptr);
+    CloseHandle (file);
+#else
+    if (crashFolderUtf8[0] == 0)
+        return;
+    char path[sizeof (crashFolderUtf8) + 64];
+    const auto len = std::strlen (crashFolderUtf8);
+    std::memcpy (path, crashFolderUtf8, len);
+    char* end = path + len;
+    const char* name = "/crash heap-corruption ";
+    std::memcpy (end, name, std::strlen (name));
+    end += std::strlen (name);
+    end = putNumber (end, (unsigned long long) std::time (nullptr));
+    std::memcpy (end, ".txt", 5);
+    const int fd = ::open (path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return;
+    char head[96];
+    char* h = head;
+    const char* what = "LYNX crashed: the C library's heap-corruption abort (signal ";
+    writeAll (fd, what);
+    h = putNumber (h, (unsigned long long) reinterpret_cast<std::uintptr_t> (exceptionPointers));
+    *h = 0;
+    writeAll (fd, head);
+    writeAll (fd, ", abort). The emergency save was skipped: the heap is broken.\n--- frames\n");
+ #if defined(LYNX_EXECINFO)
+    void* frames[64];
+    const auto n = backtrace (frames, 64);
+    backtrace_symbols_fd (frames, n, fd);
+ #endif
+    ::close (fd);
+#endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__ ((noinline))
+#endif
+void heapCorruptionForTest() noexcept
+{
+#if defined(__linux__)
+    // two chunks past the per-thread cache's sizes; the first one's neighbour gets a size of 0, so free() of the first
+    // finds "invalid next size" while it holds the arena's lock (what round 190mo's self-test write ended in)
+    using Alloc = void* (*) (std::size_t);
+    using Free = void (*) (void*);
+    volatile Alloc alloc = &std::malloc;
+    volatile Free release = &std::free;
+    auto* first = static_cast<unsigned char*> (alloc (4000));
+    auto* second = static_cast<unsigned char*> (alloc (4000));
+    std::memset (first, 1, 4000);
+    reinterpret_cast<volatile std::size_t*> (second)[-1] = 0; // (the size word of `second`'s chunk header)
+    release (first);
+    release (second);
+#elif ! defined(_WIN32)
+    using Free = void (*) (void*);
+    volatile Free release = &std::free;
+    alignas (16) static unsigned char notFromMalloc[256];
+    release (notFromMalloc + 16); // (libsystem_malloc: "pointer being freed was not allocated" -> abort)
+#else
+    RaiseException (0xC0000374u, EXCEPTION_NONCONTINUABLE, 0, nullptr); // (Windows: the code its heap raises)
+#endif
+    std::abort(); // (not reached when the C library noticed)
+}
+
+void setHangInCrashHandlerForTest() noexcept { hangForTest = true; }
+bool hangInCrashHandlerForTest() noexcept { return hangForTest.load(); }
 
 std::string lastHangFile()
 {

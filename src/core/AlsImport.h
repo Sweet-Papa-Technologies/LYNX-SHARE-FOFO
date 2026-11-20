@@ -12,7 +12,7 @@
 //    `sessionOnPlaylist`, the Playlist after the arrangement, one section per scene (a marker per scene);
 //  - third-party VST2 / VST3 plugins → PluginRef::foreign (resolved like an .flp's, state carried over);
 //  - Live's own devices → the closest LYNX instrument (Simpler / Sampler / Drum rack / Instrument rack); the rest is
-//    listed in the report (unsupported / droppedEffects), as for an .flp.
+//    listed in the report (unsupported / notReproduced / droppedEffects), as for an .flp.
 
 #include <array>
 #include <cstdint>
@@ -42,6 +42,9 @@ struct AlsImportOptions
     // Session clips: false (default, the user's choice of 2026-11-08) → LYNX's clip grid, scene for scene (round 181c);
     // true → the Playlist after the arrangement, one section per scene (the default before).
     bool sessionOnPlaylist = false;
+    // Drum Racks (round 190ec): false (default) → a LYNX Drum Rack with the pads' chains, choke groups, returns and
+    // sends; true → one sampler channel per pad, as an FL drum kit (the import before 190ec)
+    bool drumPadsAsChannels = false;
 };
 
 // True for a gzip file whose XML root is a Live set (also for plain XML starting with <?xml … <Ableton).
@@ -50,6 +53,33 @@ bool isAlsData (const std::uint8_t* data, std::size_t size);
 // The set as a LYNX song, or nullopt with `error` (not a Live set, corrupt, unsupported version).
 std::optional<Song> importAls (const std::vector<std::uint8_t>& fileBytes, const AlsImportOptions& options = {}, std::string* error = nullptr);
 std::optional<Song> importAlsXml (const xml::Document& document, const AlsImportOptions& options = {}, std::string* error = nullptr);
+
+// (round 190fm, docs/analise/ALS_FORMAT.md §20) A Live device preset the user owns — .adv (AbletonDevicePreset: one device)
+// or .adg (GroupDevicePreset: an Audio Effect Rack) — as one insert effect, through the same translators as a set's
+// devices (Live's own effects → LYNX's, racks → LYNX racks, plugins → PluginRef::foreign). nullopt + `error`: not a
+// preset, an instrument / MIDI preset, or a device with no LYNX counterpart. The report (options.common.report) gets the
+// same lines as a set's import.
+struct LiveDevicePreset
+{
+    EffectSlot slot;
+    std::string name; // the preset's device name (Live's UserName, else the device's)
+    bool rack = false;
+};
+std::optional<LiveDevicePreset> importLiveDevicePreset (const std::vector<std::uint8_t>& fileBytes, const AlsImportOptions& options = {},
+                                                        std::string* error = nullptr);
+
+// (round 190hr, racks-069) A Live instrument preset — an instrument .adv (Simpler, Sampler, Operator, Drift, a VST
+// instrument) or an Instrument / Drum Rack .adg — as a channel's instrument, through the set import's translators.
+// nullopt + `error`: not an instrument preset, a MIDI effect preset (no live counterpart in LYNX: refused), or an
+// instrument with no LYNX counterpart. `channel` holds only the instrument (and its name): the caller places it.
+struct LiveInstrumentPreset
+{
+    ChannelDef channel;
+    std::string name;
+    bool rack = false;
+};
+std::optional<LiveInstrumentPreset> importLiveInstrumentPreset (const std::vector<std::uint8_t>& fileBytes, const AlsImportOptions& options = {},
+                                                                std::string* error = nullptr);
 
 // The set's third-party plugins (no import): for the targeted scan before an open, as flpForeignPlugins for an .flp.
 std::vector<FlpPluginUse> alsForeignPlugins (const std::vector<std::uint8_t>& fileBytes);
@@ -69,5 +99,9 @@ std::string alsHexEncode (const std::vector<std::uint8_t>& bytes, std::size_t li
 
 // Live's 70-colour clip/track palette index → 0xFFRRGGBB (LYNX's own approximation of each hue; 0 for unknown).
 std::uint32_t alsColour (int index) noexcept;
-int alsColourIndex (std::uint32_t argb) noexcept; // the nearest palette index (for the export)
+// Round 190ig: Live 12.4's own colour of each index (0 for unknown), and the colour an .als import gives an index: Live's
+// while the Clip-launch layout shows (layoutstyle::current), alsColour's otherwise.
+std::uint32_t alsLiveColour (int index) noexcept;
+std::uint32_t alsImportColour (int index) noexcept;
+int alsColourIndex (std::uint32_t argb) noexcept; // Live's own index of one of its colours, else the nearest palette index (for the export)
 } // namespace lynx

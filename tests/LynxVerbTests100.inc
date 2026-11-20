@@ -165,9 +165,21 @@ TEST (lynxverbs100_onsets_levels_and_stereo)
     auto p = defaults (EffectKind::epochVerb);
     p[1] = 0.0f, p[2] = (float) lynx::verbs::skewInverse (2.0, 0.2, 70.0, 3.3596), p[5] = 0.5f, p[7] = 1.0f, p[13] = 1.0f, p[15] = 1.0f;
     const auto hall = impulse (EffectKind::epochVerb, p, 4.0);
-    // Concert Hall starts 5.5 ms after the impulse with an energy of −3.1 dB in its first 100 ms (unit impulse)
+    // Concert Hall starts 5.5 ms after the impulse with an energy of −3.1 dB in its first 100 ms (unit impulse) on the
+    // classic law; the measured law (round 190bz, the default of new instances) carries the wet-level correction of
+    // about 2 dB on top
     CHECK (std::abs ((double) onset (hall) / 48.0 - 5.5) < 1.0);
-    CHECK (std::abs (energyDb (hall, 0, 4800) - (-3.1)) < 1.5);
+    {
+        auto classic = p;
+        classic[(std::size_t) lynx::verbs::epoch::engineLaw] = 0.0f;
+        const auto was = energyDb (impulse (EffectKind::epochVerb, classic, 4.0), 0, 4800);
+        CHECK (std::abs (was - (-3.1)) < 1.5);
+        // (revision 1 of the measured law: round 190kw's loop law moves the level with Decay, round 190kw's own test)
+        auto measured = p;
+        measured[(std::size_t) lynx::verbs::epoch::loopLaw] = 0.0f;
+        const auto now = energyDb (impulse (EffectKind::epochVerb, measured, 4.0), 0, 4800);
+        CHECK (now - was > 0.5 && now - was < 4.5);
+    }
     double lr = 0, ll = 0, rr = 0;
     for (std::size_t i = 0; i < 48000; ++i)
         lr += (double) hall.l[i] * hall.r[i], ll += (double) hall.l[i] * hall.l[i], rr += (double) hall.r[i] * hall.r[i];

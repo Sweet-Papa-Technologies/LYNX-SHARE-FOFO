@@ -7,8 +7,10 @@
 #include "core/LoadTrace.h"
 #include "flp/Flp.h"
 #include "core/AlsImport.h"
+#include "core/DawProject.h"
 #include "ui/I18n.h"
 #include "ui/Theme.h"
+#include "ui/Toolbar.h"
 
 namespace lynx
 {
@@ -120,12 +122,14 @@ private:
                 try
                 {
                     const auto* bytes = static_cast<const std::uint8_t*> (data.getData());
-                    if (file.hasFileExtension ("flm;songtmpl"))
+                    if (file.hasFileExtension ("flm;songtmpl;blx"))
                     {
-                        // an FL Studio Mobile project (round 182c): no third-party plugins
+                        // an FL Studio Mobile project (round 182c), a BandLab project (round 190jr): no third-party plugins
                     }
                     else if (file.hasFileExtension ("als")) // a Live set (round 175a)
                         uses = alsForeignPlugins (std::vector<std::uint8_t> (bytes, bytes + data.getSize()));
+                    else if (file.hasFileExtension ("dawproject")) // a DAWproject (round 190jf, B22)
+                        uses = dawProjectForeignPlugins (std::vector<std::uint8_t> (bytes, bytes + data.getSize()));
                     else
                         uses = flpForeignPlugins (flp::parseProject ({ bytes, data.getSize() }));
                 }
@@ -367,7 +371,20 @@ void writeLoadLog()
     auto text = log.loadFileAsString();
     if (text.length() > 60000)
         text = text.substring (text.length() - 40000);
-    text << juce::Time::getCurrentTime().toString (true, true) << "\n" << juce::String::fromUTF8 (loadtrace::table().c_str()) << "\n";
+    text << juce::Time::getCurrentTime().toString (true, true) << "\n" << juce::String::fromUTF8 (loadtrace::table().c_str());
+    // round 190gd: where the project's memory goes (the samples' share of the process's private bytes)
+    const auto mb = [] (std::int64_t bytes) { return juce::String ((double) bytes / 1048576.0, 1); };
+    const auto use = SampleLibrary::memoryUse();
+    text << "memory: private " << mb (toolbar::PerformanceMeter::processPrivateBytes()) << " MB, working set "
+         << mb (toolbar::PerformanceMeter::processMemoryBytes()) << " MB; samples in RAM " << use.samples << " (" << mb (use.sampleBytes)
+         << " MB), mapped " << use.mappedSamples << " (" << mb (use.mappedBytes) << " MB), stretched copies " << use.stretched << " ("
+         << mb (use.stretchedBytes) << " MB";
+    // round 190gn (A2): of them mapped from the disk cache, and how much of that is resident and locked (equal: none of
+    // their pages can fault on the audio thread)
+    if (use.stretchedMapped > 0)
+        text << ", of them mapped " << use.stretchedMapped << " (" << mb (use.stretchedMappedBytes) << " MB, locked "
+             << mb (SampleLibrary::lockedStretchedBytes()) << " MB)";
+    text << ")\n\n";
     log.replaceWithText (text);
 }
 } // namespace lynx

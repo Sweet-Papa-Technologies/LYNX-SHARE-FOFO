@@ -69,6 +69,11 @@
 387,
 2
 ],
+"fx-edison": [
+960,
+540,
+2
+],
 "fx-effector": [
 436,
 438,
@@ -130,7 +135,7 @@
 2
 ],
 "fx-frequency-shifter-2": [
-383,
+380,
 246,
 2
 ],
@@ -145,17 +150,17 @@
 2
 ],
 "fx-fruity-7-band-eq": [
-341,
+340,
 248,
 2
 ],
 "fx-fruity-balance": [
-334,
+314,
 176,
 2
 ],
 "fx-fruity-bass-boost": [
-348,
+336,
 151,
 2
 ],
@@ -170,7 +175,7 @@
 2
 ],
 "fx-fruity-center": [
-327,
+307,
 81,
 2
 ],
@@ -260,17 +265,17 @@
 2
 ],
 "fx-fruity-mute-2": [
-327,
+306,
 90,
 2
 ],
 "fx-fruity-panomatic": [
-346,
+326,
 192,
 2
 ],
 "fx-fruity-phase-inverter": [
-367,
+346,
 81,
 2
 ],
@@ -285,17 +290,17 @@
 2
 ],
 "fx-fruity-send": [
-317,
+297,
 115,
 2
 ],
 "fx-fruity-soft-clipper": [
-354,
+333,
 159,
 2
 ],
 "fx-fruity-waveshaper": [
-352,
+332,
 384,
 2
 ],
@@ -336,7 +341,7 @@
 ],
 "fx-hush-de-esser": [
 720,
-518,
+614,
 2
 ],
 "fx-hyper-chorus": [
@@ -400,8 +405,8 @@
 2
 ],
 "fx-newtone": [
-960,
-480,
+727,
+582,
 2
 ],
 "fx-orbit": [
@@ -426,7 +431,7 @@
 ],
 "fx-pitch-correction": [
 523,
-356,
+378,
 2
 ],
 "fx-pitch-shift": [
@@ -445,8 +450,13 @@
 2
 ],
 "fx-pocket-chorus": [
-366,
+312,
 122,
+2
+],
+"fx-pocket-comb-filter": [
+456,
+206,
 2
 ],
 "fx-pocket-compressor": [
@@ -459,6 +469,16 @@
 232,
 2
 ],
+"fx-pocket-eq": [
+604,
+290,
+2
+],
+"fx-pocket-filter": [
+308,
+122,
+2
+],
 "fx-pocket-flanger": [
 456,
 206,
@@ -467,6 +487,11 @@
 "fx-pocket-gate": [
 674,
 314,
+2
+],
+"fx-pocket-graphic-eq": [
+456,
+206,
 2
 ],
 "fx-pocket-leveller": [
@@ -484,6 +509,11 @@
 244,
 2
 ],
+"fx-pocket-multiband-compressor": [
+604,
+374,
+2
+],
 "fx-pocket-multifx": [
 674,
 353,
@@ -494,13 +524,28 @@
 206,
 2
 ],
+"fx-pocket-reverb": [
+604,
+206,
+2
+],
+"fx-pocket-reverb-2": [
+604,
+290,
+2
+],
+"fx-pocket-reverb-classic": [
+604,
+290,
+2
+],
 "fx-pocket-spacer": [
 456,
 206,
 2
 ],
 "fx-pocket-spreader": [
-375,
+321,
 122,
 2
 ],
@@ -512,6 +557,11 @@
 "fx-pocket-tape-delay": [
 674,
 238,
+2
+],
+"fx-pocket-tape-stop": [
+456,
+206,
 2
 ],
 "fx-pocket-trance-delay": [
@@ -540,7 +590,7 @@
 2
 ],
 "fx-quell-denoiser": [
-367,
+313,
 466,
 2
 ],
@@ -590,7 +640,7 @@
 2
 ],
 "fx-squeeze": [
-332,
+311,
 249,
 2
 ],
@@ -600,7 +650,7 @@
 2
 ],
 "fx-stereo-shaper": [
-363,
+342,
 342,
 2
 ],
@@ -686,27 +736,27 @@
 ],
 "gen-3x-osc": [
 800,
-592,
+550,
 2
 ],
 "gen-bassdrum": [
 800,
-629,
+587,
 2
 ],
 "gen-beepmap": [
 800,
-422,
+406,
 2
 ],
 "gen-boobass": [
 800,
-422,
+406,
 2
 ],
 "gen-clap": [
-416,
-672,
+700,
+655,
 2
 ],
 "gen-dashboard": [
@@ -714,14 +764,19 @@
 132,
 2
 ],
+"gen-drum-rack": [
+900,
+560,
+2
+],
 "gen-drumaxx": [
 960,
-777,
+735,
 2
 ],
 "gen-drumpad": [
 960,
-402,
+386,
 2
 ],
 "gen-envelope-controller": [
@@ -731,17 +786,22 @@
 ],
 "gen-fl-keys": [
 800,
-422,
+406,
 2
 ],
 "gen-fl-slayer": [
 800,
-554,
+512,
+2
+],
+"gen-fpc": [
+960,
+437,
 2
 ],
 "gen-fruit-kick": [
 800,
-422,
+406,
 2
 ],
 "gen-fruity-dance": [
@@ -751,12 +811,12 @@
 ],
 "gen-fruity-dx10": [
 800,
-422,
+406,
 2
 ],
 "gen-fruity-granulizer": [
 800,
-641,
+599,
 2
 ],
 "gen-fruity-slicer": [
@@ -771,22 +831,22 @@
 ],
 "gen-gms": [
 960,
-499,
+466,
 2
 ],
 "gen-harmless": [
 960,
-641,
+604,
 2
 ],
 "gen-harmor": [
 960,
-489,
+456,
 2
 ],
 "gen-hat": [
-416,
-672,
+700,
+655,
 2
 ],
 "gen-instrument-rack": [
@@ -796,12 +856,12 @@
 ],
 "gen-kepler": [
 960,
-333,
+321,
 2
 ],
 "gen-kepler-exo": [
 960,
-586,
+553,
 2
 ],
 "gen-keyboard-controller": [
@@ -810,8 +870,8 @@
 2
 ],
 "gen-kick": [
-416,
-672,
+700,
+655,
 2
 ],
 "gen-layer": [
@@ -821,7 +881,7 @@
 ],
 "gen-lynx-soundfont": [
 800,
-562,
+546,
 2
 ],
 "gen-midi-effect-rack": [
@@ -836,17 +896,17 @@
 ],
 "gen-minisynth": [
 913,
-604,
+562,
 2
 ],
 "gen-morphine": [
 960,
-482,
+446,
 2
 ],
 "gen-ogun": [
 800,
-649,
+607,
 2
 ],
 "gen-patcher": [
@@ -856,27 +916,32 @@
 ],
 "gen-plucked": [
 800,
-422,
+406,
+2
+],
+"gen-pocket-supersaw": [
+716,
+1024,
 2
 ],
 "gen-poizone": [
 960,
-629,
+592,
 2
 ],
 "gen-sakura": [
 960,
-680,
+643,
 2
 ],
 "gen-sawer": [
 960,
-738,
+700,
 2
 ],
 "gen-simsynth": [
 800,
-574,
+532,
 2
 ],
 "gen-slicex": [
@@ -885,28 +950,28 @@
 2
 ],
 "gen-snare": [
-416,
-672,
+700,
+655,
 2
 ],
 "gen-synth": [
 800,
-572,
+556,
 2
 ],
 "gen-sytrus": [
 960,
-478,
+440,
 2
 ],
 "gen-toxic-biohazard": [
 960,
-785,
+745,
 2
 ],
 "gen-transistor-bass": [
 857,
-824,
+782,
 2
 ],
 "gen-vfx-color-mapper": [
@@ -951,7 +1016,7 @@
 ],
 "gen-wave-traveller": [
 800,
-532,
+516,
 2
 ]
 }

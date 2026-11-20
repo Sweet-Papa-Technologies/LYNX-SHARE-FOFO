@@ -1,5 +1,5 @@
 ---
-source: bcd8a275bd
+source: c4e89e7e72
 ---
 `檔案 › 開啟...`（`Ctrl+O`）可以開啟 LYNX SHARE 自己的 `.lynx` 專案，也能開啟 `.flp`、`.als`、`.flm` 和 `.mid` 檔案。來自其他程式的專案屬於匯入：它會成為一個新的、尚未儲存的 LYNX SHARE 專案，原始檔案不會被寫入。
 
@@ -16,8 +16,8 @@ source: bcd8a275bd
 | 格式 | 已轉換 | 未轉換 |
 |---|---|---|
 | `.flp`（FL Studio） | 通道、取樣、樣式、滑音和 porta 音符、所有編排、標記、拍號變化、自動化、控制器連結、含路由的混音器、側鏈、軌道 EQ 和原生效果器 | FLEX 包是加密的，不會被開啟。FLEX 通道會得到依預設集名稱選出的合成器音色 |
-| `.als`（Live 11 和 12） | MIDI、音訊、群組和回傳軌道，速度、拍號、定位點、循環，音量、聲像、靜音、獨奏和傳送及其自動化，Session 片段和場景，變速標記 | Live 自己的效果器會被捨棄。機架只保留第一條鏈。Simpler、Sampler 和鼓機架會變成 LYNX SHARE 取樣器 |
-| `.flm`（FL Studio Mobile） | 速度、拍號、每個通道一個混音插入軌、每條 lane 一條播放清單軌道、樣式、帶偏移和音高的音訊片段、鼓組、DW Sampler 取樣和 `.dwp` 程式 | FLM 的效果器和自動化 lane。其他 FLM 產生器會用內建合成器播放 |
+| `.als`（Live 11 和 12） | MIDI、音訊、群組和回傳軌道，速度、拍號、定位點、循環，音量、聲像、靜音、獨奏和傳送及其自動化，Session 片段和場景，變速標記，機架和鼓機架，以及 Live 自己的許多裝置（EQ Eight、Compressor、Glue Compressor、Reverb、Delay、Auto Filter、Saturator、Utility、Simpler、Drift 等），會變成 LYNX SHARE 自己的 | Live 中沒有 LYNX SHARE 對應項目的裝置（Hybrid Reverb、Grain Delay、Amp、Roar、FM Operator 音色等）會被捨棄並列出。MIDI Effect Rack 不會轉換 |
+| `.flm`（FL Studio Mobile） | 速度、拍號、每個通道一個混音插入軌、每條 lane 一條播放清單軌道、樣式、帶偏移和音高的音訊片段、鼓組、DW Sampler 取樣和 `.dwp` 程式、Slicer、MiniSynth、Transistor Bass、3x Osc、GMSynth 和 SuperSaw、效果器、自動化和和弦組 | 其他 FLM 產生器會用內建合成器播放 |
 | `.mid` | 音符、拍號和每一次速度變化 | MIDI 檔案不含聲音：通道會得到 LYNX SHARE 合成器或 MIDI Out 通道 |
 
 `.flp` 中的第三方 VST2、VST3 和 CLAP 外掛，以及 `.als` 中的 VST2 和 VST3 外掛，只要你的電腦裡裝有同一個外掛，就會連同儲存的狀態一起載入。
@@ -27,6 +27,12 @@ source: bcd8a275bd
 FL Studio 的產生器和效果器不會被載入。LYNX SHARE 讀取它們儲存的設定，並用自己重新製作的引擎來播放。每個引擎都有一個品質等級，從 `Exact`（在所有測試過的狀態下與原版位元完全一致）到 `Placeholder`（設定會保留，但外掛靜音或讓音訊直通）。各等級的說明見[從 FL Studio 轉換](/wiki/coming-from-fl-studio/)。
 
 開啟 `.flp` 不需要安裝 FL Studio。有些引擎需要的波形、取樣或脈衝響應，會在執行時從你自己的 FL Studio 安裝中讀取。
+
+使用 FL Studio 的「FL Studio Mobile Rack」的 `.flp`（FL Studio Mobile 自己的「Save as FLP」會為每個樂器軌道寫出一個）會在與 `.flm` 相同的引擎上播放它的樂器和效果器，「FL Studio Mobile Rack FX」效果器也一樣。帶鼓組或多個樂器的機架仍使用內建合成器播放。
+
+## FL Studio Mobile 原廠音色
+
+`.flm` 使用的原廠音色（鼓組、DirectWave 程式、SoundFont、GMSynth 波形）屬於 FL Studio Mobile，從不隨 LYNX SHARE 一起發行。LYNX SHARE 會在你自己的 App 副本的 `Resources` 資料夾中尋找它們：在 `設定 › 檔案 › FL Studio Mobile 資源` 下新增它（選擇它上一層的資料夾，或選擇 FL Studio 安裝資料夾，也可以）。FL Studio 的安裝只包含其中一部分，並且在你的資料夾之後才搜尋。仍然缺失的檔案會列在缺失的檔案視窗中。
 
 ## 缺失的取樣
 

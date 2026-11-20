@@ -576,3 +576,36 @@ TEST (audioedit_loop_take_markers_and_selection)
     multiCap.releaseStream (s2);
     CHECK (! multiCap.isAnyActive());
 }
+
+// A project of the SPT fork from before upstream had an Edison (0.1.25 - 0.1.27) kept an Edison slot's audio inside
+// the project (EffectSlot::recorderDocument, .lynx "recorder"). The slot is upstream's Edison now (core/EdisonFx.h):
+// when its effect is built, that document becomes its session's, not yet written (the engine's next flush makes it the
+// slot's file).
+TEST (edison_slot_takes_the_forks_embedded_document)
+{
+    namespace ae = lynx::audioedit;
+    auto song = lynx::Song::makeDefault();
+    song.channels.clear();
+    song.playlist.clear();
+    song.mixer = lynx::Song::defaultMixer (3);
+
+    auto doc = std::make_shared<ae::Document>();
+    doc->title = "Take";
+    doc->audio.sampleRate = 48000.0;
+    doc->audio.channels = { std::vector<float> (480, 0.25f), std::vector<float> (480, -0.25f) };
+    auto legacy = lynx::makeEffectSlot (lynx::EffectKind::edison);
+    legacy.recorderDocument = doc;
+    song.mixer[1].effects.push_back (legacy);
+    song.mixer[2].effects.push_back (lynx::makeEffectSlot (lynx::EffectKind::edison)); // (a slot of its own: nothing to take)
+
+    const auto state = lynx::RackState::build (song, nullptr, 48000.0); // (keeps the effects, and so their sessions)
+    const auto session = lynx::edisonfx::findSession (song.mixer[1].effects[0].instance.id);
+    CHECK (session != nullptr);
+    if (session != nullptr)
+    {
+        CHECK (session->document().audio.frames() == 480 && session->document().title == "Take");
+        CHECK (session->dirty() && session->path().empty());
+    }
+    const auto plain = lynx::edisonfx::findSession (song.mixer[2].effects[0].instance.id);
+    CHECK (plain != nullptr && plain->document().audio.empty() && ! plain->dirty());
+}

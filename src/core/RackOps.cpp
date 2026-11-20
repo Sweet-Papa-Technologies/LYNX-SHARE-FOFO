@@ -83,7 +83,7 @@ int gotoNextEmptyPattern (Song& song)
 
     if (index < 0)
     {
-        if (! song.patterns.empty() && isPatternEmpty (song.patterns[(std::size_t) song.currentPattern]))
+        if (! song.patterns.empty() && isPatternEmpty (song.activePattern()))
             return song.currentPattern;
 
         Pattern p;
@@ -158,7 +158,7 @@ int splitPatternByChannel (Song& song, int index)
         const auto channelName = channel >= 0 && channel < (int) song.channels.size() ? song.channels[(std::size_t) channel].name
                                                                                          : "Channel " + std::to_string (channel + 1);
         p.name = source.name + " - " + channelName;
-        p.lengthTicks = source.lengthTicks != 0 ? source.lengthTicks : source.effectiveLength (song.beatsPerBar);
+        p.lengthTicks = source.lengthTicks != 0 ? source.lengthTicks : source.effectiveLength (song.meter());
         p.colour = channel >= 0 && channel < (int) song.channels.size() ? song.channels[(std::size_t) channel].colour : source.colour;
 
         for (const auto& n : source.notes)
@@ -427,7 +427,7 @@ int mergeIdenticalPatterns (Song& song)
 
 int patternSteps (const Song& song, const Pattern& pattern) noexcept
 {
-    return std::clamp ((int) (pattern.effectiveLength (song.beatsPerBar) / ticksPerStep), 16, 512);
+    return std::clamp ((int) (pattern.effectiveLength (song.meter()) / ticksPerStep), 16, 512);
 }
 
 bool showsNotePreview (const Pattern& pattern, int channel) noexcept
@@ -729,7 +729,7 @@ void permuteChannels (Song& song, const std::vector<int>& newOrder)
 
     song.forEachTarget ([&] (AutomationTarget& t) {
         if (t.kind == AutomationTargetKind::channelVolume || t.kind == AutomationTargetKind::channelPan
-            || t.kind == AutomationTargetKind::channelParam)
+            || t.kind == AutomationTargetKind::channelParam || t.kind == AutomationTargetKind::channelAdjust)
             t.index = map (t.index);
     });
 
@@ -877,7 +877,7 @@ int removeChannels (Song& song, std::vector<int> channels)
 
 bool isInsertFree (const Song& song, int track) noexcept
 {
-    if (track <= 0 || track >= (int) song.mixer.size())
+    if (track <= 0 || track >= (int) song.mixer.size() || song.mixer[(std::size_t) track].current) // (round 190mv: FL's Current track)
         return false;
 
     if (std::any_of (song.channels.begin(), song.channels.end(), [track] (const ChannelDef& c) { return c.mixerTrack == track; }))
@@ -1008,12 +1008,14 @@ bool channelCutsItself (const ChannelDef& c) noexcept
     // issue #68: one state for every "Cut itself" control (rack menu, sample panel, Misc page). FL has one: its "Cut self"
     // sets Cut and By to the same group (FLEngine_x64 CutItselfBtnClick 0xF67C60 → 0xFEAAF0: [0x27C] = a group,
     // [0x280] = [0x27C]); LYNX's sampler flag (projects saved by the sample panel before 0.1.24) counts too
-    return (c.cutGroup != 0 && c.cutGroup == c.cutBy) || c.sampler.cut;
+    // (round 190fe: an FLM cut group shares Cut and By but spares the channel that plays — not "cut itself")
+    return (c.cutGroup != 0 && c.cutGroup == c.cutBy && ! c.cutOthersOnly) || c.sampler.cut;
 }
 
 void setChannelCutsItself (ChannelDef& c, int channel, bool on) noexcept
 {
     c.cutGroup = c.cutBy = on ? 1000 + channel : 0;
+    c.cutOthersOnly = c.cutAtNoteEnd = false; // (round 190fe)
     c.sampler.cut = on; // (the sampler's own quick cut of its voices goes with it, as an imported FL "cut itself")
 }
 
@@ -1026,10 +1028,10 @@ std::string cutGroupText (int group, int channel)
     return std::to_string (group);
 }
 
-std::string stepPositionText (std::int64_t tick, int beatsPerBar)
+std::string stepPositionText (std::int64_t tick, Meter meter)
 {
     tick = std::max<std::int64_t> (0, tick);
-    const auto barTicks = (std::int64_t) ppq * std::max (1, beatsPerBar);
+    const auto barTicks = meter.bar();
     const auto bar = tick / barTicks + 1;
     const auto inBar = tick % barTicks;
     const auto step = inBar / ticksPerStep + 1;

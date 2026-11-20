@@ -1,5 +1,5 @@
 ---
-source: be0fc22373
+source: 1c440a7810
 ---
 ![Plugin yöneticisinin alt kısmı; her plugin dosyasının ayrı bir süreçte incelendiğini belirten notla](/assets/img/wiki/plugin-manager-scan.webp)
 
@@ -62,7 +62,7 @@ Varsayılan olarak bir plugin LYNX SHARE'in içinde çalışır; bu yüzden çö
 
 Böyle bir plugin çökerse veya yanıt vermeyi bırakırsa susturulur, bir ileti görünür ve LYNX SHARE çalışmaya devam eder. O iletideki `Yeniden yükle`, plugin'i projeyi yeniden açmadan, son kayıttaki veya yedekteki ayarlarla yeniden başlatır. Plugin'in editörü kendi penceresinde açılır; yerleştirilemez ve üste sabitlenemez.
 
-Bunu yalnızca tek bir plugin için yapmak üzere, plugin penceresinin wrapper menüsünde `Ayrı süreçte çalıştır` veya `Always run <plugin> in a separate process` seçeneğini kullanın. Bir plugin'in editörü çöktüğünde görünen ileti ikincisini de sunar.
+Bunu yalnızca tek bir plugin için yapmak üzere, plugin penceresinin wrapper menüsünde `Ayrı süreçte çalıştır` veya `Her zaman ayrı süreçte çalıştır: <plugin>` seçeneğini kullanın. Bir plugin'in editörü çöktüğünde görünen ileti ikincisini de sunar.
 
 Bu Windows ve Linux'ta çalışır, macOS'ta ise 0.1.25'ten beri.
 
@@ -89,6 +89,19 @@ Windows'ta 32 bit VST2 ve VST3 plugin'leri bir köprü (`LYNX-bridge32.exe`) üz
 ## Bir enstrümanın çıkışlarını ayrı insert'lere gönderme
 
 Birden fazla çıkışı olan bir enstrüman plugin'i, her çıkışı kendi Mixer insert'inde çalabilir. Plugin penceresinde `Wrapper ayarları`'e, sonra `İşleme` sekmesine tıklayın. `Bağlantılar` altında her çıkışın onu açıp kapatan bir ışığı ve bir sayısı vardır: kanalın kendi insert'inden kaç insert sonrasında çaldığı. `Çıkışları otomatik eşle` her çıkışa bir sonraki insert'i verir, `Sıfırla` varsayılanlara döner.
+
+## FL Studio'nun kendi plugin'leri
+
+FL Studio'nun yerel plugin'leri, örneğin Sytrus, Harmor ve Patcher, yalnızca FL Studio içinde çalışır. Onları LYNX SHARE'de kullanmak için FL Studio ile birlikte gelen plugin sürümünü kullanın. Windows'ta `C:\Program Files\Common Files\VST2` içinde `FL Studio VSTi` ve `FL Studio VSTi (Multi)` olarak kurulur. macOS'ta bir Audio Unit'tir.
+
+1. Plugin'leri tarayın. İkisi de Image-Line üreticisiyle enstrüman olarak görünür. İlk tarama biraz sürebilir, çünkü FL Studio'nun tamamı plugin'in içinde başlar.
+2. `FL Studio VSTi` plugin'ini bir kanala ekleyin ve penceresini açın. FL Studio'nun kendi penceresini, Channel Rack'i, Mixer'ı ve browser'ıyla açmak için FL Studio logosuna tıklayın.
+3. FL Studio'nun Channel Rack'inde bir enstrüman ekleyin. Yeni bir FL Studio plugin'i boş bir Sampler ile başlar ve siz bir tane ekleyene kadar ses çıkarmaz. LYNX SHARE'den gelen notalar, FL Studio'nun Channel Rack'inde seçili kanalı çalar.
+4. FL Studio'nun kendi pattern'leri, LYNX SHARE çaldığında, LYNX SHARE'in temposunda çalar.
+
+FL Studio içinde kurduğunuz şey LYNX SHARE projesiyle birlikte kaydedilir. `FL Studio VSTi (Multi)` ayrı insert'lerde çalabilen 16 stereo çıkışa sahiptir (yukarıdaki bölüme bakın). FL Studio lisansınız, hangi FL plugin'lerinin içinde çalışacağını belirler. LYNX SHARE, FL Studio'nun plugin dosyalarını kendi başına yüklemez.
+
+FL Studio plugin'i `Yüklenemedi` olarak listeleniyorsa, ona `Seçenekler › Plugin yöneticisi...` içinde sağ tıklayın ve `Tekrar dene (bu dosyayı şimdi tara)` seçeneğini seçin.
 
 ## Plugin database klasörü
 

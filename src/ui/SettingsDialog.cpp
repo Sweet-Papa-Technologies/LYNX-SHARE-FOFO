@@ -1,10 +1,12 @@
 #include "ui/SettingsDialog.h"
+#include "ui/PlaylistComponent.h"
 #include "core/Comping.h"
 #include "ui/FileChoosers.h"
 #include "ui/ThemeSettings.h"
 
 #include "core/ClipOps.h"
 #include "core/MissingFiles.h"
+#include "core/PlaylistOps.h"
 #include "engine/PluginHost.h"
 #include "ui/I18n.h"
 #include "ui/MissingFilesDialog.h"
@@ -21,18 +23,19 @@ juce::String u8 (const std::string& s) { return juce::String::fromUTF8 (s.c_str(
 using namespace settingsui;
 
 // --- Project page ----------------------------------------------------------------------------------
-class ProjectPage final : public juce::Component,
+// (round 190bx: a ScrollingPage, as General / Audio / MIDI: in a short window the rows scroll instead of being cut off)
+class ProjectPage final : public ScrollingPage,
                           private juce::ChangeListener
 {
 public:
     ProjectPage (AudioEngine& e, const SettingsHooks& h) : engine (e), hooks (h)
     {
-        addAndMakeVisible (timeTitle);
-        addAndMakeVisible (grooveTitle);
-        addAndMakeVisible (gridTitle);
+        add (timeTitle);
+        add (grooveTitle);
+        add (gridTitle);
 
         for (auto* l : { &tempoLabel, &beatsLabel, &swingLabel, &pitchLabel })
-            addAndMakeVisible (l);
+            add (*l);
         styleLabel (tempoLabel, tr ("Tempo"));
         styleLabel (beatsLabel, tr ("Beats per bar"));
         styleLabel (swingLabel, tr ("Swing"));
@@ -46,7 +49,7 @@ public:
             s.setDoubleClickReturnValue (true, def);
             s.setColour (juce::Slider::trackColourId, theme::colour::bg4); // a quiet bar: the number is what matters here
             s.setColour (juce::Slider::textBoxOutlineColourId, theme::colour::borderStrong);
-            addAndMakeVisible (s);
+            add (s);
         };
         setup (tempo, 10.0, 999.0, 0.001, " BPM", 130.0);
         setup (beats, 1.0, 32.0, 1.0, {}, 4.0);
@@ -55,7 +58,7 @@ public:
         tempo.setNumDecimalPlacesToDisplay (3);
         // FL's Options › Project › Time settings combo (REA round 168j, .flp 0x23): how the time settings are shown
         styleLabel (timeModeLabel, tr ("Time settings"));
-        addAndMakeVisible (timeModeLabel);
+        add (timeModeLabel);
         timeMode.addItem (tr ("Set as time division"), 1);
         timeMode.addItem (tr ("Set as time signature"), 2);
         timeMode.setTooltip (tr ("Time division: FL Studio's original system (beats per bar, steps per beat). Time signature: traditional time signatures (numerator / denominator)."));
@@ -63,7 +66,7 @@ public:
             edit ([on = timeMode.getSelectedId() == 2] (Song& s) { s.timeSignatureMode = on; });
             showTimeMode (timeMode.getSelectedId() == 2);
         };
-        addAndMakeVisible (timeMode);
+        add (timeMode);
 
         tempo.onValueChange = [this] { edit ([v = tempo.getValue()] (Song& s) { clipops::followTempo (s, v); }); };
         beats.onValueChange = [this] { edit ([v = (int) beats.getValue()] (Song& s) { s.beatsPerBar = v; }); };
@@ -74,7 +77,7 @@ public:
         {
             styleLabel (*l, {});
             l->setFont (theme::font (theme::type::small));
-            addAndMakeVisible (l);
+            add (*l);
         }
         ppqText.setText (tr ("Timebase: {0} ticks per quarter note (PPQ). Imported projects (.flp, .als, .flm) are converted to it.", { juce::String (ppq) }),
                          juce::dontSendNotification);
@@ -82,10 +85,10 @@ public:
                                juce::dontSendNotification);
 
         // FL's Options › Project general settings › Playlist (round 166e)
-        addAndMakeVisible (playlistTitle);
+        add (playlistTitle);
         crossfades.setButtonText (tr ("Automatic crossfades (overlapping audio clips on a track crossfade over the overlap)"));
         crossfades.onClick = [this] { edit ([on = crossfades.getToggleState()] (Song& s) { s.autoCrossfades = on; }); };
-        addAndMakeVisible (crossfades);
+        add (crossfades);
         crossfadesNew.setButtonText (tr ("Enable automatic crossfades in new projects"));
         crossfadesNew.onClick = [this] {
             if (hooks.getGeneral == nullptr || hooks.setGeneral == nullptr)
@@ -96,10 +99,32 @@ public:
         };
         crossfadesNew.setEnabled (hooks.getGeneral != nullptr);
         crossfadesNew.setToggleState (hooks.getGeneral != nullptr ? hooks.getGeneral().crossfadesInNewProjects : true, juce::dontSendNotification);
-        addAndMakeVisible (crossfadesNew);
+        add (crossfadesNew);
+        // LYNX extra (round 190gz, issue #170): Playlist tracks linked to mixer tracks, for this project and new ones
+        linkTracks.setButtonText (tr ("Link Playlist tracks to mixer tracks (Track N with insert N; mute, solo, volume and pan on linked track headers)"));
+        // (round 190ib: switching on lists what it changes and asks first; Cancel leaves the box as the project is)
+        linkTracks.onClick = [this] {
+            PlaylistComponent::switchLinkTracks (engine, linkTracks.getToggleState(),
+                                                 [safe = juce::Component::SafePointer<ProjectPage> (this)] (bool) {
+                                                     if (safe != nullptr)
+                                                         safe->linkTracks.setToggleState (safe->engine.getSong().linkTracksToMixer, juce::dontSendNotification);
+                                                 });
+        };
+        add (linkTracks);
+        linkTracksNew.setButtonText (tr ("Link Playlist tracks to mixer tracks in new projects"));
+        linkTracksNew.onClick = [this] {
+            if (hooks.getGeneral == nullptr || hooks.setGeneral == nullptr)
+                return;
+            auto o = hooks.getGeneral();
+            o.linkTracksInNewProjects = linkTracksNew.getToggleState();
+            hooks.setGeneral (o);
+        };
+        linkTracksNew.setEnabled (hooks.getGeneral != nullptr);
+        linkTracksNew.setToggleState (hooks.getGeneral != nullptr && hooks.getGeneral().linkTracksInNewProjects, juce::dontSendNotification);
+        add (linkTracksNew);
         // Comping (round 177c): the crossfade at a comp's switches, re-applied to every comp when it changes
         styleLabel (compFadeLabel, tr ("Comp crossfade"));
-        addAndMakeVisible (compFadeLabel);
+        add (compFadeLabel);
         setup (compFade, 0.0, 100.0, 0.5, " ms", (double) Song::defaultCompCrossfadeMs);
         compFade.onValueChange = [this] {
             edit ([v = (float) compFade.getValue()] (Song& s) {
@@ -112,19 +137,19 @@ public:
         // FL's Project › "Play truncated notes in clips" (round 167g)
         truncated.setButtonText (tr ("Play truncated notes in clips (a note that starts before a pattern clip plays from the clip's start)"));
         truncated.onClick = [this] { edit ([on = truncated.getToggleState()] (Song& s) { s.playTruncatedNotes = on; }); };
-        addAndMakeVisible (truncated);
+        add (truncated);
         // FL's Options › Project › General › advanced: "Fast declick for cut groups" (round 167h)
         fastDeclick.setButtonText (tr ("Fast declick for cut groups (use faster ramping when cutting notes)"));
         fastDeclick.onClick = [this] { edit ([on = fastDeclick.getToggleState()] (Song& s) { s.fastDeclick = on; }); };
-        addAndMakeVisible (fastDeclick);
+        add (fastDeclick);
         // FL's Options › Project › General › advanced: "Panning law" (round 167j)
         styleLabel (panLawLabel, tr ("Panning law"));
-        addAndMakeVisible (panLawLabel);
+        add (panLawLabel);
         panLaw.addItem (tr ("Circular"), 1);
         panLaw.addItem (tr ("Triangular"), 2);
         panLaw.setTooltip (tr ("Circular: centre at 0 dB, +3 dB on the side panned to. Triangular: the louder side keeps its level. Mixer inserts and Sampler channels."));
         panLaw.onChange = [this] { edit ([on = panLaw.getSelectedId() == 2] (Song& s) { s.panTriangular = on; }); };
-        addAndMakeVisible (panLaw);
+        add (panLaw);
 
         engine.addChangeListener (this);
         load();
@@ -132,9 +157,10 @@ public:
 
     ~ProjectPage() override { engine.removeChangeListener (this); }
 
-    void resized() override
+private:
+    int layout (int width) override
     {
-        auto area = getLocalBounds().reduced (20, 14);
+        auto area = juce::Rectangle<int> (0, 0, width, 100000).reduced (20, 14);
         auto row = [&area] (juce::Label& l, juce::Slider& s) {
             auto r = area.removeFromTop (28);
             l.setBounds (r.removeFromLeft (150));
@@ -164,6 +190,8 @@ public:
         area.removeFromTop (6);
         crossfades.setBounds (area.removeFromTop (26));
         crossfadesNew.setBounds (area.removeFromTop (26));
+        linkTracks.setBounds (area.removeFromTop (26));
+        linkTracksNew.setBounds (area.removeFromTop (26));
         auto compRow = area.removeFromTop (26);
         compFadeLabel.setBounds (compRow.removeFromLeft (150));
         compFade.setBounds (compRow.removeFromLeft (180));
@@ -173,9 +201,9 @@ public:
         auto lawRow = area.removeFromTop (26);
         panLawLabel.setBounds (lawRow.removeFromLeft (150));
         panLaw.setBounds (lawRow.removeFromLeft (180));
+        return area.getY() + 14;
     }
 
-private:
     void edit (std::function<void (Song&)> fn)
     {
         if (loading)
@@ -189,9 +217,11 @@ private:
         const auto& s = engine.getSong();
         tempo.setValue (s.bpm, juce::dontSendNotification);
         beats.setValue (s.beatsPerBar, juce::dontSendNotification);
+        shownUnit = meterUnit (s.beatUnit);
         swing.setValue (s.swing * 100.0, juce::dontSendNotification);
         pitch.setValue (s.masterPitch, juce::dontSendNotification);
         crossfades.setToggleState (s.autoCrossfades, juce::dontSendNotification);
+        linkTracks.setToggleState (s.linkTracksToMixer, juce::dontSendNotification);
         compFade.setValue (s.compCrossfadeMs, juce::dontSendNotification);
         truncated.setToggleState (s.playTruncatedNotes, juce::dontSendNotification);
         fastDeclick.setToggleState (s.fastDeclick, juce::dontSendNotification);
@@ -201,11 +231,13 @@ private:
     }
 
     // FL's time signature mode (FUN_00eccbd0): the numerator is the beats per bar, the denominator sets the steps per
-    // beat (16 / denominator); LYNX's step grid is 4 per beat, so the denominator is 4
+    // beat (16 / denominator). Round 190fg: the song meter's own denominator (4 unless a scene, an .als, .flp or MIDI
+    // file set another); the step grid stays sixteenths, so a beat of 6/8 is 2 steps
+    int shownUnit = 4;
     void showTimeMode (bool signature)
     {
         beatsLabel.setText (signature ? tr ("Numerator") : tr ("Beats per bar"), juce::dontSendNotification);
-        stepsText.setText (signature ? tr ("Denominator: {0} (the Channel Rack's step grid is {1} steps per beat).", { juce::String (16 / stepsPerBeat), juce::String (stepsPerBeat) })
+        stepsText.setText (signature ? tr ("Denominator: {0} (the Channel Rack's step grid is {1} steps per beat).", { juce::String (shownUnit), juce::String (juce::jmax (1, 16 / shownUnit)) })
                                      : tr ("Steps per beat: {0} (the Channel Rack's step grid).", { juce::String (stepsPerBeat) }),
                            juce::dontSendNotification);
     }
@@ -223,23 +255,24 @@ private:
         playlistTitle { tr ("Playlist") };
     juce::Label tempoLabel, beatsLabel, swingLabel, pitchLabel, ppqText, stepsText, signatureText, panLawLabel, timeModeLabel;
     juce::Slider tempo, beats, swing, pitch;
-    juce::ToggleButton crossfades, crossfadesNew, truncated, fastDeclick;
+    juce::ToggleButton crossfades, crossfadesNew, linkTracks, linkTracksNew, truncated, fastDeclick;
     juce::Label compFadeLabel;
     juce::Slider compFade;
     juce::ComboBox panLaw, timeMode;
 };
 
 // --- Info page -------------------------------------------------------------------------------------
-class InfoPage final : public juce::Component,
+// (round 190bx: a ScrollingPage too; the comments box takes the room left and never gets shorter than a few lines)
+class InfoPage final : public ScrollingPage,
                        private juce::ChangeListener,
                        private juce::Timer
 {
 public:
     explicit InfoPage (AudioEngine& e) : engine (e)
     {
-        addAndMakeVisible (infoTitle);
+        add (infoTitle);
         for (auto* l : { &titleLabel, &authorLabel, &genreLabel, &urlLabel, &commentsLabel })
-            addAndMakeVisible (l);
+            add (*l);
         styleLabel (titleLabel, tr ("Title"));
         styleLabel (authorLabel, tr ("Author"));
         styleLabel (genreLabel, tr ("Genre"));
@@ -251,35 +284,43 @@ public:
             styleEditor (*t);
             t->onReturnKey = [this] { commit(); };
             t->onFocusLost = [this] { commit(); };
-            addAndMakeVisible (t);
+            add (*t);
         }
         genre.setTextToShowWhenEmpty (tr ("e.g. House, Trap, Lo-fi"), theme::colour::textDisabled);
         url.setTextToShowWhenEmpty ("https://", theme::colour::textDisabled);
 
         genreMenu.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xbe"));
         genreMenu.onClick = [this] { showGenres(); };
-        addAndMakeVisible (genreMenu);
+        add (genreMenu);
         openLink.onClick = [this] {
             const juce::URL link (url.getText().trim());
             if (url.getText().trim().isNotEmpty())
                 link.launchInDefaultBrowser();
         };
-        addAndMakeVisible (openLink);
+        add (openLink);
 
         styleEditor (comments);
         comments.setMultiLine (true, true);
         comments.setReturnKeyStartsNewLine (true);
         comments.setScrollbarsShown (true);
         comments.onFocusLost = [this] { commit(); };
-        addAndMakeVisible (comments);
+        add (comments);
 
         showOnOpen.setButtonText (tr ("Show this page when the project is opened"));
         showOnOpen.onClick = [this] { commit(); };
-        addAndMakeVisible (showOnOpen);
+        add (showOnOpen);
 
         // FL's Project info: when the project was created and how long it has been worked on (REA round 167g)
         styleLabel (timesLabel, {}); // (secondary text colour)
-        addAndMakeVisible (timesLabel);
+        add (timesLabel);
+
+        // FL's Project info › "Reset working time" (round 190bx: FL's handler restarts the count at once, no question)
+        resetTime.setTooltip (tr ("The project's start date becomes now and its working time starts again from zero"));
+        resetTime.onClick = [this] {
+            engine.resetWorkTime();
+            timerCallback();
+        };
+        add (resetTime);
 
         engine.addChangeListener (this);
         load();
@@ -292,9 +333,13 @@ public:
         engine.removeChangeListener (this);
     }
 
-    void resized() override
+private:
+    static constexpr int minimumHeight = 14 + 36 + 4 * 36 + 22 + 84 + 8 + 26 + 2 + 26 + 14; // (comments: at least 84 px)
+
+    int layout (int width) override
     {
-        auto area = getLocalBounds().reduced (20, 14);
+        const auto height = juce::jmax (minimumHeight, getHeight());
+        auto area = juce::Rectangle<int> (0, 0, width, height).reduced (20, 14);
         infoTitle.setBounds (area.removeFromTop (28));
         area.removeFromTop (8);
         auto row = [&area] (juce::Label& l) {
@@ -317,14 +362,23 @@ public:
             r.removeFromRight (4);
             url.setBounds (r);
         }
-        timesLabel.setBounds (area.removeFromBottom (22));
+        {
+            // (FL: the button at the right of the "This project started on" line)
+            auto times = area.removeFromBottom (26);
+            const auto buttonWidth = juce::jlimit (120, juce::jmax (120, times.getWidth() / 2),
+                                                   juce::roundToInt (juce::GlyphArrangement::getStringWidth (getLookAndFeel().getTextButtonFont (resetTime, 26), resetTime.getButtonText())) + 28);
+            resetTime.setBounds (times.removeFromRight (buttonWidth));
+            times.removeFromRight (8);
+            timesLabel.setBounds (times);
+        }
+        area.removeFromBottom (2);
         showOnOpen.setBounds (area.removeFromBottom (26));
         area.removeFromBottom (8);
         commentsLabel.setBounds (area.removeFromTop (22));
         comments.setBounds (area);
+        return height;
     }
 
-private:
     ProjectInfo typed() const
     {
         ProjectInfo i = engine.getSong().info; // (created / working time are not typed)
@@ -403,6 +457,7 @@ private:
     juce::Label titleLabel, authorLabel, genreLabel, urlLabel, commentsLabel;
     juce::TextEditor title, author, genre, url, comments;
     juce::TextButton genreMenu, openLink { tr ("Open") };
+    juce::TextButton resetTime { tr ("Reset working time") };
     juce::ToggleButton showOnOpen;
     juce::Label timesLabel;
 };
@@ -455,6 +510,9 @@ public:
         }
     }
 
+    // the least height that shows the heading, the note, two rows and every button
+    int minimumHeight() const { return 28 + 4 + 20 + 4 + juce::jmax (2 * 24 + 2, extraButton != nullptr ? 26 + 6 + 26 + 6 + 26 : 26 + 6 + 26); }
+
     // A third button under Add / Remove (the plugin folders' "Plugin manager...", as FL's File page has it).
     void addExtraButton (const juce::String& text, std::function<void()> onClick)
     {
@@ -465,6 +523,8 @@ public:
     }
 
 private:
+    // issue #182: typing jumps to the folder whose name starts with it (JUCE fix 37 reads the names)
+    juce::String getNameForRow (int row) override { return juce::isPositiveAndBelow (row, folders.size()) ? juce::File (folders[row]).getFileName() : juce::String(); }
     int getNumRows() override { return juce::jmax (1, folders.size()); }
 
     void paintListBoxItem (int row, juce::Graphics& g, int width, int height, bool selected) override
@@ -533,7 +593,9 @@ private:
     std::unique_ptr<juce::FileChooser> chooser;
 };
 
-class FilesPage final : public juce::Component
+// (rollup 0.1.28: a ScrollingPage since round 190fn added the fourth list: at a short window every list keeps its
+// Add / Remove buttons and two rows, and the page scrolls)
+class FilesPage final : public ScrollingPage
 {
 public:
     FilesPage (AudioEngine& engine, bool persistent, std::function<void()> browserChanged, std::function<void()> managePlugins = {})
@@ -598,28 +660,106 @@ public:
                 host.setPluginFolders (path);
             }, persistent);
 
+        // Round 190fn (decision O1, LYNX's own): FL Studio Mobile's factory content for .flm projects, from the user's own
+        // copy of the app's "Resources" folder (FL's copy, when FL is installed, is searched after these)
+        flmResources = std::make_unique<FolderList> (
+            tr ("FL Studio Mobile resources"), tr ("Factory sounds for .flm projects: the app's own Resources folder. LYNX SHARE ships none."),
+            [persistent, sample] {
+                juce::StringArray list;
+                if (persistent)
+                    list.addLines (PluginHost::settingsFolder().getChildFile ("flm-resources.txt").loadFileAsString());
+                list.removeEmptyStrings();
+                return sample (list, { "D:\\FL Studio Mobile\\Resources" });
+            },
+            [persistent] (const juce::StringArray& list) {
+                if (persistent)
+                    PluginHost::settingsFolder().getChildFile ("flm-resources.txt").replaceWithText (list.joinIntoString ("\n"));
+            }, persistent);
+
         // FL's File page has "Manage plugins" next to the plugin settings (REA round 143b)
         if (managePlugins)
             pluginFolders->addExtraButton (tr ("Plugin manager..."), managePlugins);
 
-        addAndMakeVisible (*searchFolders);
-        addAndMakeVisible (*browserFolders);
-        addAndMakeVisible (*pluginFolders);
+        add (*searchFolders);
+        add (*browserFolders);
+        add (*pluginFolders);
+        add (*flmResources);
     }
 
-    void resized() override
+protected:
+    // The four lists share the window's height; none gets less than its heading, two rows and its buttons (below that
+    // the page scrolls)
+    int layout (int width) override
     {
-        auto area = getLocalBounds().reduced (20, 14);
-        const auto h = (area.getHeight() - 24) / 3;
-        searchFolders->setBounds (area.removeFromTop (h));
-        area.removeFromTop (12);
-        browserFolders->setBounds (area.removeFromTop (h));
-        area.removeFromTop (12);
-        pluginFolders->setBounds (area);
+        constexpr int padX = 20, padY = 14, gap = 12;
+        FolderList* lists[] = { searchFolders.get(), browserFolders.get(), pluginFolders.get(), flmResources.get() };
+        const auto share = (getHeight() - 2 * padY - 3 * gap) / 4;
+        auto y = padY;
+        for (auto* list : lists)
+        {
+            const auto h = juce::jmax (list->minimumHeight(), share);
+            list->setBounds (padX, y, juce::jmax (0, width - 2 * padX), h);
+            y += h + gap;
+        }
+        return y - gap + padY;
+    }
+    int minimumWidth() const override { return 300; }
+
+private:
+    std::unique_ptr<FolderList> searchFolders, browserFolders, pluginFolders, flmResources;
+};
+
+// Round 190jp (design190ia FW-19): FL's Settings tabs, their captions a step larger (type::title, was 7 px caps at
+// type::body) in a 30 px row; the LYNX identity stays (the selected tab lifted, the red underline). LYNX's own tabs come
+// after a 12 px gap, as FL sets apart its Debug / Account / About.
+class SettingsTab final : public juce::TabBarButton
+{
+public:
+    SettingsTab (const juce::String& name, juce::TabbedButtonBar& bar, bool gapBefore) : juce::TabBarButton (name, bar), gap (gapBefore ? groupGap : 0) {}
+
+    static constexpr int groupGap = 12;
+    static juce::Font captionFont() { return theme::font (theme::type::title); }
+
+    int getBestTabLength (int) override
+    {
+        return juce::roundToInt (juce::GlyphArrangement::getStringWidth (captionFont(), getButtonText())) + 26 + gap;
+    }
+    bool hitTest (int x, int y) override { return x >= gap && juce::TabBarButton::hitTest (x, y); }
+
+    void paintButton (juce::Graphics& g, bool over, bool down) override
+    {
+        using namespace theme::colour;
+        auto area = getActiveArea().toFloat().withTrimmedLeft ((float) gap);
+        const auto front = isFrontTab();
+        if (front || over || down)
+        {
+            g.setColour (front ? bg3 : bg2);
+            g.fillRoundedRectangle (area.reduced (2.0f, 3.0f), theme::radius::md);
+        }
+        if (front)
+        {
+            g.setColour (accent);
+            g.fillRoundedRectangle (area.withTop (area.getBottom() - 2.0f).reduced (10.0f, 0.0f), 1.0f);
+        }
+        g.setColour (front ? textPrimary : over ? textPrimary.withAlpha (0.85f) : textSecondary);
+        g.setFont (captionFont());
+        g.drawFittedText (getButtonText(), area.toNearestInt().reduced (4, 0), juce::Justification::centred, 1, 0.8f);
     }
 
 private:
-    std::unique_ptr<FolderList> searchFolders, browserFolders, pluginFolders;
+    int gap;
+};
+
+class SettingsTabs final : public juce::TabbedComponent
+{
+public:
+    SettingsTabs() : juce::TabbedComponent (juce::TabbedButtonBar::TabsAtTop) {}
+    int firstOwnTab = -1; // the tab with the gap before it
+
+    juce::TabBarButton* createTabButton (const juce::String& name, int index) override
+    {
+        return new SettingsTab (name, getTabbedButtonBar(), index == firstOwnTab);
+    }
 };
 
 class SettingsPanel final : public juce::Component
@@ -627,13 +767,16 @@ class SettingsPanel final : public juce::Component
 public:
     SettingsPanel (AudioEngine& engine, SettingsPage page, bool persistent, SettingsHooks hooks)
     {
-        tabs.setTabBarDepth (34);
+        tabs.setTabBarDepth (30);
         tabs.setOutline (0);
-        // FL's order: device pages first, then the app, then the project
-        const std::pair<SettingsPage, juce::String> order[] = { { SettingsPage::audio, tr ("Audio") },     { SettingsPage::midi, tr ("MIDI") },
-                                                                { SettingsPage::general, tr ("General") }, { SettingsPage::theme, tr ("Theme") },
-                                                                { SettingsPage::files, tr ("Files") },     { SettingsPage::extras, tr ("LYNX extras") },
-                                                                { SettingsPage::project, tr ("Project") }, { SettingsPage::info, tr ("Info") } };
+        // FL's order (round 190jp, design190ia FW-19: MIDI, Audio, General, File, Theme, Project, Info), then LYNX's own
+        // pages after a gap (Ableton Link, named in full as Ableton's Link integration guidelines ask of other apps)
+        const std::pair<SettingsPage, juce::String> order[] = { { SettingsPage::midi, tr ("MIDI") },       { SettingsPage::audio, tr ("Audio") },
+                                                                { SettingsPage::general, tr ("General") }, { SettingsPage::files, tr ("Files") },
+                                                                { SettingsPage::theme, tr ("Theme") },     { SettingsPage::project, tr ("Project") },
+                                                                { SettingsPage::info, tr ("Info") },       { SettingsPage::link, tr ("Ableton Link") },
+                                                                { SettingsPage::extras, tr ("LYNX extras") } };
+        tabs.firstOwnTab = 7;
         for (const auto& [p, name] : order)
         {
             juce::Component* content = nullptr;
@@ -647,6 +790,7 @@ public:
                 case SettingsPage::project: content = new ProjectPage (engine, hooks); break;
                 case SettingsPage::info: content = new InfoPage (engine); break;
                 case SettingsPage::extras: content = makeExtrasPage (engine, hooks, persistent).release(); break;
+                case SettingsPage::link: content = makeLinkPage (engine, hooks).release(); break;
             }
             tabs.addTab (name, theme::colour::bg2, content, true);
             pages.push_back (p);
@@ -674,7 +818,7 @@ public:
     }
 
 private:
-    juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
+    SettingsTabs tabs;
     std::vector<SettingsPage> pages; // in tab order
 };
 

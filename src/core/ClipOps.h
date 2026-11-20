@@ -191,10 +191,11 @@ inline float fitBeats (double seconds, double bpm, float embeddedBeats = 0.0f, d
 }
 
 // FL's TIME knob presets (its right-click menu, r168s c_f20): "1 beat, 2 beats, 1 bar, 2 bars, 3 bars, 4 bars" in beats.
-inline std::vector<float> timePresetBeats (int beatsPerBar)
+// (round 190fg: in quarter notes, a beat and a bar of the song's meter)
+inline std::vector<float> timePresetBeats (Meter meter)
 {
-    const auto bar = (float) std::max (1, beatsPerBar);
-    return { 1.0f, 2.0f, bar, 2.0f * bar, 3.0f * bar, 4.0f * bar };
+    const auto beat = (float) meter.beat() / (float) ppq, bar = (float) meter.bar() / (float) ppq;
+    return { beat, 2.0f * beat, bar, 2.0f * bar, 3.0f * bar, 4.0f * bar };
 }
 
 // Clips (indices into song.playlist) that use the same source as `clip`: the same pattern, the same audio
@@ -343,6 +344,36 @@ inline float fadeTensionCurve (float y, float tension) noexcept
     const auto range = std::log (a + 1.0);
     return t > 0.0 ? (float) (1.0 - (std::exp ((1.0 - (double) y) * range) - 1.0) / a)
                    : (float) ((std::exp ((double) y * range) - 1.0) / a);
+}
+
+// FL 2026's fade tension handle (round 190jz, issue #194; FL GUI and FL's saved files): the circle on a fade's curve holds
+// a value v of -1..1 (FL's hint "Tension: 15%", its Type in value "Tension ±0-1 or %"), kept in the file as the raw value
+// above: raw = ±0.1·(e^(17.10105·|v|) − 1). Measured: v 0.25 → 7.0899, 0.5 → 516.8467, 1 → 2672339.25 (Thief's −812.933 is
+// v −0.527). A drag of 1 px moves v by 1/174 (FL: 156 px up took the hint from 0 % to 90 %); up raises the curve's middle.
+constexpr double fadeTensionSlope = 17.10105, fadeTensionPerPixel = 1.0 / 174.0;
+inline float fadeTensionFromHandle (double v) noexcept
+{
+    v = std::clamp (v, -1.0, 1.0);
+    const auto a = 0.1 * (std::exp (fadeTensionSlope * std::abs (v)) - 1.0);
+    return (float) (v < 0.0 ? -a : a);
+}
+inline double fadeTensionHandle (float raw) noexcept
+{
+    if (! std::isfinite (raw) || raw == 0.0f)
+        return 0.0;
+    const auto v = std::min (1.0, std::log (10.0 * std::abs ((double) raw) + 1.0) / fadeTensionSlope);
+    return raw < 0.0f ? -v : v;
+}
+
+// The gain of a fade at `x` (0..1 along it from its start; `rising` = a fade in) as the voices play it (Instruments
+// clipFadeGainOf): FL's S curve, or straight (`linear`), then bent by the raw tension. The Playlist draws its fade curves
+// and places the tension handle (at x = 0.5) with it, so the picture is the sound.
+inline float fadeLevel (float x, bool rising, bool linear, float tension) noexcept
+{
+    x = std::clamp (x, 0.0f, 1.0f);
+    const auto y0 = rising ? x : 1.0f - x;
+    const auto y = linear ? y0 : crossfadeCurve (y0);
+    return tension != 0.0f ? fadeTensionCurve (y, tension) : y;
 }
 
 // A comp crossfade (round 177c): sin(x·π/2) — the fade-in and the fade-out (the same curve, mirrored) keep constant
@@ -903,6 +934,129 @@ inline float groupNormalizeGain (const std::vector<float>& peaks) noexcept
     for (auto p : peaks)
         top = std::max (top, p);
     return top == 0.0f ? 0.0f : 1.0f / top;
+}
+
+// FL's audio clip menu › Automate › Panning / Volume (EEAUAutoPanMenuClick 0x1244900, Tag 0 / 1; round 190dx,
+// /mnt/e/lynx-work/flpl190dx/FL-FACTS.md). FL makes an automation clip of a parameter of the clip's channel and puts it
+// where the audio clip is: same track, same start, same length, a flat line at the parameter's current value from the
+// clip's start to its end. FL's parameters are the channel's Misc › "Levels adjustment" pan offset / volume multiplier
+// (channel parameters 0x10 / 0x11; round 190dz: LYNX's AutomationTargetKind::channelAdjust, the same parameters), so the
+// main Pan / Volume knobs stay free. FL's Volume clip sets its range top to unity (half of the multiplier's 0…200 %
+// travel) and the line at that top; LYNX's clips have no range of their own: the line sits at min(value, 0.5) (round
+// 190ey, see automateAudioClip).
+enum class AutomateWhat : std::uint8_t { panning, volume };
+
+inline AutomationTarget automateTarget (const Song& song, int clip, AutomateWhat what)
+{
+    if (clip < 0 || clip >= (int) song.playlist.size())
+        return {};
+    const auto& c = song.playlist[(std::size_t) clip];
+    if (c.kind != ClipKind::audio || c.channel < 0 || c.channel >= (int) song.channels.size())
+        return {};
+    AutomationTarget t;
+    t.kind = AutomationTargetKind::channelAdjust;
+    t.index = c.channel;
+    t.param = what == AutomateWhat::panning ? leveladjust::pan : leveladjust::volume;
+    return t;
+}
+
+// The new clip's name (live check 190ew PL-1 / PL-2): "<channel> - Volume multiplier", and " #2", " #3"... when clips of
+// that target already exist (FL: "Amount Too - Bass - Volume multiplier #2")
+inline std::string automateName (const Song& song, const AutomationTarget& target, const std::string& base)
+{
+    int same = 0;
+    for (const auto& a : song.automations)
+        if (a.target == target && ! a.isLive())
+            ++same;
+    return same == 0 ? base : base + " #" + std::to_string (same + 1);
+}
+
+// Adds that automation clip (named `name`); returns the new automation's index, −1 when `clip` is no audio clip.
+// (Live check 190ew PL-1: FL makes the new clip the Playlist's current clip, the UI's part.) Live check 190ew PL-2 (shot
+// PL-2-automate-volume-147pct-clip-editor.png): FL's Volume clip plays unity whatever the Levels VOL is above it (its
+// range top set to unity, the line at that top: a 147 % multiplier is not kept); below unity the line is at the value.
+// LYNX's clips have no range of their own, so the line sits at min(value, unity) = min(value, 0.5) of the 0…200 % travel.
+
+inline int automateAudioClip (Song& song, int clip, AutomateWhat what, const std::string& name)
+{
+    const auto target = automateTarget (song, clip, what);
+    if (target.kind == AutomationTargetKind::none)
+        return -1;
+    const auto audio = song.playlist[(std::size_t) clip];
+    auto value = std::clamp (song.targetValue (target), 0.0f, 1.0f);
+    if (what == AutomateWhat::volume)
+        value = std::min (value, 0.5f); // (FL: unity at most, live check 190ew PL-2)
+    const auto length = std::max<std::int64_t> (1, audio.length);
+
+    Automation a;
+    a.name = name;
+    a.target = target;
+    a.points = { { 0, value, 0.0f }, { length, value, 0.0f } };
+    song.automations.push_back (std::move (a));
+
+    Clip made;
+    made.kind = ClipKind::automation;
+    made.automation = (int) song.automations.size() - 1;
+    made.track = audio.track;
+    made.start = audio.start;
+    made.length = length;
+    song.playlist.push_back (made);
+    return made.automation;
+}
+
+// ---- "Crossfade with ›" (round 190gw; live check 190gu B3, FL 2026 shots fltails/fl-crossfade-*.png) ----------------
+// The audio clips of OTHER channels that overlap `clip` in time (on any track), in Playlist order: the submenu's list.
+inline std::vector<int> crossfadeCandidates (const Song& song, int clip)
+{
+    std::vector<int> out;
+    if (clip < 0 || clip >= (int) song.playlist.size())
+        return out;
+    const auto& a = song.playlist[(std::size_t) clip];
+    if (a.kind != ClipKind::audio)
+        return out;
+    for (int i = 0; i < (int) song.playlist.size(); ++i)
+    {
+        const auto& b = song.playlist[(std::size_t) i];
+        if (i != clip && b.kind == ClipKind::audio && b.gridSlot < 0 && b.channel != a.channel && b.start < a.end() && a.start < b.end())
+            out.push_back (i);
+    }
+    return out;
+}
+
+// FL's two target links: A's Levels adjustment Volume multiplier through 0.5*Tension(Input,10), B's through
+// 0.5-0.5*Tension(Input,-10) (0.5 = 100 % of the multiplier's 0 to 200 % travel): at the ramp's 1 A plays at 100 % and B is
+// silent, at its 0 the other way round, each with FL's log-shaped fade.
+constexpr const char* crossfadeOutFormula = "0.5*Tension(Input,10)";
+constexpr const char* crossfadeInFormula = "0.5-0.5*Tension(Input,-10)";
+
+// The clip FL makes: "<A> to <B> crossfade" (the two channels' names) on A's track over the time both play, a straight
+// ramp from 1 down to 0, with the two links above. Returns the new automation's index, -1 when they don't overlap or
+// either is not an audio clip of a channel.
+inline int crossfadeWith (Song& song, int clip, int other)
+{
+    const auto candidates = crossfadeCandidates (song, clip);
+    if (std::find (candidates.begin(), candidates.end(), other) == candidates.end())
+        return -1;
+    const auto a = song.playlist[(std::size_t) clip], b = song.playlist[(std::size_t) other];
+    if (a.channel < 0 || a.channel >= (int) song.channels.size() || b.channel < 0 || b.channel >= (int) song.channels.size())
+        return -1;
+    const auto from = std::max (a.start, b.start), to = std::min (a.end(), b.end());
+    Automation automation;
+    automation.name = song.channels[(std::size_t) a.channel].name + " to " + song.channels[(std::size_t) b.channel].name + " crossfade";
+    automation.links = { { { AutomationTargetKind::channelAdjust, a.channel, 0, leveladjust::volume }, crossfadeOutFormula },
+                         { { AutomationTargetKind::channelAdjust, b.channel, 0, leveladjust::volume }, crossfadeInFormula } };
+    automation.target = automation.links.front().target;
+    automation.points = { { 0, 1.0f, 0.0f }, { to - from, 0.0f, 0.0f } };
+    song.automations.push_back (std::move (automation));
+
+    Clip made;
+    made.kind = ClipKind::automation;
+    made.automation = (int) song.automations.size() - 1;
+    made.track = a.track;
+    made.start = from;
+    made.length = std::max<std::int64_t> (1, to - from);
+    song.playlist.push_back (made);
+    return made.automation;
 }
 
 } // namespace lynx::clipops

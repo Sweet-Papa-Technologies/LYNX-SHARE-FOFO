@@ -30,6 +30,9 @@ fi
 ln -s /Applications "$STAGE/Applications"
 [[ -n "$DEMO" && -f "$DEMO" ]] && cp "$DEMO" "$STAGE/Demo.lynx"
 cp LICENSE "$STAGE/LICENSE.txt"
+# third-party notices and licence texts, as in the Windows and Linux packages (round 190nk; 0.1.29's .dmg had LICENSE only)
+cp THIRD_PARTY.md PRIVACY.md "$STAGE/"
+./scripts/collect-licenses.sh "$STAGE/licenses"
 
 if [[ -n "$CERT_LINE" ]]; then
     cat > "$STAGE/Read me first.txt" <<'EOF'

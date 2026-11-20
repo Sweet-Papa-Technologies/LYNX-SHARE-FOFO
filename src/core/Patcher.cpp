@@ -5,6 +5,7 @@
 #include "core/XyController.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -76,7 +77,8 @@ bool sameInstrumentSetup (const ChannelDef& a, const ChannelDef& b)
         case InstrumentKind::flkeys:
             return a.samplePath == b.samplePath && a.zones == b.zones && a.modelParams == b.modelParams && a.sampler.keepPitch == b.sampler.keepPitch
                    && (! a.sampler.keepPitch || (a.sampler.stretchBeats == b.sampler.stretchBeats && a.sampler.stretchMethod == b.sampler.stretchMethod
-                                                  && a.sampler.stretchPitch == b.sampler.stretchPitch && a.sampler.warp == b.sampler.warp));
+                                                  && a.sampler.stretchPitch == b.sampler.stretchPitch && a.sampler.warp == b.sampler.warp
+                                                  && a.sampler.warpModes == b.sampler.warpModes));
         case InstrumentKind::granulizer:
         case InstrumentKind::wavetraveller:
         case InstrumentKind::soundfont: return a.samplePath == b.samplePath;
@@ -239,6 +241,8 @@ struct Graph::Node
     bool sidechain = false;
     int inLatency = 0, outLatency = 0;
     std::vector<int> mainInputs, sideInputs; // wire indices
+    std::atomic<float> peak { 0.0f };       // round 190ld: main-output peak and process time while watched (Graph::watch)
+    std::atomic<std::uint64_t> ns { 0 };
 };
 
 struct Graph::AudioWire
@@ -838,6 +842,14 @@ void Graph::setHeldNotes (const NoteMask* channels, int count) noexcept
             n->effect->setHeldNotes (channels, count);
 }
 
+bool Graph::followsHeldNotes() const noexcept
+{
+    for (const auto& n : nodes)
+        if (n->effect != nullptr && n->effect->followsHeldNotes())
+            return true;
+    return false;
+}
+
 void Graph::noteOn (int key, float velocity) noexcept { deliver (0, true, key, velocity, -1); }
 void Graph::noteOff (int key) noexcept { deliver (0, false, key, 0.0f, -1); }
 void Graph::noteOnMidi (int key, float velocity, int midiChannel) noexcept { deliver (0, true, key, velocity, midiChannel); }
@@ -929,7 +941,23 @@ void Graph::forLayeredTargets (const std::vector<MidiTarget>& targets, int type,
     }
 }
 
-bool Graph::zoneGate (int zone, bool on, int key, int midiChannel, float& velocity) noexcept
+void Graph::choke (int zone) noexcept
+{
+    // Live's choke groups (round 190ec): a pad that starts a note stops every other pad of its group (their
+    // instruments' cut: the sampler's short declick, as an FL cut group)
+    const auto& self = zoneStates[(std::size_t) zone].zone;
+    for (std::size_t z = 0; z < zoneStates.size(); ++z)
+    {
+        const auto& other = zoneStates[z].zone;
+        if ((int) z == zone || other.choke != self.choke || other.chokeNode < 0 || other.chokeNode == self.chokeNode
+            || other.chokeNode >= (int) nodes.size())
+            continue;
+        if (auto& i = nodes[(std::size_t) other.chokeNode]->instrument)
+            i->cut();
+    }
+}
+
+bool Graph::zoneGate (int zone, bool on, int& key, int midiChannel, float& velocity) noexcept
 {
     if (zone < 0 || zone >= (int) zoneStates.size())
         return true;
@@ -941,6 +969,8 @@ bool Graph::zoneGate (int zone, bool on, int key, int midiChannel, float& veloci
         if ((s.held[k] & bit) == 0)
             return false;
         s.held[k] = (std::uint16_t) (s.held[k] & ~bit);
+        if (s.zone.playKey >= 0)
+            key = s.zone.playKey;
         return true;
     }
     const auto& surface = active->surface;
@@ -952,6 +982,10 @@ bool Graph::zoneGate (int zone, bool on, int key, int midiChannel, float& veloci
         return false;
     velocity = v;
     s.held[k] = (std::uint16_t) (s.held[k] | bit);
+    if (s.zone.choke > 0)
+        choke (zone);
+    if (s.zone.playKey >= 0)
+        key = s.zone.playKey;
     return true;
 }
 
@@ -961,7 +995,7 @@ void Graph::deliver (int pin, bool on, int key, float velocityIn, int midiChanne
         return;
     forLayeredTargets (pinTargets[(std::size_t) pin], on ? 1 : 0, key, [&] (const MidiTarget& t, int k, float gain, float pan, float cents, bool viaLayer) {
         auto velocity = velocityIn;
-        if (t.zone >= 0 && ! zoneGate (t.zone, on, k, midiChannel, velocity))
+        if (t.zone >= 0 && ! zoneGate (t.zone, on, k, midiChannel, velocity)) // (k: a Drum Rack pad's Play note)
             return;
         if (t.vfx)
         {
@@ -1252,14 +1286,54 @@ std::shared_ptr<Instrument> Graph::instrumentAt (int node) const
     return node >= 0 && node < (int) nodes.size() ? nodes[(std::size_t) node]->instrument : nullptr;
 }
 
+namespace
+{
+std::uint64_t nowNs() noexcept
+{
+    return (std::uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds> (std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+float blockPeak (const float* l, const float* r, int n) noexcept
+{
+    float p = 0.0f;
+    for (int i = 0; i < n; ++i)
+        p = std::max (p, std::max (std::abs (l[i]), std::abs (r[i])));
+    return p;
+}
+void raisePeak (std::atomic<float>& a, float p) noexcept
+{
+    if (p > a.load (std::memory_order_relaxed))
+        a.store (p, std::memory_order_relaxed);
+}
+} // namespace
+
+float Graph::takeNodePeak (int node) noexcept
+{
+    return node >= 0 && node < (int) nodes.size() ? nodes[(std::size_t) node]->peak.exchange (0.0f, std::memory_order_relaxed) : 0.0f;
+}
+
+std::uint64_t Graph::nodeNanoseconds (int node) const noexcept
+{
+    return node >= 0 && node < (int) nodes.size() ? nodes[(std::size_t) node]->ns.load (std::memory_order_relaxed) : 0u;
+}
+
 void Graph::process (const float* inL, const float* inR, const float* scL, const float* scR, float* outL, float* outR, int n, double bpm) noexcept
 {
+    const auto watched = watchLeft.load (std::memory_order_relaxed) > 0; // round 190ld (View › Activity / Performance)
+    const auto start = watched ? nowNs() : 0u;
+    if (watched)
+        raisePeak (inputPeak, blockPeak (inL, inR, n));
     for (int done = 0; done < n; done += capacity)
     {
         const auto piece = std::min (capacity, n - done);
         pieceOffset = hwOffset + done;
         processPiece (inL + done, inR + done, scL != nullptr ? scL + done : nullptr, scR != nullptr ? scR + done : nullptr, outL + done,
                       outR + done, piece, bpm);
+    }
+    if (watched)
+    {
+        graphNs.fetch_add (nowNs() - start, std::memory_order_relaxed);
+        framesWatched.fetch_add ((std::uint64_t) n, std::memory_order_relaxed);
+        watchLeft.fetch_sub (n, std::memory_order_relaxed);
     }
 }
 
@@ -1547,6 +1621,13 @@ void Graph::renderNodes (const float* inL, const float* inR, const float* scL, c
     auto* inBufR = scratch[1].data();
     auto* scBufL = scratch[2].data();
     auto* scBufR = scratch[3].data();
+    const auto watched = watchLeft.load (std::memory_order_relaxed) > 0; // round 190ld: per node (View › Activity / Performance)
+    std::uint64_t nodeStart = 0;
+    auto measured = [&] (Node& node, const float* l, const float* r) {
+        const auto end = nowNs();
+        node.ns.fetch_add (end - nodeStart, std::memory_order_relaxed);
+        raisePeak (node.peak, blockPeak (l, r, n));
+    };
 
     for (const auto i : order)
     {
@@ -1554,6 +1635,8 @@ void Graph::renderNodes (const float* inL, const float* inR, const float* scL, c
         auto& v = values.nodes[(std::size_t) i];
         auto* oL = node.out[0][0].data() + start;
         auto* oR = node.out[0][1].data() + start;
+        if (watched)
+            nodeStart = nowNs();
 
         if (node.generator)
         {
@@ -1561,6 +1644,8 @@ void Graph::renderNodes (const float* inL, const float* inR, const float* scL, c
             std::fill (oR, oR + n, 0.0f);
             if (node.instrument != nullptr)
                 node.instrument->render (oL, oR, n, 1.0f, 1.0f);
+            if (watched)
+                measured (node, oL, oR);
             continue;
         }
 
@@ -1600,6 +1685,8 @@ void Graph::renderNodes (const float* inL, const float* inR, const float* scL, c
                     hR[k] *= g;
                 }
         }
+        if (watched)
+            measured (node, oL, oR);
     }
 
     // "To LYNX SHARE": the main output and the extra ones
@@ -1666,6 +1753,7 @@ public:
         side = l != nullptr && r != nullptr;
     }
     void setHeldNotes (const NoteMask* channels, int count) noexcept override { graph.setHeldNotes (channels, count); }
+    bool followsHeldNotes() const noexcept override { return graph.followsHeldNotes(); } // (round 190kz)
     int latencySamples() const noexcept override { return graph.latencySamples(); }
 
     Graph graph;

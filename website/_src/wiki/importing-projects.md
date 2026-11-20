@@ -18,8 +18,8 @@ status: full
 | Format | Converted | Not converted |
 |---|---|---|
 | `.flp` (FL Studio) | Channels, samples, patterns, slide and porta notes, every arrangement, markers, time-signature changes, automation, controller links, the Mixer with routing, sidechains, track EQ and native effects | FLEX packs are encrypted and never opened. A FLEX channel gets a synth patch chosen by its preset name |
-| `.als` (Live 11 and 12) | MIDI, audio, group and return tracks, tempo, time signature, locators, the loop, volume, pan, mute, solo and sends with their automation, Session clips and scenes, warp markers | Live's own effects are dropped. Racks keep only their first chain. Simpler, Sampler and drum racks become LYNX SHARE samplers |
-| `.flm` (FL Studio Mobile) | Tempo, time signature, one mixer insert per channel, one Playlist track per lane, patterns, audio clips with offset and pitch, drum kits, DW Sampler samples and `.dwp` programs | FLM's effects and automation lanes. Other FLM generators play the built-in synth |
+| `.als` (Live 11 and 12) | MIDI, audio, group and return tracks, tempo, time signature, locators, the loop, volume, pan, mute, solo and sends with their automation, Session clips and scenes, warp markers, racks and Drum Racks, and many of Live's own devices (EQ Eight, Compressor, Glue Compressor, Reverb, Delay, Auto Filter, Saturator, Utility, Simpler, Drift and more) as LYNX SHARE's own | Live's devices with no LYNX SHARE equivalent (Hybrid Reverb, Grain Delay, Amp, Roar, FM Operator patches and others) are dropped and listed. MIDI Effect Racks are not converted |
+| `.flm` (FL Studio Mobile) | Tempo, time signature, one mixer insert per channel, one Playlist track per lane, patterns, audio clips with offset and pitch, drum kits, DW Sampler and `.dwp` programs, the Slicer, MiniSynth, Transistor Bass, 3x Osc, GMSynth and SuperSaw, the effects, the automation and the chord sets | Other FLM generators play the built-in synth |
 | `.mid` | Notes, time signatures and every tempo change | A MIDI file carries no sounds: channels get the LYNX SHARE synth or a MIDI Out channel |
 
 Third-party VST2, VST3 and CLAP plugins in an `.flp`, and VST2 and VST3 plugins in an `.als`, load with their saved state if the same plugin is installed on your computer.
@@ -29,6 +29,12 @@ Third-party VST2, VST3 and CLAP plugins in an `.flp`, and VST2 and VST3 plugins 
 FL Studio's generators and effects are not loaded. LYNX SHARE reads their saved settings and plays them on engines it recreated. Each engine has a quality level, from `Exact` (bit-identical to the original on every state tested) down to `Placeholder` (the settings are kept, but the plugin is silent or passes audio through). The levels are explained in [Coming from FL Studio](/wiki/coming-from-fl-studio/).
 
 Opening an `.flp` works without FL Studio installed. Some engines need waves, samples or impulses that are read from your own FL Studio installation at run time.
+
+An `.flp` that uses FL Studio's "FL Studio Mobile Rack" (FL Studio Mobile's own "Save as FLP" writes one per instrument track) plays its instrument and effects on the same engines as an `.flm`, and the "FL Studio Mobile Rack FX" effect too. A rack with a drum kit or several instruments still plays the built-in synth.
+
+## FL Studio Mobile factory sounds
+
+The factory sounds an `.flm` uses (drum kits, DirectWave programs, SoundFonts, the GMSynth waves) belong to FL Studio Mobile and are never shipped with LYNX SHARE. LYNX SHARE looks for them in your own copy of the app's `Resources` folder: add it under `Settings › Files › FL Studio Mobile resources` (picking the folder above it, or an FL Studio installation folder, also works). FL Studio's install holds only part of them, and is searched after your folders. Files that are still missing are listed in the Missing files window.
 
 ## Missing samples
 

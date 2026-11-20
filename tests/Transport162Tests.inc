@@ -73,7 +73,7 @@ TEST (transport162_piano_roll_playhead)
 
     // Pattern mode: the current pattern loops; another pattern is not playing
     song.mode = lynx::PlayMode::pattern;
-    const auto len = (double) song.patterns[0].effectiveLength (4);
+    const auto len = (double) song.patterns[0].effectiveLength (lynx::Meter (4, 4));
     CHECK (std::abs (patternPlayhead (song, 0, len + 100.0) - 100.0) < 1e-9);
     CHECK (patternPlayhead (song, 1, 100.0) < 0.0);
 
@@ -208,6 +208,8 @@ TEST (transport162_follow_and_stop)
 TEST (transport162_meter_scale_marks)
 {
     using namespace lynx::meters;
+    // (round 190mf: the straight -60 … +6 dB axis is the Clip-launch and Simple layouts' scale; Pattern uses FL's law)
+    lynx::layoutstyle::setCurrent (lynx::layoutstyle::Style::clipLaunch);
     CHECK (scalePosition (-60.0f) == 0.0f && scalePosition (6.0f) == 1.0f && std::abs (scalePosition (0.0f) - 60.0f / 66.0f) < 1e-6f);
     // a tall meter shows the whole FL-like set, top down
     const auto tall = scaleMarks (400.0f, 11.0f);
@@ -223,4 +225,5 @@ TEST (transport162_meter_scale_marks)
         for (std::size_t i = 1; i < marks.size(); ++i)
             CHECK ((scalePosition ((float) marks[i - 1]) - scalePosition ((float) marks[i])) * h >= 11.0f - 1e-3f);
     }
+    lynx::layoutstyle::setCurrent (lynx::layoutstyle::Style::pattern);
 }

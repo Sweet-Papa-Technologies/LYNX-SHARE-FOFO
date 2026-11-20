@@ -54,12 +54,12 @@ void changeMute (Song& song, const std::vector<int>& clips, MuteChange change);
 void changeGain (Song& song, const std::vector<int>& clips, float value, bool relative);
 
 // Positions and lengths as the window shows them, "bar:beat:tick" (ticks at LYNX's PPQ); a position counts from 1 ("1:1:000" is the start), a length from 0 ("2:0:000" = two bars). Time signature
-// changes from markers are not applied (bars of `beatsPerBar` beats).
-std::string formatPosition (std::int64_t ticks, int beatsPerBar);
-std::string formatLength (std::int64_t ticks, int beatsPerBar);
+// changes from markers are not applied (bars and beats of `meter`; round 190fg: 6/8 counts eighths).
+std::string formatPosition (std::int64_t ticks, Meter meter);
+std::string formatLength (std::int64_t ticks, Meter meter);
 // The inverse; also accepts "bar" or "bar:beat". -1 when the text is not a time.
-std::int64_t parsePosition (const std::string& text, int beatsPerBar);
-std::int64_t parseLength (const std::string& text, int beatsPerBar);
+std::int64_t parsePosition (const std::string& text, Meter meter);
+std::int64_t parseLength (const std::string& text, Meter meter);
 
 // Sources a clip of this kind can switch to: their names (patterns / audio channels / automations).
 std::vector<std::pair<int, std::string>> sourcesFor (const Song& song, ClipKind kind);
@@ -111,7 +111,8 @@ namespace lynx::trackmodes
 {
 // A mixer track nothing uses yet (no channel routed to it, no track linked to it, no effects, nothing sent into it),
 // from insert 1 on; a new insert is added when there is none and the mixer has room. -1 when the mixer is full
-// (FL: "Can't create new audio or instrument track: no available mixer tracks").
+// (FL: "Can't create new audio or instrument track: no available mixer tracks"). In an online session an insert
+// reserved for another participant is never taken (Song::nextFreeInsert's rule).
 int freeMixerTrack (Song& song);
 // "Track mode › Audio track": links the track to a free mixer track (named and coloured after the track). False when
 // no mixer track is free.
@@ -119,8 +120,75 @@ bool makeAudioTrack (Song& song, int track);
 // "Track mode › Instrument track": the track belongs to `channel` (an instrument, not an audio clip or automation
 // channel) and to its mixer track (a free one when the channel plays on the Master or on a track already linked).
 bool makeInstrumentTrack (Song& song, int track, int channel);
+// "Track mode › Audio track › N. <insert>" (FL 2026: the submenu lists the mixer tracks; issue #15's "route the track
+// itself to 14"; REA round 190cp, FUN_012f38f0): the track becomes an audio track linked to mixer track `mixer` (an
+// instrument track too: its channel stays where it is), and the track and the insert end with one name and colour:
+// - an unassigned track first takes the insert's own name (hasOwnName) when it has one, the insert's colour when its
+//   own is the default, and "Insert N" when neither has a name;
+// - an audio track's previous insert goes back to its default name ("Insert N") and colour (its effects and routing
+//   stay);
+// - then a track without a name takes the insert's name and colour, otherwise the insert takes the track's.
+// The audio clips already on the track follow it (followAudioTracks). False when canLinkToMixerTrack says no; the
+// insert the track already has changes nothing.
+bool linkToMixerTrack (Song& song, int track, int mixer);
+// Whether `track` can be linked to `mixer`: an existing insert (never the Master), not linked to another Playlist
+// track (one track per insert, as makeAudioTrack keeps it) and not reserved for another participant of an online
+// session.
+bool canLinkToMixerTrack (const Song& song, int track, int mixer);
+// Whether insert `mixer` carries a name of its own: a stored name other than the default "Insert <its number>".
+bool hasOwnName (const Song& song, int mixer);
+// FL's "New mixer track(s)" is enabled: the mixer has room for another insert (in an online session, one not
+// reserved for another participant).
+bool canAddMixerTrack (const Song& song);
+// Appends an insert past the last one (skipping inserts reserved for another participant) and returns it; -1 (and no
+// change) when canAddMixerTrack says no.
+int addMixerTrack (Song& song);
+constexpr int newMixerTrack = -1;
+// FL's Track mode › Audio track pick (FUN_012ec590, one undo step "assign to audio track(s)"): the first of `tracks`
+// is linked to `mixer` (newMixerTrack: a new insert, FL's "New mixer track(s)"), each next one to the next insert no
+// Playlist track is linked to, new inserts past the last one, up to the mixer's limit. Returns how many were linked.
+int assignAudioTracks (Song& song, const std::vector<int>& tracks, int mixer);
+// The Audio track submenu as FL builds it (FUN_0122eff0): "New mixer track(s)" (enabled while canAddMixerTrack), a
+// separator, then one entry per insert from 1 on: "N. <name>" ("N. Insert N" without a name), ticked when it is the
+// track's stored link, greyed when it is not and the insert is linked to another track (LYNX: or reserved for another
+// participant of an online session). The text of a greyed entry is not changed.
+struct AudioTrackMenuItem
+{
+    int mixer = 0;
+    std::string name; // the insert's stored name (empty: show "Insert N")
+    bool enabled = false, ticked = false;
+};
+struct AudioTrackMenu
+{
+    bool canAddMixerTrack = false;
+    std::vector<AudioTrackMenuItem> inserts;
+};
+AudioTrackMenu audioTrackMenu (const Song& song, int track);
 // "Track mode › Unassigned".
 void unassign (Song& song, int track);
+// --- FL's new audio / instrument tracks (round 190dx; FLEngine 2026 [DECOMP], /mnt/e/lynx-work/flpl190dx/FL-FACTS.md) ---
+// The first Playlist track that has no clip and is unassigned (FUN_012e8380: tracks 1..500 in FL's count), -1 when
+// all 500 are taken. New audio and instrument tracks go there.
+int firstFreeTrack (const Song& song);
+// The Playlist's "+" › "Add audio track" and its right click (AddAudioTrackMenuClick → FUN_012e3640): the first free
+// track, linked to a mixer track nothing uses (freeMixerTrack) as Track mode › Audio track links it (FUN_012ec590).
+// Returns the track, or -1 with nothing changed (no free track, or no free mixer track).
+int addAudioTrack (Song& song);
+// Whether `channel` can have an instrument track (FL: generators only; not audio clip or automation channels).
+bool canBeInstrumentTrack (const Song& song, int channel);
+// The Playlist tracks that are instrument tracks of `channel`.
+std::vector<int> instrumentTracksOf (const Song& song, int channel);
+// The Channel rack menu's "Assign to new instrument track" (LineAssignInstrTrackMenuClick Tag 0 → FUN_013036e0 with
+// track −1): the first free track becomes the channel's instrument track (makeInstrumentTrack). Returns the track, or
+// −1 with nothing changed.
+int assignToNewInstrumentTrack (Song& song, int channel);
+// The same item while the channel has an instrument track: "Unassign from instrument track" (Tag 1 → FUN_01303e30):
+// each of its instrument tracks goes back to unassigned. Returns how many.
+int unassignFromInstrumentTracks (Song& song, int channel);
+// A new instrument track playing a new channel of `generator` (the "+" menu's / Track mode › Instrument track's "More
+// plugins..." and generator list: FUN_012e34d0 / FUN_00e71980): on `track` (an unassigned or audio track), or on the
+// first free track when `track` < 0. Returns the new channel, or −1 with nothing changed.
+int addInstrumentTrack (Song& song, ChannelDef generator, int track = -1);
 // The pattern the pencil places on an instrument track (REA round 151 [EXEC FL 2026: drawing on an instrument track
 // places a pattern named after its channel, made on the first click, empty and one bar long; every later click
 // places the same pattern; its piano roll is that channel's]): the pattern named after the track's channel whose
@@ -189,6 +257,100 @@ bool dropOnHeader (Song& song, int track, const std::string& path, const std::st
 // "Consolidate track(s)" moved to core/QuickRender.h (round 168e: FL's new track above, the old one grouped and muted).
 } // namespace lynx::trackmodes
 
+// LYNX extra (round 190gz, issue #170): "Link Playlist tracks to mixer tracks" (Song::linkTracksToMixer). FL keeps
+// Playlist tracks and mixer inserts apart; every other DAW pairs them. With the switch on, a Playlist track that holds
+// clips is made FL's own audio or instrument track (trackmodes), so nothing new is stored per track and an .flp export
+// stays an ordinary FL project. The rules never change how the song sounds:
+// - audio clips (with or without automation clips) whose channels all play through one insert M that no other track is
+//   linked to: an audio track linked to M; all on the Master: an audio track linked to insert N (the track's own
+//   number) when N is unused and neutral, else to the first such insert (a new one when the mixer has room), and their
+//   channels are routed there;
+// - pattern clips (with or without automation clips) of one generator channel that has no instrument track yet: its
+//   instrument track, on the channel's insert, or (channel on the Master) on insert N / the first unused neutral one;
+// - anything else (no clips, automation only, several channels' patterns, audio and patterns mixed, a route to an insert
+//   another track is linked to) stays unassigned, as in FL.
+// Tracks already linked are never changed.
+namespace lynx::autolink
+{
+// The rule (round 190ib, issue #170 follow-up; it replaces round 190gz's "link where it changes nothing"): while the
+// switch is on, Playlist track N is mixer insert N.
+// - Every instrument and sample lives on one track, its home: the first track (from the top) whose clips play it (audio
+//   clips, the notes of pattern clips; automation clips don't count). What a track's own instruments and samples play
+//   goes through its insert: Track N's header M / S / volume / pan ARE insert N's.
+// - A track with content of its own is linked to insert N with FL's own track modes (an instrument track when it plays
+//   one generator, else an audio track), so an .flp keeps the links. Track and insert carry one name and colour.
+// - A track that only repeats patterns or samples of tracks above it has nothing of its own: it stays unassigned (FL's
+//   LED mutes its clips) and plays through its home track's insert (repeatedTracks; the header says so).
+// - Switching on moves what is needed, keeping the sound wherever it can (every step is listed in a Report, the UI asks
+//   first, and it is one undo step): an insert at N that belongs to something else moves to a free insert (a swap: all
+//   that refers to it follows); a track whose content all plays through one insert with effects or settings of its own
+//   (or the insert it is already linked to) gets that insert moved to N; an insert with settings of its own that only
+//   the track uses sends into N; channels on the Master, on neutral inserts or on inserts other tracks share move to N.
+//   Only the last case can change the sound (a channel leaves a shared insert's effects): Change::changesSound.
+// An insert whose settings are the defaults (no effects; level, pan, mute, solo, EQ, phase, latency, I/O as new) and that
+// outputs to the Master only: content routed through it sounds as on the Master.
+bool isNeutral (const Song& song, int mixer);
+// isNeutral, and nothing uses it (no channel, linked track, send into it) and not reserved in an online session.
+bool isNeutralFree (const Song& song, int mixer);
+// The insert a Playlist track is linked to (an audio track's; an instrument track's channel's), -1 when unassigned.
+int linkedInsertOf (const Song& song, int track);
+// Each channel's home track (-1: no track plays it).
+std::vector<int> homeTracks (const Song& song);
+// Per track (0..499): the home track whose instruments it only repeats, -1 for a track with content of its own or none.
+std::vector<int> repeatedTracks (const Song& song);
+
+struct Change
+{
+    enum class Kind
+    {
+        linkTrack,    // `track` linked to insert `to` (channel: the instrument track's channel, else -1); name = its name
+        moveInsert,   // insert `from` (name: its own name, "" for the default one) moved to `to` (a swap)
+        routeInsert,  // insert `from` (name as above) now sends into `to` instead of the Master
+        routeChannel  // channel `channel` (name) from insert `from` (0 = Master) to `to`
+    } kind = Kind::linkTrack;
+    int track = -1, channel = -1, from = -1, to = -1;
+    std::string name;
+    bool changesSound = false; // the channel leaves an insert with effects or settings of its own (or N has some)
+};
+struct Report
+{
+    std::vector<Change> changes;
+    std::vector<std::pair<int, int>> repeats; // (track, home track): tracks that only repeat a track above them
+    bool changesRouting() const;              // anything besides links
+    bool changesSound() const;
+};
+// Turns the switch on and pairs every track (lowest first); `report` collects what was done. Returns how many tracks were
+// newly linked. Off: only the switch (the links stay: they are FL track modes; Undo takes the whole step back).
+int setOn (Song& song, bool on, Report* report = nullptr);
+// What setOn would do (nothing is changed): the UI's confirmation lists it.
+Report planOn (const Song& song);
+// Before an edit (AudioEngine::editSong), so the edit's new content can follow (followNewContent).
+struct Snapshot
+{
+    bool on = false;
+    std::vector<int> homes; // homeTracks
+    struct Pair
+    {
+        int track = -1, mixer = -1;
+        std::string trackName;
+        std::uint32_t trackColour = 0;
+        std::string insertName;
+        std::uint32_t insertColour = 0;
+    };
+    std::vector<Pair> pairs; // the linked tracks and their inserts' names and colours
+};
+Snapshot snapshot (const Song& song);
+// After an edit while the switch is on: a renamed (recoloured) linked track renames its insert and the other way round;
+// an instrument or sample no track played before (a first clip, the first notes of a pattern, a channel whose clips all
+// moved to another track) goes through its home track's insert, linking that track when it has no link yet — only where
+// that changes nothing that already sounded. A track set to Track mode › Unassigned that had content stays unassigned.
+// Returns how many tracks were newly linked.
+int followNewContent (Song& song, const Snapshot& before);
+// Recording (core/TakeRecording.h) while the switch is on: the Playlist track a take of insert `insert` goes to when no
+// audio track is linked to it yet — track insert − 1 when it is unassigned, ungrouped and holds no clip; -1 otherwise.
+int pairedTakeTrack (const Song& song, int insert);
+} // namespace lynx::autolink
+
 // Audio clips and the channels they play (round 190ax).
 namespace lynx::audioclips
 {
@@ -202,7 +364,9 @@ namespace lynx::audioclips
 int repairChannels (Song& song);
 // The same channel loads another file: an audio clip channel stays one (FL: the channel's type does not change with
 // its sample), a Granulizer / Wave Traveller keeps its engine, every other channel becomes a Sampler named after it.
-void loadSampleInto (ChannelDef& channel, const std::string& path, const std::string& name);
+// `autoName`: FL's General › "Auto name channels" (on by default; round 190bx, core/FlSettings.h): off = the
+// channel keeps the name it has (a channel without one still takes the file's).
+void loadSampleInto (ChannelDef& channel, const std::string& path, const std::string& name, bool autoName = true);
 } // namespace lynx::audioclips
 
 // FL's "Create automation clip" placement (REA round 177b: FUN_01191a50 places it, FUN_00e50b50 picks the track).
@@ -229,6 +393,20 @@ struct Place
 // track: the first one, from the top, with no clips at all (checked live in FL 2026: a free gap on a used track is not
 // taken; instrument tracks take no automation clips: FL's "Instrument tracks are not for audio or automation clips.").
 Place forNewClip (const Song& song, bool atPlayback, std::int64_t playTick);
+
+// The colour FL gives a NEW automation clip (Automation::colour, ARGB): by parameter, not the channel's (live check 190iw
+// Q4, four clips made with "Create automation clip" from Channel rack knobs: volume #8C5F5F / #8D5F5F, pan #7F8C5E /
+// #808D5F, whatever the channel's colour; HSV s 0.33, v 0.55, hue 0 / 77). Other targets were not sampled: 0 = FL's
+// default channel grey #485156, as before.
+constexpr std::uint32_t colourFor (const AutomationTarget& target) noexcept
+{
+    switch (target.kind)
+    {
+        case AutomationTargetKind::channelVolume: return 0xff8c5f5fu;
+        case AutomationTargetKind::channelPan:    return 0xff7f8c5eu;
+        default:                                  return 0;
+    }
+}
 } // namespace lynx::autoclipplace
 
 // Round 177b: optional automation lanes under Playlist tracks (Song.h AutomationLane). Plain edits for editSong.

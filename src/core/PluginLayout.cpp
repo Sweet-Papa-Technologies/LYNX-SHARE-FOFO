@@ -469,7 +469,9 @@ Layout fruityMultiband()
     v.push_back (knob (50, 118, 34, "Output gain", TR_NOOP ("Gain"), 144, bipolar));
     v.push_back (section (79, 7, 200, 142, nullptr, boxed));
     v.push_back (display (83, 11, 192, 78, "multiband"));
-    v.push_back (label (86, 90, 186, 12, TR_NOOP ("Crossovers"), dim));
+    // round 190mk (DP-30, capture 190mf A3 fl-mbc-playing.png): FL's SPEED slider under the display (the scroll rate of
+    // the peak display; 0 = off, the cutoff graph only), where LYNX had the "Crossovers" caption
+    v.push_back (display (86, 90, 186, 12, "mbspeed"));
     v.push_back (knob (103, 121, 34, "Low crossover", nullptr, 0, noCaption));
     v.push_back (knob (153, 121, 34, "Mid lower crossover", nullptr, 0, noCaption));
     v.push_back (knob (203, 121, 34, "Mid upper crossover", nullptr, 0, noCaption));
@@ -736,6 +738,7 @@ Layout grossBeat()
     v.push_back (label (56, 20, 70, 20, TR_NOOP ("Time"), alignLeft));
     v.push_back (display (189, 12, 72, 72, "gbjog"));
     v.push_back (toggle (113, 62, 62, 28, "Hold", TR_NOOP ("Hold"), boxed));
+    v.push_back (display (9, 66, 20, 20, "gbopts")); // round 190ee: FL's Options button (DFM OptionsBtn at 7, 66)
     // round 168m: the two slot grids draw each slot's name over a thumbnail of its envelope (FL's grids of 4 × 9)
     v.push_back (display (13, 103, 246, 162, "gbtimegrid"));
     v.push_back (display (13, 276, 246, 162, "gbvolumegrid"));
@@ -1881,15 +1884,21 @@ Layout ridgeStrip()
         v.push_back (section (4, y, 276, 98, names[b]));
         v.push_back (dial (54, y + 44.0f, 36, gains[b], TR_NOOP ("Gain"), bipolar));
         v.push_back (dial (140, y + 44.0f, 36, freqs[b], TR_NOOP ("Freq")));
-        if (b == 1 || b == 2)
-            v.push_back (dial (226, y + 44.0f, 30, extra[b], TR_NOOP ("Q")));
+        if (b == 1 || b == 2) // (round 190le: the 32C's mid bands have no Q control: their Q follows the gain)
+            v.push_back (when (dial (226, y + 44.0f, 30, extra[b], TR_NOOP ("Q")), "32C voicing", 0.0f, 0.5f));
         else
             v.push_back (toggle (194, y + 34.0f, 72, 20, extra[b], TR_NOOP ("Bell")));
     }
     v.push_back (section (4, 520, 276, 124, TR_NOOP ("Equalizer")));
     // round 165: the Brown / Black curves are Ridge's own engine's (the E console voicing has the console's one curve)
     // (round tp172c: two conditions at most — the 4K and Modern voicings; in the E voicing the curve has no effect)
-    v.push_back (when (when (tabs (10, 548, 150, 20, "EQ curve", TR_NOOP ("Brown|Black")), "4K voicing", 0.0f, 0.5f), "Modern voicing", 0.0f, 0.5f));
+    {
+        auto c = when (when (tabs (10, 548, 150, 20, "EQ curve", TR_NOOP ("Brown|Black")), "4K voicing", 0.0f, 0.5f), "Modern voicing", 0.0f, 0.5f);
+        c.idleParam = "32C voicing"; // round 190le: the 32C voicing has its own curve (dimmed: it does nothing there)
+        c.idleMin = 0.5f;
+        c.idleMax = 1.0f;
+        v.push_back (c);
+    }
     // round tp172c: the Modern voicing (the console measured on the SSL Native Channel Strip 2 trial) — the curve picks its
     // E / G EQ type; its compressor's peak detector, the gate's hold and the make-up offset join the dynamics
     v.push_back (when (tabs (10, 548, 150, 20, "EQ curve", TR_NOOP ("E type|G type")), "Modern voicing", 0.5f, 1.0f));
@@ -1901,6 +1910,9 @@ Layout ridgeStrip()
     // its gain, the make-up offset; the rest of the panel drives it with the console's own scales
     v.push_back (when (when (tabs (10, 548, 150, 20, "EQ colour", TR_NOOP ("Brown|Black|Orange")), "4K voicing", 0.5f, 1.0f), "Modern voicing", 0.0f, 0.5f));
     v.push_back (toggle (170, 584, 104, 20, "4K voicing", TR_NOOP ("4K console")));
+    // round 190le: the 32C voicing (Ridge's own engine with the EQ measured on the Harrison 32Classic trial: its filters,
+    // first-order shelves and matched bells; the EQ dials read the original's) — a switch like the 4K and Modern ones
+    v.push_back (toggle (10, 620, 150, 20, "32C voicing", TR_NOOP ("32C console")));
     v.push_back (when (when (dial (652, 52, 24, "Make-up offset", TR_NOOP ("Offset"), bipolar), "4K voicing", 0.5f, 1.0f), "Modern voicing", 0.0f, 0.5f));
     v.push_back (toggle (170, 548, 104, 20, "EQ on", TR_NOOP ("EQ in")));
     // round 123: the voicing — Ridge's own engine, or the measured E-type console (substitutes start there)
@@ -2036,10 +2048,17 @@ Layout glowLeveler()
     // round 123: the voicing — Glow's own engine, or the measured classic opto leveler (substitutes start there);
     // round 152 / 165w: the classic voicing's opto law and release (Old = a project saved before that round)
     // (review: one compact group of small muted keys where the original has only its badge)
-    v.push_back (tabs (14, 18, 112, 14, "Voicing", TR_NOOP ("Modern|Opto classic"), {}, compactKeys));
-    v.push_back (when (tabs (14, 36, 112, 14, "Opto law", TR_NOOP ("Old|Measured"), {}, compactKeys), "Voicing", 0.5f, 1.0f));
-    v.push_back (when (label (14, 54, 112, 9, TR_NOOP ("Attack / release"), dim), "Voicing", 0.5f, 1.0f)); // round 165x: both measured
-    v.push_back (when (tabs (14, 64, 112, 14, "Opto release", TR_NOOP ("Old|Measured"), {}, compactKeys), "Voicing", 0.5f, 1.0f));
+    v.push_back (tabs (14, 14, 112, 12, "Voicing", TR_NOOP ("Modern|Opto classic"), {}, compactKeys));
+    v.push_back (when (tabs (14, 29, 112, 12, "Opto law", TR_NOOP ("Old|Measured"), {}, compactKeys), "Voicing", 0.5f, 1.0f));
+    v.push_back (when (label (14, 44, 112, 9, TR_NOOP ("Attack / release"), dim), "Voicing", 0.5f, 1.0f)); // round 165x: both measured
+    v.push_back (when (tabs (14, 53, 112, 12, "Opto release", TR_NOOP ("Old|Measured"), {}, compactKeys), "Voicing", 0.5f, 1.0f));
+    // round 190dm: the cell's memory (release slower after long exposure; Compress)
+    v.push_back (when (label (14, 68, 112, 9, TR_NOOP ("Cell memory"), dim), "Voicing", 0.5f, 1.0f));
+    v.push_back (when (tabs (14, 77, 112, 12, "Opto memory", TR_NOOP ("Off|On"), {}, compactKeys), "Voicing", 0.5f, 1.0f));
+    // round 190fx: the side chain's weighting (Old = the voicing's treble emphasis; Measured = the even weighting); the four
+    // key groups 12 px high so the column ends above the COMPRESS caption
+    v.push_back (when (label (14, 92, 112, 9, TR_NOOP ("Side chain"), dim), "Voicing", 0.5f, 1.0f));
+    v.push_back (when (tabs (14, 101, 112, 12, "SC weighting", TR_NOOP ("Old|Measured"), {}, compactKeys), "Voicing", 0.5f, 1.0f));
     // COMPRESS / LIMIT: a bat toggle (up = compress), its two words above and under it
     v.push_back (tabs (40, 136, 52, 84, "Limit", TR_NOOP ("Compress|Limit"), {}, batToggle));
     // the two big knobs, their printed 0 … 100 round them; no value text (the drag tip shows it)
@@ -2077,9 +2096,9 @@ Layout hushDeEsser()
 {
     Layout l;
     l.width = 460;
-    l.height = 376; // round 165x: + the extended law's row
+    l.height = 432; // round 165x: + the extended law's row; round 190dm: + Air / Mix
     auto& v = l.items;
-    v.push_back (section (4, 4, 452, 368, TR_NOOP ("De-esser")));
+    v.push_back (section (4, 4, 452, 424, TR_NOOP ("De-esser")));
     v.push_back (display (12, 26, 200, 78, "hushband"));
     v.push_back (meter (12, 110, 200, 12, 0, TR_NOOP ("Reduction")));
     v.push_back (tabs (12, 130, 98, 20, "Wideband", TR_NOOP ("Split|Wide")));
@@ -2115,6 +2134,9 @@ Layout hushDeEsser()
     v.push_back (tabs (12, 318, 200, 20, "Range law", TR_NOOP ("Old ranges|Extended")));
     v.push_back (tabs (222, 318, 110, 20, "Link only side", TR_NOOP ("Mid only|Side only")));
     v.push_back (dial (380, 330, 24, "Link only", TR_NOOP ("Link only")));
+    // round 190dm: Air (a high shelf on the processed signal) and Mix (dry / processed)
+    v.push_back (dial (290, 390, 24, "Air", TR_NOOP ("Air")));
+    v.push_back (dial (380, 390, 24, "Mix", TR_NOOP ("Mix")));
     return l;
 }
 
@@ -2325,6 +2347,36 @@ Layout strikeLayout()
     return l;
 }
 
+// round 190fk: Anvil Bus, LYNX's drum-bus processor (the editor draws the forged-steel look, ui/PluginArtEffects.inc).
+// Round 190gx: the controls in the reference's four columns, top to bottom [Live 12.4 Drum Buss panel shot,
+// /mnt/e/lynx-work/live190gu/drumbus/live-drumbuss-panel-type0-drive25.png]: Drive, the three types stacked, Trim, Comp |
+// Crunch, Damp, Transients | Boom, Freq., Decay | the Output fader and Dry/Wet (the reference's Bass meter, Force to note
+// and Boom audition are left out: LYNX has no such outputs)
+Layout anvilLayout()
+{
+    Layout l;
+    l.width = 600;
+    l.height = 330;
+    auto& v = l.items;
+    v.push_back (section (4, 4, 146, 322, TR_NOOP ("Drive")));
+    v.push_back (dial (77, 68, 52, "Drive", TR_NOOP ("Drive"), big));
+    v.push_back (radio (30, 124, 94, 72, "Drive type", TR_NOOP ("Soft|Medium|Hard"), { 0.0f, 0.5f, 1.0f }));
+    v.push_back (dial (77, 226, 30, "Trim", TR_NOOP ("Trim")));
+    v.push_back (toggle (22, 286, 110, 26, "Comp", TR_NOOP ("Comp")));
+    v.push_back (section (154, 4, 146, 322, "", boxed));
+    v.push_back (dial (227, 58, 40, "Crunch", TR_NOOP ("Crunch")));
+    v.push_back (dial (227, 150, 40, "Damp", TR_NOOP ("Damp")));
+    v.push_back (dial (227, 246, 48, "Transients", TR_NOOP ("Transients"), bipolar | big));
+    v.push_back (section (304, 4, 146, 322, TR_NOOP ("Boom")));
+    v.push_back (dial (377, 68, 52, "Boom", TR_NOOP ("Boom"), big));
+    v.push_back (dial (377, 162, 40, "Boom freq.", TR_NOOP ("Freq.")));
+    v.push_back (dial (377, 250, 40, "Boom decay", TR_NOOP ("Decay")));
+    v.push_back (section (454, 4, 142, 322, "", boxed));
+    v.push_back (slider (Item::vslider, 505, 24, 40, 200, "Output", TR_NOOP ("Output")));
+    v.push_back (dial (525, 276, 30, "Dry/Wet", TR_NOOP ("Dry/Wet")));
+    return l;
+}
+
 // round tp172c8: Shell Channel, LYNX's drum channel strip (its role: the drum channel strip measured on the SSL Native
 // Drumstrip trial). The generic layout: input column, GATE and TRANSIENT SHAPER on top, the LOW / HIGH FREQ ENHANCERS and
 // the LISTEN MIC COMPRESSOR below, the process order under them, output column
@@ -2388,7 +2440,13 @@ Layout emberLayout()
     l.height = 230;
     auto& v = l.items;
     v.push_back (section (4, 4, 200, 222, TR_NOOP ("Style")));
-    v.push_back (display (12, 26, 184, 110, "embercurve"));
+    v.push_back (display (12, 26, 184, 96, "embercurve"));
+    // round 190fj: Tape's speed on the measured core; projects saved before it keep the Classic tape until switched
+    // (their own third condition: hidden on the Classic voicing's page like the rest of this page)
+    v.push_back (when (when (when (tabs (12, 124, 184, 16, "Tape speed", TR_NOOP ("30 ips|15|7.5|3.75|1.875"), {}, compactKeys),
+                                   "Style", 0.17f, 0.5f), "Law", 0.5f, 1.0f), "Voicing", 0.0f, 0.5f));
+    v.push_back (when (when (when (tabs (12, 124, 184, 16, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys), "Style", 0.17f, 0.5f),
+                             "Law", 0.0f, 0.5f), "Voicing", 0.0f, 0.5f));
     auto styles = radio (12, 144, 184, 76, "Style", TR_NOOP ("Tube|Tape|Transistor|Fuzz"));
     styles.columns = 2;
     v.push_back (styles);
@@ -2800,7 +2858,7 @@ Layout sentryGate()
 {
     Layout l;
     l.width = 680;
-    l.height = 510;
+    l.height = 564; // round 190dm: + the trigger row
     auto& v = l.items;
     // left: threshold (big) with ratio and range under it
     v.push_back (dial (86, 84, 92, "Threshold", TR_NOOP ("Threshold"), big));
@@ -2844,6 +2902,12 @@ Layout sentryGate()
     // round 190v: the Vocal style's noise reduction (classic = none, what a project saved before loads with)
     v.push_back (label (300, 482, 56, 22, TR_NOOP ("Model")));
     v.push_back (tabs (360, 482, 180, 22, "Law", TR_NOOP ("Classic|Measured")));
+    // round 190dm: the trigger (Transient = a drum gate: an onset opens it, it closes along the release shape)
+    v.push_back (label (8, 514, 90, 22, TR_NOOP ("Trigger")));
+    v.push_back (tabs (96, 514, 176, 22, "Trigger", TR_NOOP ("Level|Transient")));
+    v.push_back (when (label (300, 514, 56, 22, TR_NOOP ("Shape")), "Trigger", 0.5f, 1.0f));
+    v.push_back (when (tabs (360, 514, 180, 22, "Release shape", TR_NOOP ("Smooth|Mid|Sharp")), "Trigger", 0.5f, 1.0f));
+    v.push_back (when (dial (612, 520, 22, "Sensitivity", TR_NOOP ("Sensitivity")), "Trigger", 0.5f, 1.0f));
     return l;
 }
 
@@ -2866,6 +2930,8 @@ Layout quellDenoiser()
     v.push_back (value (170, 372, 70, 20, "Amount", 0));
     v.push_back (toggle (22, 372, 96, 22, "Listen", TR_NOOP ("Listen")));
     v.push_back (toggle (22, 342, 96, 22, "Matched", TR_NOOP ("Matched"))); // round 124: the engine fitted to NS1
+    // round 190dp: projects saved before the matched engine's noise-floor tracker keep the fixed law until switched
+    v.push_back (when (tabs (22, 396, 112, 16, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys), "Law", 0.0f, 0.5f));
     v.push_back (dial (256, 378, 28, "Output", TR_NOOP ("Output"), bipolar));
     return l;
 }
@@ -2899,6 +2965,9 @@ Layout geminiDoubler()
     v.push_back (dial (754, 206, 30, "High freq", TR_NOOP ("Freq")));
     // round 165w: the shelves' law (Measured: −88 … +12 dB, the reference's; Old: round 124's, kept by older projects)
     v.push_back (tabs (656, 168, 132, 18, "EQ law", TR_NOOP ("Old|Measured")));
+    // round 190do: the voices' read head with Align off (Measured: one head, the default of new instances; Classic: two
+    // crossfaded taps, kept by older projects)
+    v.push_back (tabs (520, 168, 132, 18, "Head law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     // one row per voice; round 135w: voices 3 and 4 (the four-voice doubler's) on a second page of the same rows
     v.push_back (section (4, 264, 680, 192, TR_NOOP ("Voices")));
     l.pages = { TR_NOOP ("Voices 1-2"), TR_NOOP ("Voices 3-4") };
@@ -3188,6 +3257,8 @@ Layout voiceShiftLayout()
     v.push_back (label (548, 140, 36, 14, TR_NOOP ("Dry"), dim));
     v.push_back (label (586, 140, 36, 14, TR_NOOP ("Wet"), dim));
     v.push_back (label (14, 226, 300, 34, "voice|shift", plugui::wordmark));
+    // round 190dp: projects saved before the measured unvoiced path keep the classic one until switched
+    v.push_back (when (tabs (446, 232, 180, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys), "Law", 0.0f, 0.5f));
     return l;
 }
 
@@ -3287,6 +3358,9 @@ Layout epochVerbLayout()
                              TR_NOOP ("Concert Hall|Plate|Room|Chamber|Random Space|Chorus Space|Ambience|Bright Hall|Nave|Grit Hall|Grit Plate|Smooth Plate|Smooth Room|Smooth Space|Gated|Drift Chamber|Drift Hall|Drift Space|Cathedral|Grand Hall|Vintage Chamber|Vintage Hall")));
     v.push_back (label (290, 264, 52, 24, TR_NOOP ("Color"), alignLeft));
     v.push_back (choiceMenu (342, 264, 120, 24, "Color", TR_NOOP ("Color"), TR_NOOP ("1970s|1980s|Now")));
+    // round 190bz: the engine law (Measured = the 0.1.27 law, the default of new instances; Classic = the engine of
+    // projects saved before it)
+    v.push_back (tabs (630, 265, 158, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     return l;
 }
 
@@ -3329,6 +3403,9 @@ Layout atriumLayout()
     v.push_back (label (8, 264, 92, 24, TR_NOOP ("Reverb mode"), alignLeft));
     v.push_back (choiceMenu (102, 264, 200, 24, "Type", TR_NOOP ("Type"),
                              TR_NOOP ("Large Room|Medium Room|Bright Room|Large Chamber|Dark Room|Dark Chamber|Dark Space|Deep Space|Mirror Space|Vast Space|Distant Space|Dense Room")));
+    // round 190bz: the engine law (Measured = the 0.1.27 law, the default of new instances; Classic = the engine of
+    // projects saved before it)
+    v.push_back (tabs (474, 265, 158, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     return l;
 }
 
@@ -3375,6 +3452,9 @@ Layout foilPlateLayout()
     plate (dial (556, 176, 44, "Mix", TR_NOOP ("Mix")));
     plate (toggle (24, 222, 150, 22, "Voicing", TR_NOOP ("Measured plate")));
     v.push_back (tabs (560, 292, 150, 20, "View", TR_NOOP ("Full|Plate")));
+    // round 190bz: the engine law (Measured = the 0.1.27 law, the default of new instances; Classic = the engine of
+    // projects saved before it)
+    v.push_back (tabs (60, 292, 150, 20, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     return l;
 }
 
@@ -3406,6 +3486,9 @@ Layout nebulaLayout()
     v.push_back (label (8, 264, 52, 24, TR_NOOP ("Mode"), alignLeft));
     v.push_back (choiceMenu (60, 264, 180, 24, "Mode", TR_NOOP ("Mode"),
                              TR_NOOP ("Ripple|Swell|Fold|Drift|Abyss|Vortex|Glint|Pulse|Expanse|Haze|Veil|Mist|Monolith|Eternity|Tide|Shoal|Spark|Plateau|Dusk|Mirage|Cluster|Beacon")));
+    // round 190ca: the cloud law (six of the modes run on core/NebulaCloud; classic = what a project saved before loads with)
+    v.push_back (label (264, 264, 56, 24, TR_NOOP ("Model"), alignLeft));
+    v.push_back (tabs (320, 264, 180, 24, "Law", TR_NOOP ("Classic|Measured")));
     return l;
 }
 
@@ -3440,6 +3523,9 @@ Layout haloLayout()
     auto color = choiceMenu (594, 216, 100, 28, "Color", TR_NOOP ("Color"), TR_NOOP ("Bright|Dark"));
     color.style = plugui::plainMenu;
     v.push_back (color);
+    // round 190bz: the engine law (Measured = the 0.1.27 law, the default of new instances; Classic = the engine of
+    // projects saved before it)
+    v.push_back (tabs (540, 246, 154, 14, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     return l;
 }
 
@@ -3491,6 +3577,9 @@ Layout horizonLayout()
     v.push_back (choiceMenu (522, 264, 150, 24, "Reverb mode", TR_NOOP ("Reverb mode"), TR_NOOP ("Room|Chamber|Plate|Hall|Cathedral|Space|Freeze|Gated")));
     v.push_back (label (752, 264, 52, 24, TR_NOOP ("Color"), alignLeft));
     v.push_back (choiceMenu (806, 264, 166, 24, "Color", TR_NOOP ("Color"), TR_NOOP ("Bright|Neutral|Dark|Studio")));
+    // round 190bz: the engine law (Measured = the 0.1.27 law, the default of new instances; Classic = the engine of
+    // projects saved before it)
+    v.push_back (tabs (272, 265, 148, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     return l;
 }
 
@@ -3665,6 +3754,10 @@ Layout echoformLayout()
     v.push_back (toggle (452, 290, 110, 20, "Filter link", TR_NOOP ("Link EQ")));
     v.push_back (toggle (570, 290, 100, 20, "Freeze", TR_NOOP ("Freeze")));
     v.push_back (toggle (676, 290, 90, 20, "LoFi", TR_NOOP ("LoFi"))); // round 137: H-Delay's LoFi switch
+    // round 190dl: the engine law (Measured = the measured tape stage, the default of new instances; Classic = the tape
+    // characters of projects saved before it) and the clocked modulation law (H-Delay's: the time swings by a fraction)
+    v.push_back (tabs (772, 290, 172, 20, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
+    v.push_back (toggle (782, 254, 80, 20, "Mod clock", TR_NOOP ("Clock")));
     // ---- round 137: EchoBoy's Rhythm echo mode (a pattern of evenly spaced taps the feedback replays every Length)
     v.push_back (toggle (8, 320, 74, 20, "Rhythm", TR_NOOP ("Rhythm")));
     v.push_back (when (menuOf (88, 320, 76, 20, "Rhythm sync", TR_NOOP ("Spacing"), TR_NOOP ("ms|Note|Dotted|Triplet"), syncValues), "Rhythm", 0.5f, 1.0f));
@@ -3787,6 +3880,8 @@ Layout spiralLayout()
                          syncValues));
     v.push_back (label (300, 170, 76, 18, TR_NOOP ("Output")));
     v.push_back (menuOf (380, 168, 100, 22, "Stereo", TR_NOOP ("Output"), TR_NOOP ("Mono|Stereo"), { 0.0f, 1.0f }));
+    // round 190do: the loop law (Measured = the default of new instances; Classic = the loop of projects saved before)
+    v.push_back (tabs (196, 168, 100, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     return l;
 }
 
@@ -3812,6 +3907,8 @@ Layout orbitLayout()
     v.push_back (menuOf (70, 150, 170, 24, "Mode", TR_NOOP ("Mode"),
                          TR_NOOP ("Rise|Rise / fall|Through-zero +|Through-zero −|Tri chorus|Octo chorus|Doubler|Drift rise|Drift rise / fall|Ensemble|Symphonic"),
                          modeValues));
+    // round 190do: the sweep law (Measured = the default of new instances; Classic = the voices of projects saved before)
+    v.push_back (tabs (290, 151, 160, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys));
     return l;
 }
 
@@ -3898,6 +3995,10 @@ Layout latticeLayout()
         auto pan = menuOf (552, 102, 104, 22, "Input pan", TR_NOOP ("Input pan"), TR_NOOP ("Stereo|Swapped|Mono|Mono left|Mono right"), panValues);
         pan.page = 5;
         v.push_back (pan);
+        // round 190do: the detune law (Measured = the default of new instances; Classic = the depth of projects saved before)
+        auto law = tabs (552, 150, 104, 22, "Law", TR_NOOP ("Classic|Measured"), {}, compactKeys);
+        law.page = 5;
+        v.push_back (law);
     }
     v.push_back (display (312, 230, 354, 62, "lattice"));
     return l;
@@ -3967,7 +4068,7 @@ const std::vector<EffectKind>& flLayoutKinds()
 const std::vector<EffectKind>& ownLayoutKinds()
 {
     static const std::vector<EffectKind> kinds { EffectKind::ridgeStrip, EffectKind::glowLeveler, EffectKind::hushDeEsser,
-                                                 EffectKind::aether, EffectKind::ember, EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel, EffectKind::strikeShaper, EffectKind::epochVerb, EffectKind::atrium,
+                                                 EffectKind::aether, EffectKind::ember, EffectKind::kilnChannel, EffectKind::fretChannel, EffectKind::shellChannel, EffectKind::strikeShaper, EffectKind::anvilBus, EffectKind::epochVerb, EffectKind::atrium,
                                                  EffectKind::foilPlate, EffectKind::nebula, EffectKind::halo, EffectKind::horizon,
                                                  EffectKind::echoform, EffectKind::spiralEcho, EffectKind::orbit, EffectKind::latticeMod,
                                                  EffectKind::crestCompressor, EffectKind::prismMultiband, EffectKind::sentryGate,
@@ -4055,6 +4156,7 @@ const Layout& layoutFor (EffectKind kind)
         case EffectKind::fretChannel: l = fretLayout(); break;
         case EffectKind::shellChannel: l = shellLayout(); break;
         case EffectKind::strikeShaper: l = strikeLayout(); break;
+        case EffectKind::anvilBus: l = anvilLayout(); break;
         case EffectKind::epochVerb: l = captionsAbove (epochVerbLayout()); break;
         case EffectKind::atrium: l = captionsAbove (atriumLayout()); break;
         case EffectKind::foilPlate: l = captionsAbove (foilPlateLayout()); break;
@@ -4551,7 +4653,7 @@ bool displayTakesMouse (const char* display)
     if (display == nullptr)
         return false;
     static const char* const ids[] { "eq", "xy", "sgamount", "sgpresets", "prismbands", "emberbands", "tunekeys", "tuneautokey",
-                                     "pitchring", "waveshaper", "tssenvelope", "tsssend0", "tsssend1", "maxcurve", "equosend", "lpcurve", "cvcurve", "vxcurve", "vxmapsel" };
+                                     "pitchring", "waveshaper", "tssenvelope", "tsssend0", "tsssend1", "maxcurve", "equosend", "lpcurve", "cvcurve", "vxcurve", "vxmapsel", "pitchport" };
     for (const auto* id : ids)
         if (std::strcmp (id, display) == 0)
             return true;
@@ -4583,6 +4685,8 @@ int stateIndex (EffectKind kind, int param)
 
 const char* paramName (EffectKind kind, int index)
 {
+    if (const auto* hidden = hiddenEffectParamName (kind, index)) // round 190le: a hidden parameter with a control
+        return hidden;
     if (index < 0 || index >= paramCount (kind))
         return "";
     if (const auto s = stateIndex (kind, index); s >= 0)
@@ -4601,7 +4705,7 @@ int paramIndex (EffectKind kind, const char* name)
     if (const auto* table = stateparams::tableFor (kind))
         if (const auto s = table->index (name); s >= 0)
             return (int) params.size() + s;
-    return -1;
+    return hiddenEffectParamIndex (kind, name); // round 190le
 }
 
 float stateValue01 (EffectKind kind, int param, const std::vector<std::uint8_t>& state)

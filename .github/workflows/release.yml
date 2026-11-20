@@ -19,9 +19,8 @@
 #                       Linux and macOS, each checked with plugexporttest, pluginval and clap-validator); never in the
 #                       app's installer, and the app's release doesn't wait for it
 #   plugins-publish     on a tag push attaches LYNX-Plugins-<label>-* (with their own SHA256SUMS file) to the same release
-#   store    (windows)  on a tag (push, or a manual store_build resubmission run on the tag): the .msix as a new Microsoft
-#                       Store submission (msstore CLI); skipped with a notice until the MSSTORE_* secrets exist
-#                       (docs/STORE.md › Automatic Store submission)
+#   store    (ubuntu)   on a tag: only a notice. CI no longer submits to the Microsoft Store (the old package-only submission
+#                       reused outdated listings and failed certification); the full submission is made locally (docs/STORE.md)
 name: Release
 
 on:
@@ -142,8 +141,15 @@ jobs:
         shell: bash
         run: ./scripts/fetch-onnxruntime.sh windows build-win
 
+      # Release code generation (round 190kz, owner decision; docs/PLATFORMS.md "Release optimisation"): a real -O3
+      # (zig maps -O3 to -O2, so the -O3 goes to clang itself) and ThinLTO of LYNX's own objects; the instruction set
+      # stays the x86-64 baseline (SSE2), the hottest loops pick AVX2 at run time (src/core/CpuFeatures.h). About
+      # 8 more minutes of link on the runner; Harmless.cpp stays out of LTO (LYNX_WIN_LTO_SKIP, measured)
       - name: Build (Zig cross compile)
         shell: bash
+        env:
+          LYNX_WIN_OPT: -O2 -Xclang -O3
+          LYNX_WIN_LTO: thin
         run: |
           ulimit -s 1048576 || true
           ZIG="$HOME/opt/zig-x86_64-linux-$ZIG_VERSION/zig" JUCE_DIR="$HOME/opt/juce-$JUCE_VERSION" OUT=build-win \
@@ -174,8 +180,10 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------------------------
-  # SignPath code signing: PLACEHOLDER, disabled until the SignPath Foundation approves LYNX.
-  # To enable (docs/CODE_SIGNING.md):
+  # SignPath code signing (docs/CODE_SIGNING.md). Build and signing are separate jobs: with the
+  # release-signing policy (SignPath Foundation certificate) every request waits for a manual
+  # approval in the SignPath web app; test-signing is approved automatically.
+  # Settings:
   #   repository secret    SIGNPATH_API_TOKEN        API token of the SignPath CI user (submitter role)
   #   repository variable  SIGNPATH_ORGANIZATION_ID  organization id shown in the SignPath web app
   #   repository variable  SIGNPATH_PROJECT_SLUG     project slug (default: LYNX)
@@ -187,7 +195,7 @@ jobs:
     needs: build
     if: false
     runs-on: ubuntu-24.04
-    timeout-minutes: 200
+    timeout-minutes: 355  # GitHub-hosted jobs stop at 6 h
     permissions:
       actions: read     # SignPath reads the job details and downloads the unsigned artifact
       contents: read
@@ -201,7 +209,7 @@ jobs:
           signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
           github-artifact-id: ${{ needs.build.outputs.artifact-id }}
           wait-for-completion: true
-          wait-for-completion-timeout-in-seconds: 10800   # a release request waits up to 3 h for manual approval
+          wait-for-completion-timeout-in-seconds: 20700   # a release request waits up to 5 h 45 min for the manual approval
           output-artifact-directory: signed
 
       - name: Upload signed LYNX.exe
@@ -300,6 +308,9 @@ jobs:
           $p = Start-Process bin\LYNX.exe -ArgumentList '--showcase', "$PWD\pkg\$name\Demo.lynx" -Wait -PassThru
           if (-not (Test-Path "pkg\$name\Demo.lynx")) { throw "showcase did not write Demo.lynx (exit $($p.ExitCode))" }
           Copy-Item bin\LYNX.exe, bin\onnxruntime.dll, LICENSE, THIRD_PARTY.md, PRIVACY.md "pkg\$name\"
+          # the third-party licence texts (round 190nk): Git for Windows' bash runs the same script as the other packages
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/collect-licenses.sh "pkg/$name/licenses"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "pkg\$name\licenses\ara-ARA_API-LICENSE.txt")) { throw "collect-licenses failed" }
           # LYNX ASIO driver and its registration helpers (REA round 97)
           if (Test-Path bin\lynx-asio.dll) { Copy-Item bin\lynx-asio.dll, "asio\Register LYNX ASIO.bat", "asio\Unregister LYNX ASIO.bat" "pkg\$name\" }
           if (Test-Path bin\lynx-asio32.dll) { Copy-Item bin\lynx-asio32.dll "pkg\$name\" }  # 32-bit hosts (round 106)
@@ -355,7 +366,7 @@ jobs:
           $tools = $sdk.DirectoryName; "Windows SDK tools: $tools"
           $demo = "pkg\LYNX-$env:LABEL-windows-x64\Demo.lynx"
           function Pack($layout, $out, [switch]$test) {
-            $a = @('scripts\make-msix-layout.py', '--version', $env:VERSION, '--bin', 'bin', '--out', $layout, '--extra', $demo, 'LICENSE', 'THIRD_PARTY.md', 'PRIVACY.md')
+            $a = @('scripts\make-msix-layout.py', '--version', $env:VERSION, '--bin', 'bin', '--out', $layout, '--extra', $demo, 'LICENSE', 'THIRD_PARTY.md', 'PRIVACY.md', "pkg\LYNX-$env:LABEL-windows-x64\licenses")
             if ($test) { $a += '--test-identity' }
             python @a; if ($LASTEXITCODE -ne 0) { throw "make-msix-layout failed" }
             & "$tools\makepri.exe" createconfig /cf "$layout.priconfig.xml" /dq en-US_pt-BR_es-ES_fr-FR_de-DE_it-IT_nl-NL_pl-PL_ru-RU_tr-TR_id-ID_ja-JP_ko-KR_zh-CN_zh-TW /pv 10.0.0 /o | Out-Null
@@ -688,69 +699,20 @@ jobs:
           ls -la dist
           gh release upload "$GITHUB_REF_NAME" dist/LYNX-Plugins-* --clobber
 
-  # Microsoft Store (round 168y): the release's LYNX-<label>-store.msix as a new submission of product 9NQRFBFDCX6N. The
-  # msstore CLI clones the last published submission (listings, pricing, "What's new" untouched), replaces its package
-  # with this one and commits it to certification. A pending (unpublished) submission is deleted first.
+  # Microsoft Store: DISABLED in CI (round 190ij, queue item 23). This job used to run `msstore publish`, which clones the
+  # last published submission and swaps only the package. That reused the old 0.1.22 listings and the old pepper icon,
+  # and certification failed (10.1.1.11 On Device Tiles, 10.1.1.3 Inaccurate Representation). The working path is a full
+  # submission (15 listings, images, certification note) made by the maintainer's local scripts (submit.sh +
+  # build_body.py, Partner Center API) after the release is published; see docs/STORE.md > Automatic Store submission.
+  # The job therefore creates NO submission and touches no Store secret; it only prints a reminder on a tag run.
   store:
-    name: Microsoft Store submission
+    name: Microsoft Store submission (manual)
     needs: [version, publish]
-    if: false
-    runs-on: windows-2025
-    env:
-      LABEL: ${{ needs.version.outputs.label }}
-      STORE_PRODUCT_ID: 9NQRFBFDCX6N
+    if: false   # fork: no Microsoft Store product
+    runs-on: ubuntu-24.04
     steps:
-      - name: Store credentials
-        id: creds
-        shell: bash
+      - name: Reminder
         env:
-          MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
-          MSSTORE_CLIENT_ID: ${{ secrets.MSSTORE_CLIENT_ID }}
-          MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
-          MSSTORE_SELLER_ID: ${{ secrets.MSSTORE_SELLER_ID }}
+          LABEL: ${{ needs.version.outputs.label }}
         run: |
-          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
-            echo "::notice title=Microsoft Store::not a tag ($GITHUB_REF_NAME): no Store submission (run the workflow on the release tag)"
-            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          missing=""
-          for n in MSSTORE_TENANT_ID MSSTORE_CLIENT_ID MSSTORE_CLIENT_SECRET MSSTORE_SELLER_ID; do
-            [[ -n "${!n}" ]] || missing="$missing $n"
-          done
-          if [[ -n "$missing" ]]; then
-            echo "::notice title=Microsoft Store::secrets not set:$missing — Store submission skipped (docs/STORE.md › Automatic Store submission)"
-            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "run=true" >> "$GITHUB_OUTPUT"
-
-      - name: Download the Store package
-        if: steps.creds.outputs.run == 'true'
-        uses: actions/download-artifact@v8
-        with:
-          name: LYNX-${{ env.LABEL }}-windows-x64
-          path: store
-
-      - name: Microsoft Store CLI
-        if: steps.creds.outputs.run == 'true'
-        uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4 (setup-msstore-cli)
-        with:
-          version: v0.4.4
-
-      - name: Submit to the Microsoft Store
-        if: steps.creds.outputs.run == 'true'
-        shell: pwsh
-        env:
-          MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
-          MSSTORE_CLIENT_ID: ${{ secrets.MSSTORE_CLIENT_ID }}
-          MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
-          MSSTORE_SELLER_ID: ${{ secrets.MSSTORE_SELLER_ID }}
-        run: |
-          $msix = Get-Item "store\LYNX-$env:LABEL-store.msix" -ErrorAction Stop
-          Write-Host "Store package: $($msix.Name) ($($msix.Length) bytes)"
-          # (the secrets go in from the environment, never in the script text; GitHub masks them in the log)
-          msstore reconfigure --tenantId $env:MSSTORE_TENANT_ID --sellerId $env:MSSTORE_SELLER_ID `
-            --clientId $env:MSSTORE_CLIENT_ID --clientSecret $env:MSSTORE_CLIENT_SECRET
-          if ($LASTEXITCODE -ne 0) { throw "msstore reconfigure failed ($LASTEXITCODE)" }
-          msstore publish $msix.FullName --appId $env:STORE_PRODUCT_ID --output-stream stdout
-          if ($LASTEXITCODE -ne 0) { throw "msstore publish failed ($LASTEXITCODE)" }
-          msstore submission status $env:STORE_PRODUCT_ID
+          echo "::notice title=Microsoft Store::CI does not submit to the Store (it would reuse old listings). Submit LYNX-$LABEL-store.msix with the local full-submission script (docs/STORE.md)."

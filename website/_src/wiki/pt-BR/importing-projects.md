@@ -1,5 +1,5 @@
 ---
-source: bcd8a275bd
+source: c4e89e7e72
 ---
 `Arquivo › Abrir...` (`Ctrl+O`) abre os projetos `.lynx` do próprio LYNX SHARE e também arquivos `.flp`, `.als`, `.flm` e `.mid`. Um projeto de outro programa é uma importação: ele vira um projeto novo do LYNX SHARE, ainda não salvo, e o arquivo original nunca é gravado.
 
@@ -16,8 +16,8 @@ source: bcd8a275bd
 | Formato | Convertido | Não convertido |
 |---|---|---|
 | `.flp` (FL Studio) | Canais, samples, patterns, notas de slide e porta, todos os arranjos, marcadores, mudanças de fórmula de compasso, automação, vínculos de controlador, o Mixer com roteamento, sidechains, EQ de faixa e efeitos nativos | Os pacotes FLEX são criptografados e nunca são abertos. Um canal FLEX recebe um patch de sintetizador escolhido pelo nome do preset |
-| `.als` (Live 11 e 12) | Faixas MIDI, de áudio, de grupo e de retorno, tempo, fórmula de compasso, locators, o loop, volume, pan, mudo, solo e sends com a automação deles, clipes de Session e cenas, warp markers | Os efeitos do próprio Live são descartados. Racks mantêm só a primeira cadeia. Simpler, Sampler e drum racks viram samplers do LYNX SHARE |
-| `.flm` (FL Studio Mobile) | Tempo, fórmula de compasso, um insert de mixer por canal, uma faixa da Playlist por lane, patterns, clipes de áudio com offset e pitch, kits de bateria, samples do DW Sampler e programas `.dwp` | Os efeitos e as lanes de automação do FLM. Os outros geradores do FLM tocam o sintetizador embutido |
+| `.als` (Live 11 e 12) | Faixas MIDI, de áudio, de grupo e de retorno, tempo, fórmula de compasso, locators, o loop, volume, pan, mudo, solo e sends com a automação deles, clipes de Session e cenas, warp markers, racks e Drum Racks, e muitos dos devices do próprio Live (EQ Eight, Compressor, Glue Compressor, Reverb, Delay, Auto Filter, Saturator, Utility, Simpler, Drift e mais) como os do LYNX SHARE | Os devices do Live sem equivalente no LYNX SHARE (Hybrid Reverb, Grain Delay, Amp, Roar, patches de FM Operator e outros) são descartados e listados. Os MIDI Effect Racks não são convertidos |
+| `.flm` (FL Studio Mobile) | Tempo, fórmula de compasso, um insert de mixer por canal, uma faixa da Playlist por lane, patterns, clipes de áudio com offset e pitch, kits de bateria, DW Sampler e programas `.dwp`, o Slicer, MiniSynth, Transistor Bass, 3x Osc, GMSynth e SuperSaw, os efeitos, a automação e os conjuntos de acordes | Os outros geradores do FLM tocam no sintetizador embutido |
 | `.mid` | Notas, fórmulas de compasso e todas as mudanças de tempo | Um arquivo MIDI não traz sons: os canais recebem o sintetizador do LYNX SHARE ou um canal MIDI Out |
 
 Plugins VST2, VST3 e CLAP de terceiros em um `.flp`, e plugins VST2 e VST3 em um `.als`, carregam com o estado salvo se o mesmo plugin estiver instalado no seu computador.
@@ -27,6 +27,12 @@ Plugins VST2, VST3 e CLAP de terceiros em um `.flp`, e plugins VST2 e VST3 em um
 Os geradores e efeitos do FL Studio não são carregados. O LYNX SHARE lê as configurações salvas deles e as toca em motores que recriou. Cada motor tem um nível de qualidade, de `Exact` (idêntico bit a bit ao original em todos os estados testados) até `Placeholder` (as configurações são mantidas, mas o plugin fica mudo ou deixa o áudio passar direto). Os níveis são explicados em [Vindo do FL Studio](/wiki/coming-from-fl-studio/).
 
 Abrir um `.flp` funciona sem o FL Studio instalado. Alguns motores precisam de ondas, samples ou impulsos que são lidos da sua própria instalação do FL Studio durante a execução.
+
+Um `.flp` que usa o "FL Studio Mobile Rack" do FL Studio (o "Save as FLP" do próprio FL Studio Mobile grava um por faixa de instrumento) toca o instrumento e os efeitos nos mesmos motores de um `.flm`, e o efeito "FL Studio Mobile Rack FX" também. Um rack com um kit de bateria ou vários instrumentos ainda toca o sintetizador embutido.
+
+## Sons de fábrica do FL Studio Mobile
+
+Os sons de fábrica que um `.flm` usa (kits de bateria, programas do DirectWave, SoundFonts, as ondas do GMSynth) pertencem ao FL Studio Mobile e nunca são distribuídos com o LYNX SHARE. O LYNX SHARE os procura na sua própria cópia da pasta `Resources` do app: adicione-a em `Configurações › Arquivos › Recursos do FL Studio Mobile` (escolher a pasta acima dela, ou uma pasta de instalação do FL Studio, também funciona). A instalação do FL Studio guarda só uma parte deles e é pesquisada depois das suas pastas. Os arquivos que ainda faltarem aparecem na janela Arquivos ausentes.
 
 ## Samples ausentes
 

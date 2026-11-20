@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/Song.h"
+#include "core/FlSettings.h"
 
 namespace lynx::noteedit
 {
@@ -64,7 +65,7 @@ std::vector<int> duplicate (Pattern& pattern, const std::vector<int>& indices, s
 // The Piano roll's Ctrl+B / Duplicate (round 170h, FL 2026 driven with the snap on Step): the copy goes whole bars
 // later, the selection's span rounded up to bars (notes over steps 1-8 -> bar 2, over 1-24 -> bar 3), so a riff
 // repeats in time even when its last note ends before the bar line.
-std::vector<int> duplicateBars (Pattern& pattern, const std::vector<int>& indices, int beatsPerBar);
+std::vector<int> duplicateBars (Pattern& pattern, const std::vector<int>& indices, Meter meter);
 
 // Rounds the notes' start to the nearest multiple of `grid` (length kept).
 void quantize (Pattern& pattern, const std::vector<int>& indices, std::int64_t grid);
@@ -132,8 +133,8 @@ std::int64_t screenStep (double pixelsPerTick, std::int64_t bar, double minPixel
 std::int64_t flLineStep (double pixelsPerTick, int numerator, int denominator = 4, double minPixels = 10.0);
 
 // "bar:step:tick" (bar and step from 1, tick from 0; 16 steps per 4/4 bar) <-> ticks.
-std::string formatTime (std::int64_t ticks, int beatsPerBar, bool isLength = false); // lengths count bars and steps from 0
-bool parseTime (const std::string& text, int beatsPerBar, std::int64_t& ticks, bool isLength = false);
+std::string formatTime (std::int64_t ticks, Meter meter, bool isLength = false); // lengths count bars and steps from 0
+bool parseTime (const std::string& text, Meter meter, std::int64_t& ticks, bool isLength = false);
 
 // --- Playlist clips ------------------------------------------------------------------
 
@@ -201,11 +202,19 @@ void removeTrack (Song& song, int track);
 // Swaps two tracks (their clips and headers), in every arrangement.
 void swapTracks (Song& song, int a, int b);
 // Solo: `track` plays alone (every other track muted); on the only unmuted track it unmutes all.
-void soloTrack (Song& song, int track, int trackCount);
+// `memory` (round 190bx, core/FlSettings.h; null = none kept): the solo remembers every track's mute switch; with
+// `restore` (FL's General › "Restore previous state after solo") the un-solo puts them back instead of unmuting
+// everything.
+void soloTrack (Song& song, int track, int trackCount, flsettings::SoloMemory* memory = nullptr, bool restore = false);
 // FL's channel solo (FUN_00ffaaa0, REA_rodada167l §5): `channel` plays and every other channel is muted, except the
 // ones with "Lock active/mute state"; on a channel already playing alone (among the unlocked ones) every channel the
-// solo touched plays again.
-void soloChannel (Song& song, int channel);
+// solo touched plays again (`memory` / `restore`: as soloTrack's).
+void soloChannel (Song& song, int channel, flsettings::SoloMemory* memory = nullptr, bool restore = false);
+// FL's Alt+click on a channel's mute switch (round 190mv, DE-12; capture 190mv A4): the solo within the channel's filter
+// group — the channel plays and the other channels of its group are muted (the channels without a group are one group,
+// FL's "Unsorted"); other groups and the locked channels keep theirs. Again on the channel heard alone in its group:
+// the whole group plays.
+void soloChannelInGroup (Song& song, int channel);
 
 // --- Playlist track groups (FL's "Group with above track", REA round 104) -----------------------------
 // A track with `grouped` set belongs to the group of the nearest ungrouped track above it: the header.
@@ -217,6 +226,35 @@ void groupWithAbove (Song& song, int track);                 // no-op on track 0
 void ungroupTrack (Song& song, int track);                   // a member leaves its group (headers stay)
 void setGroupCollapsed (Song& song, int track, bool collapsed); // the group of `track`
 void colourGroup (Song& song, int track);                    // "Auto color group": members take the header's colour
+
+// --- Round 190jf (slice B17): folders = nested track groups (LYNX; FL's groups are one level) and FL's group mute / solo ----
+// The functions above are nest-aware: a header is any track followed by a deeper one, its members are every track of its
+// folder (sub-folders included), a track is folded away when any folder it is in is collapsed.
+int folderDepth (const Song& song, int track);                     // 0 = not grouped; `grouped ? 1 + nest : 0`
+int folderParent (const Song& song, int track);                    // the header of the folder it is directly in, −1 = none
+int folderEnd (const Song& song, int header);                      // the last track of the folder (`header` itself when none)
+std::vector<int> folderChildren (const Song& song, int header);    // the tracks directly in the folder
+// Every track is at most one level deeper than the track above it (the first track at 0). Returns true when it changed.
+bool normalizeFolders (Song& song);
+// FL's group mute / solo (manual, Playlist › Mute / Solo: "(Alt+Click) the Mute icon for any member of the group",
+// Alt+left = mute, Alt+right = solo): the tracks of the group `track` is in — a header's own folder, else its parent's
+// folder (the header included). Mute: every track takes the clicked track's flipped state. Solo: the group plays and
+// every other track is muted; on a group already playing alone everything plays again (or, with `restore`, what
+// played before). Both return false when the track is in no group.
+std::vector<int> groupMuteSet (const Song& song, int track);
+// `insertOf` (rollup 0.1.30, round 190jf × 190ib): the mixer insert a linked header's M button mutes (≤ 0: none), for
+// the Playlist tracks linked to the mixer. Their LED is lit by the track's mute or by the insert's, so the clicked
+// track's state is that lit state, and a group switched back on also unmutes its linked inserts: every LED of the
+// group goes out, as every LED came on. Empty: FL's groups (the Playlist mutes only).
+bool muteGroup (Song& song, int track, const std::vector<int>& insertOf = {});
+bool soloGroup (Song& song, int track, int trackCount, flsettings::SoloMemory* memory = nullptr, bool restore = false);
+// Moves `track` with its folder so that it starts at the old index `before` (count = to the end), at folder `depth`
+// (clamped to what the place allows: at most one deeper than the track above). The clips follow. Returns the track's
+// new index, −1 when nothing moved. LYNX's Alt+drag of a track header (B17).
+int moveFolder (Song& song, int track, int before, int depth);
+int maxFolderDepthAt (const Song& song, int before, int track); // the deepest `moveFolder` allows there
+bool nestTrack (Song& song, int track);   // one level deeper (with its folder), under the track above
+bool unnestTrack (Song& song, int track); // out of its folder: below the folder, one level up
 
 // --- Piano roll note template and Alt+wheel (round 166e, FL 2026 measured in docs/analise/REA_rodada166e.md) --------
 // FL: clicking a note (or Alt+wheel-editing the nearest one) makes its properties the ones new notes get. Velocity and
@@ -327,9 +365,9 @@ int addPatternMarker (Pattern& pattern, const Marker& marker);
 int addPatternAutoMarker (Pattern& pattern, std::int64_t tick);
 // Shift+Alt+T (FUN_0122b0d0 Tag 2): a num/den change at `from` (floored to a beat) named "num/den" (FL's "%d/%d"); with a
 // time selection ending at `to`, the signature in force before comes back there (unless a change is already there)
-void addPatternSignatureChange (Pattern& pattern, std::int64_t from, std::int64_t to, int numerator, int denominator, int beatsPerBar);
-// the pattern's signature at `tick`: its last signature marker at or before it, else beatsPerBar / 4
-std::pair<int, int> patternSignatureAt (const Pattern& pattern, std::int64_t tick, int beatsPerBar);
+void addPatternSignatureChange (Pattern& pattern, std::int64_t from, std::int64_t to, int numerator, int denominator, Meter meter);
+// the pattern's signature at `tick`: its last signature marker at or before it, else the song's meter
+std::pair<int, int> patternSignatureAt (const Pattern& pattern, std::int64_t tick, Meter meter);
 // FL's Paint tool in the Piano roll (round 189o; FLEngine 2026 [DECOMP] FUN_00e5cd20: mode 0x11 "mono paint" when
 // Shift != General › "Monophonic painting in piano roll", PRPaintMode, off by default): with the option on, a plain
 // stroke paints monophonically and Shift paints chords / layers as before.

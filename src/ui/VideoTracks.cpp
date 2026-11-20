@@ -15,6 +15,7 @@
 #include "ui/Dialogs.h"
 #include "ui/FileChoosers.h"
 #include "ui/I18n.h"
+#include "ui/ImageReadback.h"
 #include "ui/PlaylistComponent.h"
 #include "ui/TextCache.h"
 #include "ui/Theme.h"
@@ -166,13 +167,20 @@ juce::Image thumbAt (ThumbStrip& strip, double fileSeconds)
         return {};
     const auto n = (int) strip.images.size();
     const auto i = juce::jlimit (0, n - 1, (int) std::floor (fileSeconds / strip.interval));
+    // a thumbnail is made as a software image (on the thumbnails' thread) and drawn on every paint of the Playlist: the
+    // first time it is drawn it becomes the window's kind of image, so its GPU copy is made once (round 190gv)
+    auto shown = [&] (int k) -> juce::Image {
+        auto& image = strip.images[(std::size_t) k];
+        image = ui::forScreen (image);
+        return image;
+    };
     // (not decoded yet: the nearest decoded one, earlier first)
     for (int d = 0; d < n; ++d)
     {
         if (i - d >= 0 && strip.images[(std::size_t) (i - d)].isValid())
-            return strip.images[(std::size_t) (i - d)];
+            return shown (i - d);
         if (i + d < n && strip.images[(std::size_t) (i + d)].isValid())
-            return strip.images[(std::size_t) (i + d)];
+            return shown (i + d);
     }
     return {};
 }
@@ -427,6 +435,24 @@ namespace videotracks
 bool isVideoFile (const juce::File& file)
 {
     return videoExtensions.contains (file.getFileExtension().trimCharactersAtStart (".").toLowerCase());
+}
+
+juce::File soundTrackWav (const juce::File& video)
+{
+    static std::mutex lock; // (two loads of the same file must not write one WAV together)
+    const std::scoped_lock hold (lock);
+    auto folder = platform::cacheFolder ("video-audio");
+    folder.createDirectory();
+    const auto key = juce::String::toHexString (video.getFullPathName().hashCode64()) + "-"
+                     + juce::String::toHexString (video.getLastModificationTime().toMilliseconds()) + "-" + juce::String::toHexString (video.getSize());
+    const auto wav = folder.getChildFile (video.getFileNameWithoutExtension() + " (sound) " + juce::String::toHexString (key.hashCode64()) + ".wav");
+    if (wav.existsAsFile() && wav.getSize() > 44)
+        return wav;
+    const auto temp = wav.getSiblingFile (wav.getFileNameWithoutExtension() + ".part.wav");
+    if (media::extractAudioToWav (video, temp) && temp.moveFileTo (wav))
+        return wav;
+    temp.deleteFile();
+    return {};
 }
 
 bool importVideo (AudioEngine& engine, const juce::File& file, double songSeconds, int track)
