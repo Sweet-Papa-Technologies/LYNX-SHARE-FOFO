@@ -110,6 +110,7 @@ struct Disk
     std::string saved;
     int saves = 0;
     int decodeMs = 0;
+    std::function<void (const std::string&)> beforeDecode; // (on the worker thread: lets a test hold the pass)
 
     Disk()
     {
@@ -151,6 +152,8 @@ struct Disk
             return true;
         };
         cb.decode = [this] (const std::string& path, double, std::vector<float>& mono, double& rate) {
+            if (beforeDecode)
+                beforeDecode (path);
             ++decodes;
             if (decodeMs > 0)
                 std::this_thread::sleep_for (std::chrono::milliseconds (decodeMs));
@@ -413,26 +416,42 @@ TEST (similar190as_query_first_pause_and_close)
     using namespace s190as;
     Disk disk;
     disk.decodeMs = 40; // a slow disk: the whole pass takes more than a second
+    // The pass is held at fixed points instead of timed: its first file waits until the query has been sent, every
+    // later one until the answer has been checked; the clicked file is never held. A service that did not serve the
+    // query before going on with the pass would block here until the time limit and fail the checks below.
+    const std::string clicked = "/lib/loops/l3.wav";
+    std::atomic<bool> passStarted { false }, asked { false }, checked { false };
+    std::atomic<int> passDecodes { 0 };
+    const auto waitFor = [] (const std::atomic<bool>& flag) {
+        const auto began = std::chrono::steady_clock::now();
+        while (! flag && std::chrono::steady_clock::now() - began < std::chrono::seconds (10))
+            std::this_thread::sleep_for (std::chrono::milliseconds (1));
+    };
+    disk.beforeDecode = [&] (const std::string& path) {
+        if (path == clicked)
+            return;
+        passStarted = true;
+        waitFor (++passDecodes == 1 ? asked : checked);
+    };
     Inbox inbox;
     {
         lynx::similarity::Service service (disk.callbacks());
         service.refresh ({ "/lib" });
-        std::this_thread::sleep_for (std::chrono::milliseconds (60));
+        waitFor (passStarted);
         // a query while the pass runs is served first, for a file the pass has not reached (loops come last)
         const auto began = std::chrono::steady_clock::now();
-        const auto id = service.findSimilar ("/lib/loops/l3.wav", {}, 3, inbox.sink());
+        const auto id = service.findSimilar (clicked, {}, 3, inbox.sink());
+        asked = true;
         std::vector<lynx::similarity::Result> got;
         while (got.empty() && std::chrono::steady_clock::now() - began < std::chrono::seconds (10))
         {
             std::this_thread::sleep_for (std::chrono::milliseconds (5));
             got = inbox.take();
         }
-        const auto waited = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - began).count();
         CHECK (got.size() == 1 && got[0].id == id && ! got[0].failed && got[0].partial); // partial: the pass goes on
-        // after at most the file being analysed and the clicked one, not after the whole pass (no time limit here:
-        // the test machine may be busy)
-        CHECK (service.status().busy && disk.decodes < 20);
-        (void) waited;
+        // after the file being analysed and the clicked one, not after the whole pass
+        CHECK (service.status().busy && disk.decodes == 2);
+        checked = true;
 
         // a newer query replaces one still waiting: only the newest is answered
         service.findSimilar ("/lib/kicks/k1.wav", {}, 3, inbox.sink());
