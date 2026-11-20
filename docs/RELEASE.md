@@ -47,8 +47,8 @@ Two workflows create every `v*` tag; nobody tags by hand:
 - `<version>` is `CMakeLists.txt`'s. Step 1 and step 5 below are what these workflows now do for you.
 
 Steps:
-1. Bump the version in `CMakeLists.txt` (`project(LYNX VERSION x.y.z)`, the single source) and the download badge in
-   `README.md`.
+1. Bump the version in `CMakeLists.txt` (`project(LYNX VERSION x.y.z)`, the single source). The download badge in
+   `README.md` reads the latest published release from GitHub, so it needs no edit.
 2. Locally: `scripts/build-local.sh "/mnt/c/Program Files/Image-Line/FL Studio 2026/Data"` → `0 failures`;
    `flock ~/.cache/lynx-winbuild.lock scripts/build-windows-zig.sh`; from a Windows folder `LYNX.exe --selftest r.txt`
    (`result=OK`) and `LYNX.exe --scantest <folder with a VST3/CLAP> r.txt` (a test CLAP: `tools/testplugin`).

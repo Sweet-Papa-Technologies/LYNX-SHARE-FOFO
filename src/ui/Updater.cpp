@@ -613,7 +613,7 @@ void appImageUpdate()
     const auto current = appImageFile();
    #if JUCE_LINUX || JUCE_BSD
     // AppImageUpdate's command-line tool: the zsync update information embedded by scripts/package-linux.sh
-    // (zsync|https://lynx-share.com/update/...) fetches only the changed blocks, then -O replaces the file
+    // (UPDATE_INFO; this fork's release builds embed none yet) fetches only the changed blocks, then -O replaces the file
     if (const auto tool = findInPath ("appimageupdatetool"); current != juce::File() && tool != juce::File() && overrideUrl().isEmpty())
     {
         c.progress = -1.0f;

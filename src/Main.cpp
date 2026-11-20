@@ -1679,7 +1679,7 @@ public:
         {
             // LYNX.exe --send-test-report out.txt [--dry]: builds a crash report marked "test" from the newest crash /
             // hang file and this computer's facts, writes its JSON to out.txt.json and (without --dry) sends it to
-            // lynx-share.com (LYNX_CRASH_ENDPOINT overrides); out.txt gets "id=…" and "result=OK" or the error (round 159)
+            // LYNX_CRASH_ENDPOINT (unset in this fork: no upload); out.txt gets "id=…" and "result=OK" or the error (round 159)
             const auto i = args.indexOf ("--send-test-report");
             const juce::File out (args[i + 1].unquoted());
             lynx::crashreporter::Session session;
