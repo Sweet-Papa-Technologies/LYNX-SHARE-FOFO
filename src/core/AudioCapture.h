@@ -21,7 +21,10 @@ public:
     static constexpr std::size_t capacity = std::size_t (1) << 18; // ~5.5 s at 48 kHz
     static constexpr std::size_t maxWraps = 256;
 
-    AudioCapture() = default;
+    // The shared stream's ring is there from the start (as upstream's one ring); an editor's own stream gets its ring
+    // the first time it is given a source (2 MB each: a MeterBank has three AudioCaptures, and the app has several
+    // MeterBanks, so eight rings each from the start was 180 MB more than upstream).
+    AudioCapture() { streams[0].allocate(); }
 
     // UI: allocate / release a dedicated capture stream for an editor instance (0 is the default shared stream).
     int acquireStream() noexcept
@@ -136,11 +139,22 @@ private:
 
     struct Stream
     {
-        Stream() : left (capacity), right (capacity) {}
+        // UI. Only while the stream's source is off and has always been (the audio thread reads the ring only after it
+        // has seen a source, which is stored after this).
+        void allocate()
+        {
+            if (left.empty())
+            {
+                left.assign (capacity, 0.0f);
+                right.assign (capacity, 0.0f);
+            }
+        }
 
         void setSource (int newSource) noexcept
         {
             source.store (off, std::memory_order_release);
+            if (newSource != off)
+                allocate();
             readIndex.store (writeIndex.load (std::memory_order_acquire), std::memory_order_release);
             wrapRead.store (wrapWrite.load (std::memory_order_acquire), std::memory_order_release);
             dropped.store (0, std::memory_order_relaxed);
@@ -149,7 +163,7 @@ private:
 
         void push (int from, const float* l, const float* r, int n) noexcept
         {
-            if (source.load (std::memory_order_relaxed) != from)
+            if (source.load (std::memory_order_acquire) != from) // (acquire: a source seen means its ring is there)
                 return;
             if (r == nullptr)
                 r = l;
