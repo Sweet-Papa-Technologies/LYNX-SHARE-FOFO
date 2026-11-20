@@ -1,13 +1,14 @@
 #pragma once
 
 // In-app update check (round 166b), the logic without JUCE (tested in isolation; the app side is ui/Updater.h):
-// - the GitHub releases list of Ka1-S/LYNX-SHARE (JSON) parsed into releases, drafts skipped, prereleases included;
+// - the GitHub releases list of Sweet-Papa-Technologies/LYNX-SHARE-FOFO (JSON) parsed into releases, drafts skipped;
+// - the update channel: Stable offers releases only, Beta prereleases (the nightly "-beta.YYYYMMDD" builds) too;
 // - semantic-version comparison of a release tag ("v0.1.21-alpha") with the running version (CMake's "0.1.20");
 // - the build flavour LYNX runs as (installer, portable zip, Store, macOS, AppImage, tar.gz), the update method and
 //   the release asset that flavour uses;
 // - the release's SHA256SUMS.txt line for a file;
 // - the release notes (Markdown) as readable lines;
-// - the settings file (automatic check on/off, the skipped version, the time of the last check).
+// - the settings file (automatic check on/off, the channel, the skipped version, the time of the last check).
 
 #include <cstdint>
 #include <string>
@@ -51,8 +52,21 @@ struct Release
 // is not a version are dropped. `error` (optional) gets the reason when the text is not that JSON.
 std::vector<Release> parseReleases (const std::string& json, std::string* error = nullptr);
 
-// The newest non-draft release newer than `running`, or -1.
-int newestIndex (const std::vector<Release>& releases, const Version& running);
+// Which releases a user is offered: Stable only releases (no prerelease flag, no prerelease part in the tag), Beta
+// both, the newest by semver ("0.1.28-beta.20261117" -> "0.1.28" too). byVersion: the running build decides.
+enum class Channel
+{
+    byVersion, // not chosen: Beta when the running version has a prerelease part, else Stable
+    stable,
+    beta
+};
+Channel defaultChannel (const Version& running); // stable or beta
+const char* channelId (Channel);                 // "", "stable", "beta"
+Channel channelFromId (const std::string& id);   // byVersion for anything else
+bool isPrerelease (const Release&);              // GitHub's flag or a prerelease part in the tag
+
+// The newest non-draft release newer than `running` on `channel` (byVersion: defaultChannel (running)), or -1.
+int newestIndex (const std::vector<Release>& releases, const Version& running, Channel channel = Channel::byVersion);
 
 // --- build flavours ---------------------------------------------------------------------------------------------
 enum class Flavour
@@ -134,11 +148,14 @@ std::string releaseNotesText (const std::vector<NoteLine>&); // the same as plai
 struct Settings
 {
     bool automatic = true;      // Settings › General › "Check for updates automatically"
+    Channel channel = Channel::byVersion; // Settings › General › Stable / Beta (byVersion until the user picks one)
     std::string skipped;        // the version the user skipped (✕ on the bar): that one and older stay quiet
     std::int64_t lastCheckMs = 0; // when the release list was last fetched (the cache's age)
 };
 Settings parseSettings (const std::string& text);
 std::string formatSettings (const Settings&);
+// The channel in effect: the one chosen, else the running build's default.
+Channel channelFor (const Settings&, const Version& running);
 
 // Whether the bar shows `release`: a manual check always, an automatic one unless that version (or a newer one)
 // was skipped.
@@ -149,8 +166,8 @@ bool shouldShow (const Release& release, const Settings& settings, bool manual);
 constexpr std::int64_t cacheLifetimeMs = 3LL * 60 * 60 * 1000;
 bool cacheFresh (std::int64_t lastCheckMs, std::int64_t nowMs);
 
-// The GitHub API address of the release list (prereleases included; drafts are only listed for the repository's
-// own token, and dropped anyway).
-constexpr const char* releasesUrl = "https://api.github.com/repos/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases?per_page=10";
+// The GitHub API address of the release list (prereleases included, newest first: a week of nightly betas plus the
+// weekly release fits several times over; drafts are only listed for the repository's own token, and dropped anyway).
+constexpr const char* releasesUrl = "https://api.github.com/repos/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases?per_page=30";
 constexpr const char* releasesPage = "https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases";
 } // namespace lynx::update

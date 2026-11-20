@@ -415,7 +415,7 @@ void check (bool manual)
             saveSettings (settings);
         }
         const auto running = runningVersion();
-        const auto best = update::newestIndex (releases, running);
+        const auto best = update::newestIndex (releases, running, update::channelFor (settings, running));
         update::Release found;
         if (best >= 0)
             found = releases[(std::size_t) best];
@@ -740,6 +740,17 @@ void setAutomatic (bool on)
     if (s.automatic == on)
         return;
     s.automatic = on;
+    saveSettings (s);
+}
+
+update::Channel channel() { return update::channelFor (loadSettings(), runningVersion()); }
+
+void setChannel (update::Channel c)
+{
+    auto s = loadSettings();
+    if (update::channelFor (s, runningVersion()) == c)
+        return; // unchanged: an unchosen channel stays unchosen (it follows the build)
+    s.channel = c;
     saveSettings (s);
 }
 

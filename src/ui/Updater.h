@@ -30,6 +30,11 @@ bool offered(); // this build looks for updates at all (false: the Store build) 
 bool automatic();
 void setAutomatic (bool on);
 
+// Stable (releases only) or Beta (the nightly prereleases too); until the user picks one, the running build's own
+// version decides (a "-beta..." build is on Beta).
+update::Channel channel(); // stable or beta
+void setChannel (update::Channel c);
+
 // What the main window lends the updater: "save the project, then go on" (the quit prompt) and the project to reopen.
 struct Host
 {

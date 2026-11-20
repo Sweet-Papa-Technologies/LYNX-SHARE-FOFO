@@ -6,10 +6,10 @@ namespace
 {
 // a trimmed copy of GitHub's /releases answer: a draft, two prereleases, a tag that is no version, escapes
 const char* updateFixture = R"json([
-  {"url":"x","html_url":"https://github.com/Ka1-S/LYNX-SHARE/releases/tag/v0.1.23-alpha","tag_name":"v0.1.23-alpha",
+  {"url":"x","html_url":"https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/tag/v0.1.23-alpha","tag_name":"v0.1.23-alpha",
    "name":"LYNX SHARE 0.1.23-alpha","draft":true,"prerelease":true,"body":"draft","assets":[]},
-  {"html_url":"https://github.com/Ka1-S/LYNX-SHARE/releases/tag/v0.1.22-alpha","tag_name":"v0.1.22-alpha",
-   "name":"LYNX SHARE 0.1.22-alpha","draft":false,"prerelease":true,"id":12345678,"author":{"login":"Ka1-S","id":1},
+  {"html_url":"https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/tag/v0.1.22-alpha","tag_name":"v0.1.22-alpha",
+   "name":"LYNX SHARE 0.1.22-alpha","draft":false,"prerelease":true,"id":12345678,"author":{"login":"SweetPapa","id":1},
    "body":"## New\r\n- **Update** button — see [the docs](https://x/y)\r\n- Café 🌶\r\n\r\n## Fixes\r\n* `crash` fixed\r\n",
    "assets":[
      {"name":"LYNX-0.1.22-alpha-linux-x86_64.tar.gz","size":40000000,"browser_download_url":"https://github.com/d/LYNX-0.1.22-alpha-linux-x86_64.tar.gz"},
@@ -22,7 +22,7 @@ const char* updateFixture = R"json([
      {"name":"LYNX.exe","size":90000000,"browser_download_url":"https://github.com/d/LYNX.exe"},
      {"name":"SHA256SUMS.txt","size":900,"browser_download_url":"https://github.com/d/SHA256SUMS.txt"}]},
   {"html_url":"h","tag_name":"nightly","name":"not a version","draft":false,"prerelease":true,"body":"","assets":[]},
-  {"html_url":"https://github.com/Ka1-S/LYNX-SHARE/releases/tag/v0.1.21-alpha","tag_name":"v0.1.21-alpha","name":"LYNX SHARE 0.1.21-alpha",
+  {"html_url":"https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/tag/v0.1.21-alpha","tag_name":"v0.1.21-alpha","name":"LYNX SHARE 0.1.21-alpha",
    "draft":false,"prerelease":true,"body":null,"assets":[]},
   {"html_url":"h","tag_name":"v0.1.20-alpha","draft":false,"prerelease":true,"body":"old","assets":[], "reactions":{"+1":3}, "x":[1,2.5e3,-4,true,false,null]}
 ])json";
@@ -64,17 +64,21 @@ TEST (update166b_parses_the_release_list_and_picks_the_newest)
     CHECK (releases[0].draft && releases[0].version.text() == "0.1.23-alpha");
     const auto& r = releases[1];
     CHECK (r.tag == "v0.1.22-alpha" && r.name == "LYNX SHARE 0.1.22-alpha" && r.prerelease && ! r.draft);
-    CHECK (r.page == "https://github.com/Ka1-S/LYNX-SHARE/releases/tag/v0.1.22-alpha");
+    CHECK (r.page == "https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/tag/v0.1.22-alpha");
     CHECK (r.assets.size() == 9 && r.assets[2].size == 30000000 && r.assets[2].url == "https://github.com/d/LYNX-0.1.22-alpha-setup-x64.exe");
     CHECK (r.body.find ("\xE2\x80\x94") != std::string::npos);     // —
     CHECK (r.body.find ("Caf\xC3\xA9 \xF0\x9F\x8C\xB6") != std::string::npos); // é and a surrogate pair
     CHECK (releases[2].body.empty()); // "body": null
 
-    // the draft (0.1.23) is skipped: 0.1.22-alpha is the update for 0.1.20 and 0.1.21
-    CHECK (newestIndex (releases, parseVersion ("0.1.20")) == 1);
-    CHECK (newestIndex (releases, parseVersion ("0.1.21")) == 1);
-    CHECK (newestIndex (releases, parseVersion ("0.1.22")) == -1);   // up to date (the release build of 0.1.22-alpha)
-    CHECK (newestIndex (releases, parseVersion ("0.2.0")) == -1);
+    // the draft (0.1.23) is skipped: on Beta 0.1.22-alpha is the update for 0.1.20 and 0.1.21
+    CHECK (newestIndex (releases, parseVersion ("0.1.20"), Channel::beta) == 1);
+    CHECK (newestIndex (releases, parseVersion ("0.1.21"), Channel::beta) == 1);
+    CHECK (newestIndex (releases, parseVersion ("0.1.21-alpha")) == 1); // a prerelease build is on Beta by default
+    CHECK (newestIndex (releases, parseVersion ("0.1.22"), Channel::beta) == -1); // up to date (the release build of 0.1.22-alpha)
+    CHECK (newestIndex (releases, parseVersion ("0.2.0"), Channel::beta) == -1);
+    // every one of them is a prerelease: nothing for a release build on Stable (its default)
+    CHECK (newestIndex (releases, parseVersion ("0.1.20")) == -1);
+    CHECK (newestIndex (releases, parseVersion ("0.1.20"), Channel::stable) == -1);
 
     // one release object, an error answer, garbage
     const auto one = parseReleases (R"({"tag_name":"v1.0.0","draft":false,"assets":[{"name":"a","browser_download_url":"u"}]})");
@@ -177,6 +181,81 @@ TEST (update166b_checksum_verification)
     abc.add ("abc", 3);
     CHECK (abc.finish() == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"); // FIPS 180-2 example
     CHECK (! checksumMatches ("", "") && ! checksumMatches (std::string (64, 'g'), std::string (64, 'g')));
+}
+
+namespace
+{
+// nightly betas around the weekly releases, newest first as GitHub lists them; one tagged as a release by mistake
+const char* channelFixture = R"json([
+  {"html_url":"h","tag_name":"v0.1.29-beta.20261124","draft":true,"prerelease":true,"assets":[]},
+  {"html_url":"h","tag_name":"v0.1.29-beta.20261123","draft":false,"prerelease":true,"assets":[]},
+  {"html_url":"h","tag_name":"v0.1.28","draft":false,"prerelease":false,"assets":[]},
+  {"html_url":"h","tag_name":"v0.1.28-beta.20261121","draft":false,"prerelease":false,"assets":[]},
+  {"html_url":"h","tag_name":"v0.1.28-beta.20261117","draft":false,"prerelease":true,"assets":[]},
+  {"html_url":"h","tag_name":"v0.1.27","draft":false,"prerelease":false,"assets":[]}
+])json";
+} // namespace
+
+TEST (update_channel_stable_and_beta)
+{
+    using namespace lynx::update;
+    const auto releases = parseReleases (channelFixture);
+    CHECK (releases.size() == 6);
+    if (releases.size() != 6)
+        return;
+    auto newest = [&] (const char* running, Channel c) {
+        const auto i = newestIndex (releases, parseVersion (running), c);
+        return i < 0 ? std::string ("-") : releases[(std::size_t) i].version.text();
+    };
+    // Stable: releases only (GitHub's flag and the tag's prerelease part both count), the draft never
+    CHECK (newest ("0.1.26", Channel::stable) == "0.1.28");
+    CHECK (newest ("0.1.27", Channel::stable) == "0.1.28");
+    CHECK (newest ("0.1.28", Channel::stable) == "-");
+    CHECK (! isPrerelease (releases[2]) && isPrerelease (releases[1]) && isPrerelease (releases[3]));
+    // Beta: both, the newest by semver
+    CHECK (newest ("0.1.27", Channel::beta) == "0.1.29-beta.20261123");
+    CHECK (newest ("0.1.28", Channel::beta) == "0.1.29-beta.20261123");
+    CHECK (newest ("0.1.29-beta.20261123", Channel::beta) == "-");
+    // a beta whose next release is the final one is offered it (0.1.28-beta.x < 0.1.28)
+    const auto noNightly = std::vector<Release> (releases.begin() + 2, releases.end());
+    const auto i = newestIndex (noNightly, parseVersion ("0.1.28-beta.20261121"), Channel::beta);
+    CHECK (i >= 0 && noNightly[(std::size_t) std::max (i, 0)].version.text() == "0.1.28");
+    // a beta user who switches to Stable is offered the next release only
+    CHECK (newest ("0.1.28-beta.20261117", Channel::stable) == "0.1.28");
+    CHECK (newest ("0.1.28-beta.20261121", Channel::stable) == "0.1.28");
+
+    // the default channel comes from the running build's own version
+    CHECK (defaultChannel (parseVersion ("0.1.28-beta.20261117")) == Channel::beta);
+    CHECK (defaultChannel (parseVersion ("0.1.21-alpha")) == Channel::beta);
+    CHECK (defaultChannel (parseVersion ("0.1.28")) == Channel::stable);
+    CHECK (defaultChannel (parseVersion ("0.1.28+build.5")) == Channel::stable);
+    CHECK (defaultChannel (parseVersion ("nonsense")) == Channel::stable);
+    CHECK (newest ("0.1.27", Channel::byVersion) == "0.1.28");
+    CHECK (newest ("0.1.28-beta.20261117", Channel::byVersion) == "0.1.29-beta.20261123");
+
+    // the settings: not chosen -> the build decides; a choice is saved and wins
+    for (auto c : { Channel::byVersion, Channel::stable, Channel::beta })
+        CHECK (channelFromId (channelId (c)) == c);
+    CHECK (channelFromId ("Beta") == Channel::byVersion && channelFromId ("") == Channel::byVersion);
+    const auto none = parseSettings ("automatic=1\n");
+    CHECK (none.channel == Channel::byVersion && formatSettings (none).find ("channel") == std::string::npos);
+    CHECK (channelFor (none, parseVersion ("0.1.28")) == Channel::stable);
+    CHECK (channelFor (none, parseVersion ("0.1.28-beta.20261117")) == Channel::beta);
+    for (auto c : { Channel::stable, Channel::beta })
+    {
+        Settings s;
+        s.automatic = false;
+        s.channel = c;
+        s.skipped = "0.1.28";
+        s.lastCheckMs = 1761900000000LL;
+        const auto again = parseSettings (formatSettings (s));
+        CHECK (again.channel == c && ! again.automatic && again.skipped == "0.1.28" && again.lastCheckMs == s.lastCheckMs);
+        CHECK (channelFor (again, parseVersion ("0.1.28")) == c);
+        CHECK (channelFor (again, parseVersion ("0.1.28-beta.20261117")) == c);
+    }
+    CHECK (parseSettings ("channel=beta\n").channel == Channel::beta);
+    CHECK (parseSettings ("channel = stable\n").channel == Channel::stable);
+    CHECK (parseSettings ("channel=nightly\n").channel == Channel::byVersion);
 }
 
 TEST (update166b_skip_version_and_settings)

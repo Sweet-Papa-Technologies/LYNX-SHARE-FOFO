@@ -6597,6 +6597,7 @@ void MainComponent::openSettings (int page)
         o.limitEditors = editorlimit::enabled();
         o.crashReports = (int) crashreporter::consent();
         o.checkUpdates = updater::automatic();
+        o.betaUpdates = updater::channel() == update::Channel::beta;
         return o;
     };
     hooks.setGeneral = [safe] (const GeneralOptions& o) {
@@ -6662,6 +6663,7 @@ void MainComponent::openSettings (int page)
         if (o.crashReports != (int) crashreporter::consent())
             crashreporter::setConsent ((crashreport::Consent) juce::jlimit (0, 2, o.crashReports));
         updater::setAutomatic (o.checkUpdates);
+        updater::setChannel (o.betaUpdates ? update::Channel::beta : update::Channel::stable);
         ChannelRackComponent::keepEditorsOpen = o.keepEditorsOpen;
         ChannelRackComponent::selectFirstChannelWithNotes = o.selectFirstChannelWithNotes;
         PianoRollComponent::monophonicPainting = o.monophonicPainting;
