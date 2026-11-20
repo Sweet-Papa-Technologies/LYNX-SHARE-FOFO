@@ -60,7 +60,7 @@ TEST (polish190jp_colour_dots_set_their_tokens)
     spec.dots[(std::size_t) Dot::mute] = 0xff808080;
     const auto p = adjustedPalette (spec);
     CHECK (p.accentHover == 0xff30a5ff && p.textPrimary == 0xffffffff && p.textDisabled == 0xff808080);
-    CHECK (p.selectionFill == 0x2e00ff00); // (the fill keeps its own alpha)
+    CHECK (p.selectionFill == 0x3800ff00); // (the fill keeps its own alpha: 0x38 in the fork's palette, 0x2e upstream)
     CHECK (p.accent == defaultAccent);
     CHECK (spec.hasDots() && ! spec.isDefaultLook());
     CHECK (std::string (dotId (Dot::selection)) == "selection" && std::string (dotId (Dot::text)) == "text" && dotCount == 8);

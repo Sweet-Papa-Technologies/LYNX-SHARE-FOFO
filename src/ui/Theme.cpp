@@ -384,6 +384,10 @@ themes::Palette& paletteInUse()
 }
 // (the largest channel difference a tile may show against its shape drawn straight, --selftest; see paintCacheSelfTest)
 constexpr int nativeTolerance = 1, nativeKnobTolerance = 3;
+// Fork (LYNX-SHARE-FOFO): with the fork's palette the knob (several layers over one another) from a tile is 2 levels
+// from the knob drawn straight on the software renderer (measured on Linux and macOS; 1 with upstream's palette, whose
+// drawing code is the same). Single shapes stay at 1.
+constexpr int softwareKnobTolerance = 2;
 } // namespace
 
 ClipLook clipBody (juce::Colour clipColour, juce::Colour trackColour, ClipKind kind, ClipStyle style)
@@ -1004,8 +1008,9 @@ juce::String paintCacheSelfTest()
                 (shape.single ? worstSingle : worstKnob) = juce::jmax (shape.single ? worstSingle : worstKnob, worst);
             }
         detail << (native ? ", native" : "software") << " shapes " << worstSingle << " / knob " << worstKnob;
-        if (! native && (worstSingle > 1 || worstKnob > 1))
-            return "ERROR a tile differs from its shape on the software renderer by more than 1 level (" + detail + ")";
+        if (! native && (worstSingle > 1 || worstKnob > softwareKnobTolerance))
+            return "ERROR a tile differs from its shape on the software renderer by more than 1 level (knob: "
+                   + juce::String (softwareKnobTolerance) + ") (" + detail + ")";
         if (worstSingle > nativeTolerance || worstKnob > nativeKnobTolerance)
             return "ERROR a tile differs from its shape (" + detail + ")";
     }

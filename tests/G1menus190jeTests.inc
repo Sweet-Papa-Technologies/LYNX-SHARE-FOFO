@@ -107,7 +107,7 @@ TEST (g1menus190je_menu_colours_read)
     using namespace lynx::themes;
     const auto& p = defaultPalette();
     const auto m = menuColours (p, MenuStyle::lynxDark);
-    CHECK (m.background == p.bg3 && m.band == 0xff2a3346);
+    CHECK (m.background == p.bg3 && m.band == 0xff2a3347);
     CHECK (contrastRatio (m.text, m.background) >= textContrastFloor);
     CHECK (contrastRatio (m.shortcut, m.background) >= textContrastFloor);
     CHECK (contrastRatio (m.disabled, m.background) >= disabledContrastFloor);
