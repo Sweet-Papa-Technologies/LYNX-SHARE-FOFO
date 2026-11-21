@@ -22655,6 +22655,68 @@ private:
         };
 
         {
+            // SPT fork (LYNX-SHARE-FOFO): a project of the fork from before upstream's Edison (0.1.25 - 0.1.27) kept an
+            // Edison slot's audio inside the project ("recorder" on the slot, no file; the text is the same as the
+            // fork's writer made). Opened now, the slot's session gets that audio; the flush before a save writes it as
+            // the slot's WAV and the slot lets go of the document; the project saved then opens with the same audio.
+            const auto forkFolder = folder.getChildFile ("fork-0.1.27");
+            forkFolder.deleteRecursively();
+            lynx::AudioEngine engine (false);
+            engine.setRecordingTarget (forkFolder.getChildFile ("Audio").getChildFile ("Recorded"), "Fork");
+            auto doc = std::make_shared<ae::Document>();
+            doc->audio.sampleRate = 44100.0;
+            doc->audio.channels = { std::vector<float> (3000), std::vector<float> (3000) };
+            for (int k = 0; k < 3000; ++k)
+            {
+                doc->audio.channels[0][(std::size_t) k] = 0.5f * (float) std::sin (0.05 * k);
+                doc->audio.channels[1][(std::size_t) k] = -0.25f * (float) std::sin (0.03 * k);
+            }
+            ae::addMarker (*doc, 1000, "Fork take");
+            auto song = engine.getSong();
+            if (song.mixer.size() < 2)
+                song.mixer.resize (2);
+            auto slot = lynx::makeEffectSlot (lynx::EffectKind::edison);
+            slot.recorderDocument = doc;
+            song.mixer[1].effects = { slot };
+            juce::String error;
+            auto old = lynx::ProjectFile::fromJson (lynx::ProjectFile::toJson (song, false), error);
+            check ("fork_0127_slot_read_with_its_audio", old.has_value() && old->mixer[1].effects.size() == 1
+                                                           && old->mixer[1].effects[0].kind == lynx::EffectKind::edison
+                                                           && old->mixer[1].effects[0].recorderDocument != nullptr
+                                                           && old->mixer[1].effects[0].samplePath.empty(), error);
+            if (old)
+            {
+                engine.setSong (std::move (*old));
+                engine.dispatchPendingMessages();
+                const auto session = ef::findSession (engine.getSong().mixer[1].effects[0].instance.id);
+                check ("fork_0127_slot_audio_in_the_session", session != nullptr && session->document().audio.channels == doc->audio.channels
+                                                                && session->document().markers.size() == 1 && session->dirty());
+                engine.flushEdisonAudio();
+                engine.dispatchPendingMessages();
+                const auto& migrated = engine.getSong().mixer[1].effects[0];
+                const juce::File file (juce::String::fromUTF8 (migrated.samplePath.c_str()));
+                check ("fork_0127_slot_audio_written_as_a_file", file.existsAsFile() && file.isAChildOf (forkFolder), file.getFullPathName());
+                check ("fork_0127_slot_lets_go_of_the_document", migrated.recorderDocument == nullptr);
+                const auto project = forkFolder.getChildFile ("fork-0.1.27.lynx");
+                check ("fork_0127_project_saved", lynx::ProjectFile::save (engine.getSong(), project, error), error);
+                if (auto again = lynx::ProjectFile::load (project, error))
+                {
+                    check ("fork_0127_saved_slot_has_no_embedded_audio", again->mixer.size() > 1 && again->mixer[1].effects.size() == 1
+                                                                           && again->mixer[1].effects[0].recorderDocument == nullptr
+                                                                           && again->mixer[1].effects[0].samplePath == migrated.samplePath);
+                    lynx::AudioEngine second (false);
+                    second.setSong (std::move (*again));
+                    second.dispatchPendingMessages();
+                    const auto reopened = ef::findSession (second.getSong().mixer[1].effects[0].instance.id);
+                    check ("fork_0127_reopened_project_has_the_audio", reopened != nullptr && reopened != session
+                                                                         && reopened->document().audio.channels == doc->audio.channels);
+                }
+                else
+                    check ("fork_0127_project_loaded", false, error);
+            }
+        }
+
+        {
             lynx::AudioEngine engine (false);
             engine.setRecordingTarget (folder.getChildFile ("Audio").getChildFile ("Recorded"), "Test");
 
