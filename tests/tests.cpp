@@ -22,7 +22,13 @@
 #include <tuple>
 #include <vector>
 
+#include "core/FlTrackMenus.h" // round 190dx
+#include "core/OneClickRec.h"
+#include "core/TakeRecording.h"
+
 #if defined(__SSE__) || defined(_M_X64) || defined(__x86_64__) || defined(__aarch64__) || defined(_M_ARM64) // x86 SSE, or ARM64 through core/Simd.h (sse2neon)
+#include "core/FlControlMenus.h"
+#include "core/LinkFormula.h"
 #include "core/Multilink.h"
 #include "core/Simd.h"
 #endif
@@ -40,6 +46,7 @@
 #include "core/FruityMultiband.h"
 #include "core/Denormals.h"
 #include "core/TestProfile.h"
+#include "core/FlCurve.h"
 #include "core/FlpImport.h"
 #include "core/MidiControls.h"
 #include "core/MidiImport.h"
@@ -123,6 +130,7 @@
 #include "core/PitchShifterFl.h"
 #include "core/FruityFilters.h"
 #include "core/NewtoneFx.h"
+#include "core/EdisonFx.h"
 #include "core/FruityDelay.h"
 #include "core/StereoFx.h"
 #include "core/FrequencySplitter.h"
@@ -135,9 +143,16 @@
 #include "core/DelphiMath.h"
 #include "core/LiveEventQueue.h"
 #include "core/RackRenderer.h"
+#include "core/PerfProjects.h"
+#include "core/TempoMap.h"
+#include "core/ActivityLight.h" // round 190ih
+#include "core/LiveNote.h"
+#include "core/LiveKeys.h"
+#include "core/PresetMix.h"
 #include "core/PinOnTop.h"
 #include "core/MetronomeVoice.h"
 #include "engine/Transport.h"
+#include "engine/RemoteHistory.h"
 #include "core/Patcherize.h"
 #include "core/Performance.h"
 #include "core/Scheduler.h"
@@ -160,6 +175,7 @@
 #include "core/LiveRecordView.h"
 #include "core/Recorder.h"
 #include "core/KeyMap.h"
+#include "core/EventPaneSplit.h" // round 190fz
 #include "core/UndoKeys.h"
 #include "core/SortOnce.h"
 #include "core/RackOps.h"
@@ -176,6 +192,7 @@
 #include "core/PluginSubstitutes.h"
 #include "core/ClipOps.h"
 #include "core/PlaylistOps.h"
+#include "core/PluginDrop.h"
 #include "core/QuickRender.h"
 #include "core/TouchKeyboard.h"
 #include "core/HeldNotes.h"
@@ -184,6 +201,8 @@
 #include "ui/I18nData.h"
 #include "ui/I18nLocale.h"
 #include "core/CrashReport.h"
+#include "core/RenderAhead.h"
+#include "core/WorkerPool.h"
 
 namespace
 {
@@ -534,10 +553,12 @@ TEST (flp_channel_level_adjustments_and_stretched_clip_start)
     CHECK (song.channels.size() == 1 && song.playlist.size() == 1);
     if (song.channels.size() != 1 || song.playlist.size() != 1)
         return;
-    // gain = f(volume)·f(volAdj), pan = pan + panAdj
+    // gain = f(volume)·f(volAdj), pan = pan + panAdj (round 190dz: the adjustments are the channel's own Levels
+    // adjustment, the knobs read as in FL)
     const auto expected = lynx::channelGain (10000.0f / 12800.0f) * lynx::channelGain (7286.0f / 12800.0f);
-    CHECK (std::abs (lynx::channelGain (song.channels[0].volume) - expected) < 1e-5f);
-    CHECK (std::abs (song.channels[0].pan - 0.5f) < 1e-6f);
+    CHECK (std::abs (lynx::channelGain (song.channels[0].volume) * lynx::levelAdjustGain (song.channels[0].misc.levels.volume) - expected) < 1e-5f);
+    CHECK (std::abs (song.channels[0].volume - 10000.0f / 12800.0f) < 1e-6f);
+    CHECK (std::abs (lynx::adjustedPan (song.channels[0].pan, song.channels[0].misc.levels.pan) - 0.5f) < 1e-6f);
     // 788.46 sample ms / 1.056892 = 746.0 ms = 1.6164 beats into the clip
     CHECK (song.channels[0].sampler.stretchBeats > 0.0f);
     CHECK (std::llabs (song.playlist[0].offset - (std::int64_t) std::llround (1.61638 * lynx::ppq)) <= 1);
@@ -2409,9 +2430,9 @@ TEST (pattern_toggle_step_and_length)
     p.toggleStep (0, 4);
     CHECK (p.hasStep (0, 4));
     CHECK (p.notes.size() == 1 && p.notes[0].start == 4 * lynx::ticksPerStep);
-    CHECK (p.effectiveLength (4) == 4 * lynx::ppq); // one bar
+    CHECK (p.effectiveLength (lynx::Meter (4, 4)) == 4 * lynx::ppq); // one bar
     p.toggleStep (1, 20);                            // second bar
-    CHECK (p.effectiveLength (4) == 8 * lynx::ppq);
+    CHECK (p.effectiveLength (lynx::Meter (4, 4)) == 8 * lynx::ppq);
     p.toggleStep (0, 4);
     CHECK (! p.hasStep (0, 4) && p.notes.size() == 1);
 }
@@ -2455,7 +2476,7 @@ TEST (scheduler_places_events_at_exact_samples)
     const auto tps = lynx::ticksPerSample (bpm, sr);
     lynx::EventBuffer ev;
 
-    lynx::schedulePatternLoop (p, p.effectiveLength (4), 23900.0 * tps, 512, tps, ev);
+    lynx::schedulePatternLoop (p, p.effectiveLength (lynx::Meter (4, 4)), 23900.0 * tps, 512, tps, ev);
     // the beat-2 note starts at sample 24000 -> offset 100 in this block
     int ons = 0;
     for (auto& e : ev)
@@ -2471,7 +2492,7 @@ TEST (scheduler_wraps_the_loop)
 {
     lynx::Pattern p;
     p.toggleStep (2, 0);
-    const auto len = p.effectiveLength (4); // 3840 ticks
+    const auto len = p.effectiveLength (lynx::Meter (4, 4)); // 3840 ticks
     const double sr = 48000.0;
     const auto tps = lynx::ticksPerSample (120.0, sr);
     lynx::EventBuffer ev;
@@ -2500,7 +2521,7 @@ TEST (scheduler_off_before_on_at_same_sample)
     p.notes = { a, b };
     const auto tps = lynx::ticksPerSample (120.0, 48000.0);
     lynx::EventBuffer ev;
-    lynx::schedulePatternLoop (p, p.effectiveLength (4), 200.0, 4000, tps, ev);
+    lynx::schedulePatternLoop (p, p.effectiveLength (lynx::Meter (4, 4)), 200.0, 4000, tps, ev);
 
     CHECK (ev.size() >= 2);
     CHECK (ev[0].type == lynx::NoteEvent::Type::off);
@@ -4805,12 +4826,36 @@ TEST (plugin_factories_create_reuse_and_fallback)
     CHECK (instrumentsMade == 1 && effectsMade == 1);
     CHECK (a->instruments.size() == 2 && a->instruments[1] != nullptr); // missing: muted, but it exists
 
-    // changing the saved state doesn't recreate; swapping the plugin does
+    // Default startup keeps the established reuse contract: saving/capturing
+    // different serialized bytes by itself must not recreate hosted instances.
+    auto storedOnly = s;
+    storedOnly.channels[0].plugin.state = "captured instrument without opt-in";
+    storedOnly.mixer[1].effects[0].plugin.state = "captured effect without opt-in";
+    auto ordinary = lynx::RackState::build (storedOnly, a.get(), 48000.0, f);
+    CHECK (instrumentsMade == 1 && effectsMade == 1);
+    CHECK (ordinary->instruments[0] == a->instruments[0] && ordinary->effects[1][0] == a->effects[1][0]);
+
+    // Serialized state changes and undo preserve running instances. Remote control
+    // applies deliberate state edits in place through the engine, outside this factory.
     s.channels[0].plugin.state = "abc";
     auto b = lynx::RackState::build (s, a.get(), 48000.0, f);
     CHECK (instrumentsMade == 1 && b->instruments[0] == a->instruments[0] && b->effects[1][0] == a->effects[1][0]);
+    s.mixer[1].effects[0].plugin.state = "new effect state";
+    auto changed = lynx::RackState::build (s, b.get(), 48000.0, f);
+    CHECK (instrumentsMade == 1 && effectsMade == 1 && changed->effects[1][0] == b->effects[1][0]);
+    s.channels[0].plugin.state.clear();
+    s.mixer[1].effects[0].plugin.state.clear();
+    auto undone = lynx::RackState::build (s, changed.get(), 48000.0, f);
+    CHECK (instrumentsMade == 1 && effectsMade == 1);
+    CHECK (undone->instruments[0] == changed->instruments[0] && undone->effects[1][0] == changed->effects[1][0]);
+    auto capturedShape = *undone;
+    capturedShape.song.channels[0].plugin.state = s.channels[0].plugin.state = "captured instrument";
+    capturedShape.song.mixer[1].effects[0].plugin.state = s.mixer[1].effects[0].plugin.state = "captured effect";
+    auto captured = lynx::RackState::build (s, &capturedShape, 48000.0, f);
+    CHECK (instrumentsMade == 1 && effectsMade == 1);
+    CHECK (captured->instruments[0] == undone->instruments[0] && captured->effects[1][0] == undone->effects[1][0]);
     s.mixer[1].effects[0].plugin.id = "VST3-Outro-1";
-    auto c2 = lynx::RackState::build (s, b.get(), 48000.0, f);
+    auto c2 = lynx::RackState::build (s, captured.get(), 48000.0, f);
     CHECK (effectsMade == 2);
 
     // rendering with a missing plugin and a plugin slot breaks nothing
@@ -4832,6 +4877,164 @@ TEST (plugin_factories_create_reuse_and_fallback)
         peak = std::max (peak, std::abs (v));
     }
     CHECK (peak > 0.0f);
+}
+
+TEST (remote_reset_replaces_only_requested_instances_and_default_reuse_stays_unchanged)
+{
+    lynx::Song source;
+    source.mixer = lynx::Song::defaultMixer (2);
+    for (const auto* id : { "Synth A", "Synth B" })
+    {
+        lynx::ChannelDef channel;
+        channel.instrument = lynx::InstrumentKind::plugin;
+        channel.plugin.id = id;
+        channel.plugin.state = std::string ("saved ") + id;
+        source.channels.push_back (std::move (channel));
+    }
+    for (const auto* id : { "Effect A", "Effect B" })
+    {
+        lynx::EffectSlot effect;
+        effect.kind = lynx::EffectKind::plugin;
+        effect.plugin.id = id;
+        effect.plugin.state = std::string ("saved ") + id;
+        source.mixer[1].effects.push_back (std::move (effect));
+    }
+    int instrumentsMade = 0, effectsMade = 0;
+    std::string lastInstrumentState, lastEffectState;
+    lynx::RackState::Factories normal;
+    normal.pluginInstruments = [&] (const lynx::PluginRef& ref, double) -> std::shared_ptr<lynx::Instrument> {
+        ++instrumentsMade;
+        lastInstrumentState = ref.state;
+        return lynx::makeInstrument (lynx::InstrumentKind::synth);
+    };
+    normal.pluginEffects = [&] (const lynx::PluginRef& ref, double) -> std::shared_ptr<lynx::Effect> {
+        ++effectsMade;
+        lastEffectState = ref.state;
+        return lynx::makeEffect (lynx::EffectKind::eq);
+    };
+    const auto before = lynx::RackState::build (source, nullptr, 48000.0, normal);
+    CHECK (instrumentsMade == 2 && effectsMade == 2);
+    // Round 190az (24047e7a0): an ordinary build keeps a running instance for its own channel / slot (the instance
+    // tag) or for one saved with the same settings. A renewed tag with a cleared state is another device: it is
+    // created anew, with the default state, as a remote reset asks.
+    auto reset = source;
+    reset.channels[0].instance.renew();
+    reset.channels[0].plugin.state.clear();
+    reset.mixer[1].effects[0].instance.renew();
+    reset.mixer[1].effects[0].plugin.state.clear();
+    const auto ordinary = lynx::RackState::build (reset, before.get(), 48000.0, normal);
+    CHECK (instrumentsMade == 3 && effectsMade == 3);
+    CHECK (lastInstrumentState.empty() && lastEffectState.empty()); // factories received actual default-state requests
+    CHECK (ordinary->instruments[0] != before->instruments[0] && ordinary->effects[1][0] != before->effects[1][0]);
+    CHECK (ordinary->instruments[1] == before->instruments[1] && ordinary->effects[1][1] == before->effects[1][1]);
+
+    // With the same saved bytes the positional instance stays in an ordinary build; freshInstances replaces exactly
+    // the devices it names.
+    auto renewed = source;
+    renewed.channels[0].instance.renew();
+    renewed.mixer[1].effects[0].instance.renew();
+    const auto kept = lynx::RackState::build (renewed, before.get(), 48000.0, normal);
+    CHECK (instrumentsMade == 3 && effectsMade == 3);
+    CHECK (kept->instruments[0] == before->instruments[0] && kept->effects[1][0] == before->effects[1][0]);
+    auto requested = normal;
+    requested.freshInstances = { renewed.channels[0].instance.id, renewed.mixer[1].effects[0].instance.id };
+    const auto replaced = lynx::RackState::build (renewed, before.get(), 48000.0, requested);
+    CHECK (instrumentsMade == 4 && effectsMade == 4);
+    CHECK (lastInstrumentState == "saved Synth A" && lastEffectState == "saved Effect A");
+    CHECK (replaced->instruments[0] != before->instruments[0] && replaced->effects[1][0] != before->effects[1][0]);
+    CHECK (replaced->instruments[1] == before->instruments[1] && replaced->effects[1][1] == before->effects[1][1]);
+
+    // The policy belongs to that build only: later ordinary edits reuse the newly created instances.
+    const auto later = lynx::RackState::build (renewed, replaced.get(), 48000.0, normal);
+    CHECK (instrumentsMade == 4 && effectsMade == 4);
+    CHECK (later->instruments[0] == replaced->instruments[0] && later->effects[1][0] == replaced->effects[1][0]);
+}
+
+TEST (remote_history_normalized_restores_preserve_lineage_without_crossing_producer_edits)
+{
+    struct Entry { std::string song; bool remote = false; std::string deviceHash; };
+    std::vector<Entry> undo { { "A", true, "B" }, { "B", true, "C" } }, redo;
+    std::string live = "C";
+    const auto restore = [&] (auto& from, auto& to, const std::string& normalized) {
+        CHECK (! from.empty() && from.back().deviceHash == live);
+        const auto savedTarget = from.back().song;
+        // A real engine inverse stores captured live bytes, even when its raw model blob was older.
+        to.push_back ({ live, true, {} });
+        from.pop_back();
+        live = normalized;
+        lynx::remote_history::acceptRestoredState (to.back(), from.empty() ? nullptr : &from.back(), savedTarget, live);
+    };
+
+    restore (undo, redo, "B-normalized");
+    CHECK (undo.back().deviceHash == live && redo.back().deviceHash == live);
+    CHECK (redo.back().song == "C");
+    restore (undo, redo, "A-normalized");
+    CHECK (undo.empty() && redo.back().song == "B-normalized");
+    restore (redo, undo, "B-normalized-again");
+    CHECK (redo.back().deviceHash == live); // the next redo adopts normalization through the same proven lineage
+    restore (redo, undo, "C-normalized");
+    CHECK (redo.empty() && undo.size() == 2);
+
+    // A producer changed B to D before the following remote edit. Undoing that edit may normalize D, but cannot
+    // promote the older B fence: doing so would silently authorize undo across the producer's opaque edit.
+    undo = { { "A", true, "B" }, { "D", true, "E" } };
+    redo.clear();
+    live = "E";
+    restore (undo, redo, "D-normalized");
+    CHECK (redo.back().deviceHash == live && undo.back().deviceHash == "B");
+    CHECK (undo.back().deviceHash != live); // the next remote-owned undo remains refused
+
+    // An ordinary producer entry never acquires a remote fence even if its bytes happen to match the target.
+    Entry ordinary { "A", false, "B" }, inverse { "C", true, {} };
+    lynx::remote_history::acceptRestoredState (inverse, &ordinary, std::string ("B"), std::string ("B-normalized"));
+    CHECK (ordinary.deviceHash == "B" && inverse.deviceHash == "B-normalized");
+}
+
+TEST (remote_capture_mirror_preserves_projected_shape_and_updates_only_matching_hosted_bytes)
+{
+    lynx::Song captured;
+    lynx::ChannelDef hosted;
+    hosted.instrument = lynx::InstrumentKind::plugin;
+    hosted.plugin.id = "Synth";
+    hosted.plugin.state = "saved";
+    captured.channels = { hosted, hosted };
+    captured.channels[1].instance.renew();
+    lynx::ChannelDef patcher;
+    patcher.instrument = lynx::InstrumentKind::patcher;
+    lynx::PatchNode nested;
+    nested.generator = true;
+    nested.channel = hosted;
+    patcher.patcher.nodes.push_back (nested);
+    captured.channels.push_back (patcher);
+    captured.mixer = lynx::Song::defaultMixer (2);
+    lynx::EffectSlot effect;
+    effect.kind = lynx::EffectKind::plugin;
+    effect.plugin.id = "Effect";
+    effect.plugin.state = "saved";
+    captured.mixer[1].effects.push_back (effect);
+    auto published = captured;
+    published.channels[0].muted = true; // an insert stand-in changes routing/muting in the published projection
+    published.channels[1].instrument = lynx::InstrumentKind::sampler;
+    published.channels[1].samplePath = "stem.wav";
+    published.channels.push_back (lynx::ChannelDef()); // generated stem helper channels must survive
+    published.mixer[1].effects[0].enabled = false;
+
+    captured.channels[0].plugin.state = "captured synth";
+    captured.channels[1].plugin.state = "unavailable synth";
+    captured.channels[2].patcher.nodes[0].channel.plugin.state = "captured nested synth";
+    captured.mixer[1].effects[0].plugin.state = "captured effect";
+    lynx::remote_history::mirrorCapturedHostedStates (captured, published);
+    CHECK (published.channels.size() == 4 && published.channels[0].muted);
+    CHECK (published.channels[0].plugin.state == "captured synth");
+    CHECK (published.channels[1].instrument == lynx::InstrumentKind::sampler && published.channels[1].samplePath == "stem.wav");
+    CHECK (published.channels[1].plugin.state == "saved"); // a projected replacement is not the captured hosted device
+    CHECK (published.channels[2].patcher.nodes[0].channel.plugin.state == "captured nested synth");
+    CHECK (! published.mixer[1].effects[0].enabled && published.mixer[1].effects[0].plugin.state == "captured effect");
+
+    published.channels[0].instance.renew();
+    captured.channels[0].plugin.state = "different device";
+    lynx::remote_history::mirrorCapturedHostedStates (captured, published);
+    CHECK (published.channels[0].plugin.state == "captured synth");
 }
 
 TEST (export_song_adds_silent_tail_and_never_restarts)
@@ -4978,15 +5181,15 @@ TEST (note_edit_grid_and_time_text)
     CHECK (ne::screenStep (8.0 / bar, bar) == 2 * bar);
     CHECK (ne::screenStep (200.0 / step, bar) == step / 4);
 
-    CHECK (ne::formatTime (0, 4) == "1:1:0" && ne::formatTime (bar + 5 * step + 7, 4) == "2:6:7");
-    CHECK (ne::formatTime (step * 2, 4, true) == "0:2:0");
+    CHECK (ne::formatTime (0, lynx::Meter (4, 4)) == "1:1:0" && ne::formatTime (bar + 5 * step + 7, lynx::Meter (4, 4)) == "2:6:7");
+    CHECK (ne::formatTime (step * 2, lynx::Meter (4, 4), true) == "0:2:0");
     std::int64_t t = 0;
-    CHECK (ne::parseTime ("2:6:7", 4, t) && t == bar + 5 * step + 7);
-    CHECK (ne::parseTime ("3", 4, t) && t == 2 * bar);
-    CHECK (ne::parseTime ("0:2:0", 4, t, true) && t == 2 * step);
-    CHECK (! ne::parseTime ("0:1:0", 4, t) && ! ne::parseTime ("1:17:0", 4, t) && ! ne::parseTime ("1:1:240", 4, t)
-           && ! ne::parseTime ("a", 4, t) && ! ne::parseTime ("", 4, t));
-    CHECK (ne::parseTime ("1:12:0", 3, t) && ! ne::parseTime ("1:13:0", 3, t)); // 3/4: 12 steps per bar
+    CHECK (ne::parseTime ("2:6:7", lynx::Meter (4, 4), t) && t == bar + 5 * step + 7);
+    CHECK (ne::parseTime ("3", lynx::Meter (4, 4), t) && t == 2 * bar);
+    CHECK (ne::parseTime ("0:2:0", lynx::Meter (4, 4), t, true) && t == 2 * step);
+    CHECK (! ne::parseTime ("0:1:0", lynx::Meter (4, 4), t) && ! ne::parseTime ("1:17:0", lynx::Meter (4, 4), t) && ! ne::parseTime ("1:1:240", lynx::Meter (4, 4), t)
+           && ! ne::parseTime ("a", lynx::Meter (4, 4), t) && ! ne::parseTime ("", lynx::Meter (4, 4), t));
+    CHECK (ne::parseTime ("1:12:0", lynx::Meter (3, 4), t) && ! ne::parseTime ("1:13:0", lynx::Meter (3, 4), t)); // 3/4: 12 steps per bar
 }
 
 TEST (playlist_clip_edges_and_time_selection)
@@ -5043,7 +5246,7 @@ TEST (playlist_clip_edges_and_time_selection)
 TEST (recorder_builds_notes_in_pattern_and_song_mode)
 {
     auto song = lynx::Song::makeDefault();
-    const auto loop = song.patterns[0].effectiveLength (4); // 1 bar = 3840
+    const auto loop = song.patterns[0].effectiveLength (lynx::Meter (4, 4)); // 1 bar = 3840
     lynx::NoteRecorder r;
     r.add (song, { 100.0, 4, 60, 0.5f, true }); // no take: ignored
     CHECK (r.takeFinished().empty());
@@ -5759,7 +5962,7 @@ TEST (swing_delays_offbeat_sixteenths)
     p.notes = { { 0, 100, 0, 60 }, { lynx::ticksPerStep, 100, 0, 62 } };
     lynx::EventBuffer ev;
     const auto tps = lynx::ticksPerSample (120.0, 48000.0);
-    lynx::schedulePatternLoop (p, p.effectiveLength (4), 0.0, 12000, tps, ev, 1.0f);
+    lynx::schedulePatternLoop (p, p.effectiveLength (lynx::Meter (4, 4)), 0.0, 12000, tps, ev, 1.0f);
     int onOffset = -1;
     for (auto& e : ev)
         if (e.type == lynx::NoteEvent::Type::on && e.key == 62)
@@ -5860,7 +6063,7 @@ TEST (note_pan_pitch_and_mute)
     p.notes = { a, b };
     lynx::EventBuffer ev;
     const auto tps = lynx::ticksPerSample (120.0, 48000.0);
-    lynx::schedulePatternLoop (p, p.effectiveLength (4), 0.0, 48000, tps, ev);
+    lynx::schedulePatternLoop (p, p.effectiveLength (lynx::Meter (4, 4)), 0.0, 48000, tps, ev);
     int ons = 0;
     for (auto& e : ev)
         if (e.type == lynx::NoteEvent::Type::on)
@@ -6079,7 +6282,7 @@ TEST (slide_notes_glide_without_retrigger)
     p.notes = { base, glide };
     lynx::EventBuffer ev;
     const auto tps = lynx::ticksPerSample (120.0, 48000.0);
-    lynx::schedulePatternLoop (p, p.effectiveLength (4), 0.0, 30000, tps, ev);
+    lynx::schedulePatternLoop (p, p.effectiveLength (lynx::Meter (4, 4)), 0.0, 30000, tps, ev);
     int ons = 0, offs = 0, slides = 0;
     for (auto& e : ev)
     {
@@ -6351,7 +6554,7 @@ TEST (arpeggiator_plays_held_chord_in_steps)
     for (double tick = 0.0; tick < lynx::ppq * 2.0; tick += 512 * tps)
     {
         ev.clear();
-        lynx::schedulePatternLoop (song.patterns[0], song.patterns[0].effectiveLength (4), tick, 512, tps, ev);
+        lynx::schedulePatternLoop (song.patterns[0], song.patterns[0].effectiveLength (lynx::Meter (4, 4)), tick, 512, tps, ev);
         int in = 0, out = 0;
         for (auto& e : ev)
             if (e.channel == 4)
@@ -6441,7 +6644,9 @@ TEST (audio_clip_unity_at_fl_default_volume)
     c.instrument = lynx::InstrumentKind::audioClip;
     c.volume = 10000.0f / 12800.0f;
     clip->configure (c, 120.0);
-    clip->noteOn (60, 1.0f);
+    // (a Playlist clip's own key: since round 190lq a key below audioClipKeyBase is a NOTE of the channel, which plays as a
+    // Sampler note — tests/Issue204Tests.inc)
+    clip->noteOn (lynx::audioClipKey (0), 1.0f);
     std::vector<float> l (4800, 0.0f), r (4800, 0.0f);
     const auto g = lynx::channelGain (c.volume);
     clip->render (l.data(), r.data(), 4800, g, g);
@@ -9021,7 +9226,7 @@ namespace
 // velocity map — and the global block. Every other curve is neutral.
 // features (REA_rodada75): 1 arpeggio markers on the volume envelope, 2 noise resonance on filter 1, 4 "pluck replaces
 // blur decay", 8 pluck blend, 16 harmonic randomness, 32 phaser + harmonizer masks
-std::vector<std::uint8_t> harmorTestState (bool panLfo = true, bool image = false, int features = 0)
+std::vector<std::uint8_t> harmorTestState (bool panLfo = true, bool image = false, int features = 0, const std::string& resynthPath = {})
 {
     std::vector<std::uint8_t> b;
     auto i32 = [&] (std::int32_t v) { for (int k = 0; k < 4; ++k) b.push_back ((std::uint8_t) ((std::uint32_t) v >> (8 * k))); };
@@ -9067,6 +9272,10 @@ std::vector<std::uint8_t> harmorTestState (bool panLfo = true, bool image = fals
         for (const auto& [i, v] : std::initializer_list<std::pair<int, int>> { { 82, 200 }, { 83, 100000 }, { 84, 10000 }, { 85, 20000 },
                  { 86, 750 }, { 87, 4 }, { 88, 600 }, { 89, 900 }, { 90, 1 }, { 91, 3 }, { 92, 1500 }, { 93, -300 }, { 94, 800 } })
             p[(std::size_t) i] = v;
+    if (! resynthPath.empty()) // resynthesis: speed 1, linear interpolation, Hz frequency mode, sharpening 750
+        for (const auto& [i, v] : std::initializer_list<std::pair<int, int>> { { 82, 500 }, { 84, 10000 }, { 86, 750 }, { 87, 3 },
+                 { 88, 500 }, { 89, 1000 }, { 90, 1 }, { 91, 3 }, { 92, 1000 } })
+            p[(std::size_t) i] = v;
     for (auto v : p)
         i32 (v);
     for (int i = 0; i < 12; ++i)
@@ -9079,6 +9288,8 @@ std::vector<std::uint8_t> harmorTestState (bool panLfo = true, bool image = fals
     if ((features & 8) != 0)
         put (0x00, 5);
     misc[0x44] = 1;
+    if (! resynthPath.empty())
+        put (0x24, 250); // resynthesis soft knee (part +0x244)
     if ((features & 4) != 0)
         misc[0x46] = 1;
     b.insert (b.end(), misc.begin(), misc.end());
@@ -9156,6 +9367,15 @@ std::vector<std::uint8_t> harmorTestState (bool panLfo = true, bool image = fals
             }
         i32 (0);
         b.push_back (0); // (file name: empty)
+    }
+    if (! image && ! resynthPath.empty())
+    {
+        // a resynthesis image object (round natives190kj): mode 1, ping-pong, no planes, then the sample's path
+        i32 (0), i32 (1), i32 (2), i32 (0);
+        f64 (-1.0), f64 (-1.0), f64 (0.0);
+        i32 (0), i32 (0);
+        b.push_back ((std::uint8_t) resynthPath.size());
+        b.insert (b.end(), resynthPath.begin(), resynthPath.end());
     }
     std::swap (b, part);
     i32 ((std::int32_t) part.size());
@@ -16073,22 +16293,22 @@ TEST (prtools_articulate)
     using namespace lynx::prtools;
     Pattern p;
     p.notes = { prNote (0, 100), prNote (480, 100), prNote (960, 100) };
-    articulate (p, allOf (p), articulatePreset (ArticulatePreset::legato), 4);
+    articulate (p, allOf (p), articulatePreset (ArticulatePreset::legato), lynx::Meter (4, 4));
     CHECK (p.notes[0].length == 480 && p.notes[1].length == 480 && p.notes[2].length == 3840 - 960); // to the bar line
 
     p.notes = { prNote (0, 100), prNote (480, 100), prNote (960, 2880) };
-    articulate (p, allOf (p), articulatePreset (ArticulatePreset::staccato), 4);
+    articulate (p, allOf (p), articulatePreset (ArticulatePreset::staccato), lynx::Meter (4, 4));
     CHECK (p.notes[0].length == 96 && p.notes[1].length == 96 && p.notes[2].length == 576); // ends on a bar: own length
 
     auto o = articulatePreset (ArticulatePreset::legato);
     o.gap = 20;
     p.notes = { prNote (0, 100), prNote (480, 100) };
-    articulate (p, allOf (p), o, 4);
+    articulate (p, allOf (p), o, lynx::Meter (4, 4));
     CHECK (p.notes[0].length == 460);
 
     // chop chords: a held note is cut where the next one starts
     p.notes = { prNote (0, 960, 48), prNote (480, 480, 60) };
-    articulate (p, allOf (p), articulatePreset (ArticulatePreset::chopChordsOnly), 4);
+    articulate (p, allOf (p), articulatePreset (ArticulatePreset::chopChordsOnly), lynx::Meter (4, 4));
     CHECK (p.notes.size() == 3 && p.notes[0].length == 480 && p.notes[1].start == 480 && p.notes[2].start == 480);
 
     // variation is seeded (MT19937): same seed, same result; lengths only get shorter
@@ -16097,8 +16317,8 @@ TEST (prtools_articulate)
     o.seed = 7;
     Pattern a, b2;
     a.notes = b2.notes = { prNote (0, 100), prNote (480, 100), prNote (960, 100) };
-    articulate (a, allOf (a), o, 4);
-    articulate (b2, allOf (b2), o, 4);
+    articulate (a, allOf (a), o, lynx::Meter (4, 4));
+    articulate (b2, allOf (b2), o, lynx::Meter (4, 4));
     CHECK (a.notes[0].length == b2.notes[0].length && a.notes[0].length <= 480 && a.notes[0].length >= 240);
 }
 
@@ -16166,7 +16386,7 @@ TEST (prtools_riff_machine)
     RiffOptions o;
     o.channel = 1;
     o.bars = 2;
-    const auto notes = riffMachine (p, { 0 }, o, 4);
+    const auto notes = riffMachine (p, { 0 }, o, lynx::Meter (4, 4));
     CHECK (! notes.empty() && notes.size() == p.notes.size());
     CHECK (std::all_of (p.notes.begin(), p.notes.end(), [] (auto& n) {
         return n.channel == 1 && n.start >= 0 && n.start < 2 * 3840 && n.key >= 36 && n.key <= 84;
@@ -16175,7 +16395,7 @@ TEST (prtools_riff_machine)
     // only the first step: the progression shape, chopped from one note at key 48
     o.stepsUpTo = 0;
     Pattern q;
-    const auto first = riffMachine (q, {}, o, 4);
+    const auto first = riffMachine (q, {}, o, lynx::Meter (4, 4));
     CHECK (first.size() == builtInRiffProgression (0).notes.size() * 2 && q.notes[0].key == 48);
 }
 
@@ -17191,6 +17411,7 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Render155Tests.inc"
 #include "Tune157Tests.inc"
 #include "Tune165Tests.inc"
+#include "Tune190liTests.inc" // round 190li: the vocal pitch toolkit's CPU pass
 #include "HwOut156Tests.inc"
 #include "SoundFont158Tests.inc"
 #include "Mp3157Tests.inc"
@@ -17290,6 +17511,10 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Remote190aiTests.inc"
 #include "StemSplitTests.inc"
 #include "AudioToMidi189bTests.inc"
+#include "Poly2Midi190ljTests.inc"
+#include "PolyEdit190lkTests.inc"
+#include "PolyEdit190loTests.inc"
+#include "PolyEdit190loUiTests.inc" // (round 190lo, UI half)
 #include "Zoom167tTests.inc"
 #include "PianoKeys190jTests.inc"
 #include "Proll168gTests.inc"
@@ -17373,26 +17598,65 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Fluid174eTests.inc"
 #include "Comp177Tests.inc"
 #include "AlsImport175aTests.inc"
+#include "Als190kaTests.inc" // round als190ka (issue #193): .als automation laws, sends, device on / off, Main devices, video clips
+#include "AlsColours190igTests.inc" // round 190ig (CL-6): Live's colour table for .als imports in the Clip-launch layout
 #include "FlmImport182cTests.inc"
 #include "FlmEngines190uTests.inc"
 #include "FlmNotes190abTests.inc"
 #include "FlmGmsynth190abTests.inc"
+#include "PocketSuperSaw190byTests.inc" // round 190by
 #include "FlmImport187dTests.inc"
 #include "FlmImport188fTests.inc"
 #include "FlmImport188hTests.inc"
 #include "FlmImport189hTests.inc"
 #include "FlmImport189hATests.inc"
 #include "FlmImport189hBTests.inc"
+#include "BandImport190icTests.inc"
+#include "BandImport190jmTests.inc" // round 190jm: issue #184 project (GarageBand for iOS 2.3+ events, Sampler)
+#include "Band184_190mxTests.inc" // round 190mx: issue #184 (GarageBand for iOS 2.3+ signature)
+#include "Issue198_190mxTests.inc" // round 190mx: GitHub #198 follow-up (plugin-window knobs recorded as automation)
+#include "Blx190jrTests.inc"
+#include "Stems190jrTests.inc"
+#include "SimpleGb190keTests.inc" // round 190ke: GarageBand / BandLab ideas in Simple (fade-out, Controls, tuner, factory tags)
 #include "FlmImport189hCTests.inc"
+#include "FlmImport190bsTests.inc"
+#include "PocketFx190byTests.inc" // round 190by
+#include "FlmImport190deTests.inc" // round 190de
+#include "PocketEq190dwTests.inc" // round 190dw
+#include "PocketReverb190dwTests.inc" // round 190dw
+#include "FlmEffects190dwTests.inc" // round 190dw: the .flm effect laws against FLM's renders
+#include "FlmImport190dwInstTests.inc" // round 190dw item 4
+#include "FlmImport190feTests.inc" // round 190fe: cut groups, 3x Osc lanes, effect Mix, rack parts
+#include "FlmImport190fnTests.inc" // round 190fn: FLM resources folders (O1), FL Studio Mobile Rack in an .flp, META, short SEND
 #include "Bridge176aTests.inc"
 #include "Issues178aTests.inc"
 #include "Mixer177aTests.inc"
 #include "ClipLauncher181aTests.inc"
+#include "Session190bvTests.inc"
 #include "DetailView183aTests.inc"
 #include "Als181cTests.inc"
+#include "DetailView190hrTests.inc"
+#include "Groove190fmTests.inc"
+#include "AlsDevices190bqTests.inc"
+#include "AlsDevices190cfTests.inc"
+#include "AlsDevices190edTests.inc"
+#include "LiveDev190kkTests.inc" // round 190kk: Erosion → Corrode, Vinyl → Platter, Corpus → Soundboard, Looper, MIDI Effect Racks (uses als190cf::)
+#include "Meld190koTests.inc" // round 190ko: Meld → Braid, Spectral Time → Timeprism, Spectral Resonator → Harmonia (uses als190cf::)
+#include "AlsDevices190ekTests.inc"
+#include "Tetra190hsTests.inc" // round 190hs
+#include "Tetra190ixTests.inc" // round 190ix
+#include "Helix190jaTests.inc" // round 190ja
+#include "Helix190miTests.inc" // round 190mi
+#include "Helix190mlTests.inc" // round 190ml
+#include "Helix190mtTests.inc" // round 190mt
+#include "AlsDevices190fmTests.inc"
 #include "Merge180cTests.inc"
 #include "Slicer180cTests.inc"
 #include "Slicer190fTests.inc"
+#include "Issue160Tests.inc"
+#include "Issue159Tests.inc"
+#include "Issue165Tests.inc"
+#include "Bugs190gyTests.inc"
 #include "Fpc190mTests.inc"
 #include "Fpc190qTests.inc"
 #include "Fpc190zTests.inc"
@@ -17414,6 +17678,7 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Auto177bTests.inc"
 #include "Lanes177bTests.inc"
 #include "Lfo177bTests.inc"
+#include "Curves190bwTests.inc"
 #include "Mod177bTests.inc"
 #include "UiFont179aTests.inc"
 #include "Multilink177bTests.inc"
@@ -17436,6 +17701,9 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Playlist189nTests.inc"
 #include "PlaylistKeys190agTests.inc"
 #include "Rack183cTests.inc"
+#include "DrumRack190ecTests.inc"
+#include "DrumRackSlice190ecTests.inc"
+#include "DrumRack190elTests.inc"
 #include "Gamepad184aTests.inc"
 #include "ExportBundle184aTests.inc"
 #include "MultiOut188dTests.inc"
@@ -17446,10 +17714,12 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "MidiTools190sTests.inc"
 #include "MidiTools190aaTests.inc"
 #include "MidiTools190aa2Tests.inc"
+#include "MidiGenerate190fmTests.inc"
 #include "Notes188gTests.inc"
 #include "Layer190bTests.inc"
 #include "PlugLevel190adTests.inc"
 #include "Undo190bTests.inc"
+#include "Undo190mzTests.inc"
 #include "TrackMeters190wTests.inc"
 #include "Locator190wTests.inc"
 #include "Bugs190cTests.inc"
@@ -17466,11 +17736,14 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Slicex190rTests.inc"
 #include "Slicex190acTests.inc"
 #include "Slicex190ajTests.inc"
+#include "Slicex190hgTests.inc"
+#include "Slicex190hzTests.inc"
 #include "ScaleSnap190anTests.inc"
 #include "TruePeak190amTests.inc"
 #include "Loudness190amTests.inc"
 #include "UsedOnly190amTests.inc"
 #include "Extras190amTests.inc"
+#include "Workflow190iuTests.inc" // round 190iu: issues #186 and #191
 #include "Reload190aoTests.inc"
 #include "Pin190aoTests.inc"
 #include "Velocity190aoTests.inc"
@@ -17480,6 +17753,8 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "PluginsOff190apTests.inc"
 #include "ExportSections190apTests.inc"
 #include "DirectWave190ajTests.inc"
+#include "core/DirectWaveState.h"
+#include "DirectWave190hzTests.inc"
 #include "Similar190asTests.inc"
 #include "Controller190awTests.inc"
 #include "ControllerProfiles190awTests.inc"
@@ -17487,16 +17762,239 @@ TEST (fl_low_lifter_matches_fl_engine)
 #include "Snap190axTests.inc"
 #include "PluginState190azTests.inc"
 #include "Parity190arTests.inc"
+#include "Maps190caTests.inc"
 #include "Mpe190bbTests.inc"
 #include "Mpe190bbLiveTests.inc"
+#include "Mpe190hyTests.inc"
+#include "Mpe190hyAlsTests.inc"
 #include "PluginDb190baTests.inc"
+#include "PerfWin190gdTests.inc"
+#include "Ram190gnTests.inc"
+#include "Startup190goTests.inc"
+#include "Startup190hdTests.inc"
 #include "Freeze190ayTests.inc"
+#include "LiveFreeze190ffTests.inc"
 #include "QaFix190bjTests.inc"
 #include "Fl190bfTests.inc"
 #include "ShotScale190biTests.inc"
 #include "QaFix190bjATests.inc"
 #include "Demo190bmTests.inc"
+#include "Nebula190caTests.inc"
+#include "Settings190bxTests.inc"
+#include "Link190btTests.inc"
+#include "LiveBrowser190ceTests.inc"
+#include "LoopBrowser190kfTests.inc" // round gaps190kf: the Loop Browser's keywords and filters
+#include "Browser190izTests.inc" // round 190iz: Browser tags, FL tabs, Live sidebar, send to selected, 5-s preview
+#include "SimpleFx190buTests.inc"
+#include "SimpleGate190dgTests.inc"
+#include "SimpleNext190dsTests.inc"
+#include "FirstSongTour190dvTests.inc"
+#include "SimplePads190foTests.inc"
+#include "Rollup027Tests.inc"
+#include "Edison190cdTests.inc"
+#include "Fled190eeTests.inc"
+#include "Warp190cgTests.inc"
+#include "LiveScr190drTests.inc"
+#include "LiveWf190efMapTests.inc"
+#include "LiveWf190efDrawTests.inc"
+#include "LiveWf190efScenesTests.inc"
+#include "LiveWf190emTests.inc"
+#include "BandlabExtras190chTests.inc"
 #include "DanceFix190cjTests.inc"
+#include "Reverb190bzTests.inc"
+#include "Dyn190dmTests.inc"
+#include "ParityDyn190fxTests.inc"
+#include "Echo190dlTests.inc"
+#include "Vqe190dpTests.inc"
+#include "Ember190fjTests.inc"
+#include "ApexFix190coTests.inc"
+#include "Link190csTests.inc"
+#include "TrackLinkTests.inc"
+#include "TrackAuto190gzTests.inc"
+#include "Issues190htTests.inc"
+#include "Warp190dbTests.inc"
+#include "WarpModes190fmTests.inc" // round 190fm
+#include "WarpLive190gxTests.inc" // round 190gx
+#include "ClipEnv190giTests.inc" // round 190gi
+#include "LiveFacts190gxTests.inc" // round 190gx
+#include "BeatsLaw190gxTests.inc" // round 190gx
+#include "FlCtl190dfTests.inc"
+#include "FlFix190eyTests.inc"
+#include "FlPl190dxTests.inc"
+#include "FlClip190dzTests.inc"
+#include "Iss152Tests.inc"
+#include "Win190evTests.inc"
+#include "U190heTests.inc"
+#include "U190hxTests.inc"
+#include "U190klTests.inc"
+#include "D190jyTests.inc"
+#include "Mod190doTests.inc"
+#include "Parity190fyTests.inc"
+#include "Parity190hoTests.inc"
+#include "Parity190iqTests.inc"
+#include "Parity190itTests.inc"
+#include "Parity190lnVrTests.inc" // round 190ln: Foil Plate on ValhallaPlate's own EQ / bass-decay laws (after Parity190it: its gold helpers)
+#include "Parity190lsTests.inc" // round 190ls: Atrium on a dense late tank for the ValhallaRoom role (after Parity190it: its gold helpers)
+#include "Parity190lyTests.inc" // round 190ly: Atrium's dense tank only for a translated ValhallaRoom; Valhalla stand-ins part 2
+#include "Parity190mbTests.inc" // round 190mb: Valhalla stand-ins part 3 (Supermassive tone, FutureVerb, SpaceModulator modes; after Parity190ly: its helpers)
+#include "Parity190mjTests.inc" // round 190mj: Orbit = ValhallaSpaceModulator's own voices (hidden voiceLaw; after Parity190mb)
+#include "Parity190mjHzTests.inc" // round 190mj: FutureVerb → Horizon part 2 (echo modes, Room / Chamber over Size; after Parity190mb)
+#include "Parity190jhTests.inc" // round 190jh: Facet's automatic threshold, Pro-Q 4 dynamic bands, Waves L2 / SuperTap / SSLComp / CLA-76
+#include "Parity190jsTests.inc" // round 190js: the Waves reverbs on Reeverb 2, Hush's Single Vocal revision, Facet's auto-threshold refit
+#include "Parity190ktTests.inc" // round 190kt: REA of the Waves SSLComp DSP, Crest's console law, SSLComp on Crest
+#include "Parity190lbTests.inc" // round 190lb: black-box study (no decryption); SSL 4K G Pink EQ + output ceiling
+#include "Harrison190leTests.inc" // round 190le: Ridge Strip's 32C voicing (Harrison 32Classic EQ law)
+#include "Parity190kyTests.inc" // round 190ky: Crest's FET law (REA of the Waves CLA-76 DSP), CLA-76 on it
+#include "Parity190lgQ4Tests.inc" // round 190lg: Facet's automatic threshold on Pro-Q 4's structure (revision 1; after Parity190jh / 190js)
+#include "Parity190kwTests.inc" // round 190kw: static REA — Crest's Pro-C 3 V1 / V2 style laws (hidden revision)
+#include "Parity190lgVersTests.inc" // round 190lg: Crest Allround = Pro-C 3 Versatile (revision 1; after Parity190kw: its helpers)
+#include "Parity190lpCrestTests.inc" // round 190lp: Crest Smooth / Op-El = Pro-C 3's own graphs (revision 1; after Parity190kw: its helpers)
+#include "Parity190mbCrestTests.inc" // round 190mb: Crest Upward / Vari-mu = Pro-C 3's own Upward graph and Vari-Mu tube node (revision 1; after Parity190kw: its helpers)
+#include "Parity190mjCrestTests.inc" // round 190mj: Crest Two-way = Pro-C 3's own TTM band processors (revision 1; after Parity190kw: its helpers)
+#include "Parity190lgMbTests.inc" // round 190lg: Prism revision 1 on Pro-MB's own band compander graph (after DynamicsTests108: its helpers)
+#include "Parity190lpLgTests.inc" // round 190lp: Apex Limiter / Sentry Gate revision 1, black-box refit on Pro-L 2 / Pro-G (after DynamicsTests108: its helpers)
+#include "Parity190kwTl3Tests.inc" // round 190kw: Timeless 3 states on Echoform (the hidden line law)
+#include "Parity190kwVvTests.inc" // round 190kw: Epoch Verb's level on ValhallaVintageVerb's loop law (after Parity190it: its gold helpers)
+#include "Parity190kwSatTests.inc" // round 190kw: Saturn 2 -> Ember, the styles' own laws (hidden revision)
+#include "Parity190lfTests.inc" // round 190lf: the Limiter's L2 law (REA of the Waves L2 DSP), L2 on it; PuigTec EQP1A on Facet EQ
+#include "Parity190lfDynTests.inc" // round 190lf (dyn): Glow Leveler's cell law (REA of the Waves CLA-2A), CLA-2A on it
+#include "Parity190lfVerbTests.inc" // round 190lf (verb): H-Delay's measured loop (Echoform hybrid law 1), TrueVerb's direct sound
+#include "Parity190lfNs1Tests.inc" // round 190lf (ns1): Quell's zero law (REA of the Waves NS1: 0 % = its bare all-pass pair), NS1 on it
+#include "Parity190lnTests.inc" // round 190ln: Eiosis AirEQ / Slate Infinity EQ translated onto Facet EQ in physical units
+#include "Parity190lnKhsTests.inc" // round 190ln: Kilohearts states (kHs snapins, Faturator, Disperser) on LYNX stand-ins
+#include "Parity190nbKhsTests.inc" // round 190nb: Kilohearts laws on Effector (Ring Mod, Reverser, Resonator, Phase Distortion, Shaper) + measured maps
+#include "Parity190kwR2Tests.inc" // round 190kw: Pro-R 2 → LuxeVerb Space, the Space engine's revision 1 (recovered laws)
+#include "Parity190lpR2Tests.inc" // round 190lp: Pro-R 2 → LuxeVerb Space revision 1, the reference's fixed early taps (after Parity190kwR2: its helpers)
+#include "Parity190mgC4Tests.inc" // round 190mg: Prism's hidden C4 law (REA of the Waves C4), C4 on it
+#include "Parity190mgRenTests.inc" // round 190mg (ren): Compressor's Renaissance law (REA of the Waves Renaissance Compressor), RComp on it
+#include "Parity190mgNs1Tests.inc" // round 190mg (ns1): Quell's NS1 law (REA of the Waves NS1: its own structure for 20 … 100 %), NS1 on it
+#include "Parity190mgVocTests.inc" // round 190mg (voc): the Waves Doubler DSP's splice law on Gemini, the Waves Tune RT law on LYNX Tune
+#include "Parity190mgDynTests.inc" // round 190mg (dyn): Facet's PuigTec law, L2's IDR on the Limiter (REA of the Waves PuigTec / L2 DSP)
+#include "Parity190mmTests.inc" // round 190mm: Facet's Waves design law (REQ, Q10), API-550 / 560 on Facet, SSL G-Channel on Ridge
+#include "Parity190mmSchepsTests.inc" // round 190mm (scheps): the Scheps Omni Channel on Ridge Strip's hidden omni law (five modules, order)
+#include "Parity190mmDynTests.inc" // round 190mm (dyn): Waves RVox / RDeEsser / C6 / API-2500 / MaxxBass / RBass / Vitamin stand-ins on hidden laws
+#include "Parity190mtTests.inc" // round 190mt: SSL G EQ law (Ridge), Q10 exact bell, API-560 law (Facet, 65-sample latency), RChannel RVox type
+#include "Sampler190dhTests.inc"
+#include "Fix190eaTests.inc"
+#include "Iss158Tests.inc"
+#include "Voices190ejTests.inc"
+#include "Flfix190ezTests.inc"
+#include "Reafl190flTests.inc"
+#include "FlTails190gkTests.inc"
+#include "Rcfix190fcTests.inc"
+#include "Follow190fgTests.inc"
+#include "Relfix190fpTests.inc"
+#include "Anvil190fkTests.inc"
+#include "AnvilBus190gxTests.inc"
+#include "Donate190fqTests.inc"
+#include "GenPreset190fsTests.inc"
+#include "Issues190ftTests.inc"
+#include "FlFacts190gwTests.inc"
+#include "Flvsti190fwTests.inc"
+#include "Stability190ggTests.inc"
+#include "StemPass190gjTests.inc"
+#include "Small190ghTests.inc"
+#include "GoBack190hlTests.inc"
+#include "Link190glTests.inc"
+#include "SynthLanes190gpTests.inc"
+#include "SchedIndex190gpTests.inc"
+#include "SmartTails190gpTests.inc"
+#include "ApexMeter190gpTests.inc"
+#include "Toolchain190gtTests.inc"
+#include "RenderAhead190gqTests.inc"
+#include "EvPane190fzTests.inc"
+#include "U190heLinkTests.inc" // round 190he (issue #152 item 2: linkable LYNX instruments, knobs that follow links)
+#include "PluginDrop190hfTests.inc" // issue #152 point 6: plugins dropped on the tracks (FL and Live layouts)
+#include "PickerDrop190hmTests.inc" // issue #177: Picker panel entries dragged onto the Playlist
+#include "Community190hpTests.inc" // round 190hp: global MIDI mappings, mix snapshots, split at silence (0.1.28 pain report B9/B16/B18)
+#include "Rollup028Tests.inc" // round 190fv: semantic interactions of the 0.1.28 rollup
+#include "Design190igTests.inc" // round 190ig: automation clip colours (design190ia slice 3)
+#include "Pdc190hqTests.inc" // round 190hq B13: side inputs, level automation and render-ahead under PDC
+#include "TempoMarkers190hqTests.inc" // round 190hq B11: tempo markers, resampled audio under them, scene tempo hold
+#include "UserFix190ibTests.inc" // round 190ib: issues #165 (SoundFont same-step slide), #170, #181, #182, #183
+#include "LiveRack190hrTests.inc" // round 190hr: Live Racks finish (Group / Ungroup of an instrument, .adg presets)
+#include "Formats190iiTests.inc" // round 190ii (issue #149): .dwp / .dwb / .gig / NCW / Kontakt detection
+#include "Simple190jcTests.inc" // round 190jc: the Simple layout's BandLab / FLM look (design190ia slices 5, 14, 15, 22, 24)
+#include "Rollup030Tests.inc" // round 190il: semantic interactions of the 0.1.30 rollup (keep last)
+#include "Bug190ieTests.inc" // round 190ie (issue #185: tempo automation through the basic Delay)
+#include "Perf190kgTests.inc" // round 190kg: the basic Delay's faster loops render round 190ie's samples bit for bit
+#include "Harm190krTests.inc" // round beatfl190kr: Harmless's vector sine bank, Vocodex's sliding max: the old bits
+#include "Shift190krTests.inc" // round 190kr: Signalsmith Stretch's faster loops render the base commit's pitch shifts bit for bit
+#include "Perf190krTests.inc" // round 190kr: the FL-native mixer effects' faster kernels render the plain loops' samples bit for bit
+#include "PerfGate190idTests.inc" // round perfgate190id: the performance gate's synthetic projects (community slice B12)
+#include "Details190ihTests.inc" // round 190ih: DETAILS slices R2, R3, R4, R7, R9, R12, R14
+#include "Rackmix190ioTests.inc" // round 190io: FL rack + Mixer landmarks, Mixer details, issue #154 part 2
+#include "Bugs190irTests.inc" // round 190ir: issue #189 text size, takes on the tracks FL picks (Discord report)
+#include "Parity190isTests.inc" // round 190is: Echoform voicings revision 1, the Soundtoys echoes' own defaults
+#include "Warp190ikTests.inc" // round 190ik: Complex Pro, granular Texture, the pitch-aware Beats detector
+#include "Details190imTests.inc" // round 190im: activity meter reader, deactivated grid clips, Live keys 0 / Ctrl+E
+#include "Toolbar190ivTests.inc" // round 190iv: the toolbar per layout style (Simple capsules, Live control bar)
+#include "MidiOutHw190jlTests.inc" // round 190jl: MIDI Out channels to hardware MIDI outputs (Discord #help)
+#include "Hosting190jgTests.inc" // round 190jg: sample-accurate automation for hosted plugins (BUILD-LIST 18)
+#include "G1menus190jeTests.inc" // round 190je: contrast floors, one state language, grid intensity, FL menus (design190ia G1, FW-S3)
+#include "Capfix190jjTests.inc" // round 190jj: capture190ji changes (transport states per look, the master bar meter)
+#include "Livefix190jdTests.inc" // round 190jd: live check 190iw — previews, automation clip colours, count-in, Gross Beat locator, .flp audio clip step
+#include "Livefix190jdATests.inc" // round 190jd: DirectWave zone map, Slicex deck Snap menu and play line
+#include "Livefix190jdBTests.inc" // round 190jd: the Clip View MPE tab as Live 12.4
+#include "Livefix190jdCTests.inc" // round 190jd: Mixer peak hold and Extra large list, Limiter / Maximus history
+#include "Folders190jfTests.inc" // round 190jf: B17 Playlist folders (nested groups, FL group mute / solo, Alt+drag)
+#include "DawProject190jfTests.inc" // round 190jf B22: DAWproject import / export (core/DawProject.h, core/ZipLite.h)
+#include "Polish190jpTests.inc" // round 190jp: Theme Adjustments and colour dots, bold interface text, Simple follow-ups
+#include "LiveLook190jnTests.inc" // round 190jn: the Clip-launch layout in Live's look (the Info View key)
+#include "Playlist190jqTests.inc" // round 190jq: Playlist header width (#164), pointer click (#191), automation clip lanes (#191.3)
+#include "Slides190jvTests.inc" // round 190jv: FL's stepped slide notes on its native generators
+#include "Trim190jvTests.inc" // round 190jv: Mixer › Trim unused tracks (FL's Remove unused tracks)
+#include "Pr190jvTests.inc" // round 190jv: Piano roll Scale highlighting › Automatic (FL's key guess)
+#include "PrArp190jvTests.inc" // round 190jv: FL's Piano roll arpeggiator patterns (TPRArpForm law)
+#include "Flm190jvTests.inc" // round 190jv: FL Studio Mobile racks with several instruments / an effect first (BUILD-LIST 19)
+#include "Spin190kbTests.inc" // round 190kb: the worker pool's waiting (statistics, tuning, bounded task-graph waits, adaptive spin)
+#include "Beat190krTests.inc" // round 190kr: the worker pool wakes only the workers a chunk's work needs; the same samples
+#include "Lighter190laTests.inc" // round 190la: timed waits without the sub-millisecond spin (platform/CvWait.h)
+#include "Sched190kzTests.inc" // round 190kz: one worker-pool round per device block cut in pieces; the same samples
+#include "Sched190lvTests.inc" // round 190lv: batched blocks with live controllers (two rounds: their sources, then the rest); the same samples
+#include "Export190kaTests.inc" // round als190ka-export (owner decision D5): AIFF and M4A (AAC) export
+#include "Issues190jzTests.inc" // round 190jz: issues #192 (docked Browser), #194 (clip fade handles), #195 (Home, W)
+#include "PrChord190kdTests.inc" // round 190kd: FL's chord tool strip (Generate modes, Analyze, Learn from MIDI input, note options)
+#include "ClipLaunch190kcTests.inc" // round 190kc: Live return tracks, crossfader, relative session mappings, audio grooves
+#include "Gaps190kfTests.inc" // round gaps190kf: Live Transpose ±48 in real time, the Clip View warp time line
+#include "Gaps190kfNativesTests.inc" // round gaps190kf: FL Edison's Sample properties (form, Accept, WAV chunks)
+#include "Natives190kjNewtoneTests.inc" // round natives190kj: Newtone note analysis as FL's (tiling, whole-sample pitch, fades), editor commands
+#include "Natives190kjEdisonTests.inc" // round natives190kj: FL Edison Dual view, grid step, pitch-period snap, grid-slicing, scrub, pitch regions
+#include "Natives190kjHarmorTests.inc" // round natives190kj: Harmor resynthesis (analysis, voice, engine revision)
+#include "Qa190kpTests.inc" // round qa190kp: Follow pause after a layout switch during playback
+#include "QaFix190kqTests.inc" // round qafix190kq: QA-1/2/6/9/10 release blockers of 0.1.30
+#include "QaFix190kqReportTests.inc" // round qafix190kq: the import report's "not reproduced" list apart from the synth-preset instruments
+#include "Details190knTests.inc" // round details190kn: FL mute-switch modifiers (Unmute All, Lock state, slot solo), BandLab chain-preset stepper
+#include "Own190ksTests.inc" // round 190ks: GitHub #198, the notes a plugin plays from its own window are recorded
+#include "Stoys190kvTests.inc" // round 190kv: the Soundtoys factory presets (fingerprint of the encoded payload -> their own settings)
+#include "Details190ldTests.inc" // round details2_190ld: FL slot and Playlist track lock state, Live Shift+Space continue, FL tool names
+#include "Details190ldPluginTests.inc" // round details2_190ld: Vocoder band levels published while watched, Patcher activity measured only while watched
+#include "Ara190kxTests.inc" // round 190kx: ARA 2 on audio clips (the clips as playback regions, ids, tempo, the clip menu)
+#include "LoopAnalysis190kxTests.inc" // round 190kx: loop analysis (key and tempo of the user's own loops; core/LoopAnalysis.h)
+#include "Vocal190liTests.inc" // round 190li: Newtone natural engine (engine 1), modulation / drift split, sung centre, analysis octave guard
+#include "Newtone190lmTests.inc" // rollup 0.1.30 step 8: a new Newtone slot (natural engine) analysed with "Separate close notes"
+#include "Rollup190luTests.inc" // rollup 0.1.30 step 9: per-block batching vs plugins' own notes (190kz x 190ks), LYNX Tune's held notes
+#include "Rollup190meTests.inc" // rollup 0.1.30 step 10: round 190lv's fix, a block of too many pieces still plays (190kz batching)
+#include "Codegen190kzTests.inc" // round 190kz codegen: runtime CPU dispatch (AVX2 paths render the SSE2 bits)
+#include "Dsp190kzTests.inc" // round 190kz: exact Reeverb 2 LFO sine and sinc seeds, Maximus revision 1
+#include "Issue204Tests.inc" // round 190lq: issue #204, an audio clip channel played from notes (whole clip, layered, key pitch)
+#include "Issues190llTests.inc" // round 190ll: issues #199 (hosted synth from the piano roll), #200, #201, #203
+#include "Details190lrTests.inc" // round details3_190lr: the Simple Drum Machine (BandLab steps), Live scene follow actions
+#include "Issues190lwTests.inc" // round 190lw: issues #205 / #206 / #207 (row bands, second click, automation point editing)
+#include "Details190lxTests.inc" // round details4_190lx: Live slot-block clipboard, separate Punch-In / Punch-Out
+#include "Issue208Tests.inc" // round 190ma: issue #208, the graph editor's Note pitch, Shift and Repeat (FL note repeat)
+#include "Details190mfTests.inc" // round details5_190mf: FL normal meter law (Pattern default), Channel rack "+" menu cache, details pass 5
+#include "Modal190mcTests.inc" // round 190mc: the Piano roll's Chord helper (discussion #105) and Transistor Bass's program row (discussion #202)
+#include "Details190mkTests.inc" // round details6_190mk: Live insert marker, rack zip, details pass 6
+#include "Details190mpTests.inc" // round details7_190mp: FL Half speed, Auto name clips, Restretch all, details pass 7
+#include "Issues190mqTests.inc" // round 190mq: issues #211 / #212 / #213 (paste per layout, key-row shading, ruler double click)
+#include "core/Details190mr.h"
+#include "Details190mrTests.inc" // round details8_190mr: click-and-hold, rack Auto Select, undo / warning / layout options, details pass 8
+#include "core/Details190mv.h"
+#include "Details190mvTests.inc" // round details9_190mv: undo knob tweaks and the rest of details pass 9
+#include "Details190myTests.inc" // round details10_190my: the Current track follow-ups and details pass 10
+#include "Mixer221_190ngTests.inc" // round 190ng: issue #221 (Del with only the used inserts shown)
+#include "Issues190ngTests.inc" // round 190ng: issues #215, #217, #219, #220, #222
 
 TEST (live_playback_reactivity)
 {

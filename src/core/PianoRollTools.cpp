@@ -94,9 +94,9 @@ void blendLevels (Note& n, const ScoreNote& t, const LevelStrengths& s)
     n.modY = std::clamp (blend (n.modY, t.modY + (n.modY - 128.0f / 255.0f), s.modY), 0.0f, 1.0f);
 }
 
-std::int64_t barTicks (int beatsPerBar) noexcept
+std::int64_t barTicks (Meter meter) noexcept
 {
-    return beatTicks * std::max (1, beatsPerBar);
+    return meter.bar();
 }
 } // namespace
 
@@ -580,6 +580,8 @@ void chop (Pattern& pattern, const std::vector<int>& indices, const Score& sourc
                     piece.length = length;
                     piece.key = std::clamp (n.key + p.key - 60, 0, 127);
                     piece.slide = p.slide;
+                    // (issue #108: each piece keeps its part of the note's MPE curves)
+                    piece.curves = notecurves::slice (n.curves, (double) (pos - n.start), (double) (pos - n.start + length));
                     blendLevels (piece, p, o.levels);
                     out.push_back (piece);
                 }
@@ -863,9 +865,9 @@ ArticulateOptions articulatePreset (ArticulatePreset preset) noexcept
     return o;
 }
 
-void articulate (Pattern& pattern, const std::vector<int>& indices, const ArticulateOptions& o, int beatsPerBar)
+void articulate (Pattern& pattern, const std::vector<int>& indices, const ArticulateOptions& o, Meter meter)
 {
-    const auto bar = barTicks (beatsPerBar);
+    const auto bar = barTicks (meter);
     const auto multiply = std::clamp (o.multiply, 10, 100) * 0.01f;
     const auto variation = std::clamp (o.variation, 0, 100) * 0.01f;
     const auto gap = roundEven ((double) std::clamp (o.gap, 0, 240) * ppq / 960.0);
@@ -1702,7 +1704,7 @@ Score builtInRiffChord (int variant)
 int builtInRiffProgressionCount() noexcept { return (int) progressionShapes().size(); }
 int builtInRiffChordCount() noexcept { return (int) chordShapes().size(); }
 
-std::vector<int> riffMachine (Pattern& pattern, const std::vector<int>& indices, const RiffOptions& o, int beatsPerBar)
+std::vector<int> riffMachine (Pattern& pattern, const std::vector<int>& indices, const RiffOptions& o, Meter meter)
 {
     // work on a separate pattern holding only the riff's notes
     Pattern work;
@@ -1719,7 +1721,7 @@ std::vector<int> riffMachine (Pattern& pattern, const std::vector<int>& indices,
     {
         Note base;
         base.start = o.start;
-        base.length = (std::int64_t) std::clamp (o.bars, 1, 64) * barTicks (beatsPerBar);
+        base.length = (std::int64_t) std::clamp (o.bars, 1, 64) * barTicks (meter);
         base.channel = o.channel;
         base.key = 48;
         base.velocity = 100.0f / 128.0f;
@@ -1748,7 +1750,7 @@ std::vector<int> riffMachine (Pattern& pattern, const std::vector<int>& indices,
             case 2: notetools::arpeggiate (work, all(), o.arp); break;
             case 3: notetools::randomise (work, all(), o.levels); break;
             case 4: notetools::flip (work, all(), o.flipTime, o.flipPitch); break;
-            case 5: articulate (work, all(), o.articulation, beatsPerBar); break;
+            case 5: articulate (work, all(), o.articulation, meter); break;
             case 6: quantize (work, all(), o.groove.notes.empty() ? gridScore (ticksPerStep) : o.groove, o.grooveOptions); break;
             case 7:
                 notetools::limit (work, all(), o.fit);

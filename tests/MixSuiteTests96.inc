@@ -344,6 +344,7 @@ TEST (mixsuite96_ember_thd_and_aliasing)
         auto p = defaults (EffectKind::ember);
         p[style] = styleValue;
         p[drive] = driveValue;
+        p[law] = 0.0f; // round 190fj: the Style menu's curves (the measured Tape: Ember190fjTests.inc)
         const auto y = run (EffectKind::ember, p, sine (1000.0, amp, 32768));
         const auto f = amplitude (y, 1000.0, 16384, 16384);
         double sum = 0.0;
@@ -434,7 +435,7 @@ TEST (mixsuite_panels_place_every_parameter)
     using namespace lynx;
     // LYNX's own panels (not FL arrangements): every parameter has exactly one control, controls stay inside the body
     // and never overlap, and the dynamics effects show their live gain-reduction meter
-    CHECK (plugui::ownLayoutKinds().size() == 42); // round trans189d: + Strike Shaper; round tp172c8: + Fret Channel, Shell Channel; round tp172c7: + Kiln Channel; round 168r: + the 14 simple built-ins; the mixing suite, the reverbs of round 100, the delay / modulation suite of round 101, the dynamics of round 108, the voice tools of round 119, Voice Shift and Auto-pan (round 135), the Hardware Insert (round 164d)
+    CHECK (plugui::ownLayoutKinds().size() == 43); // round 190fk: + Anvil Bus; round trans189d: + Strike Shaper; round tp172c8: + Fret Channel, Shell Channel; round tp172c7: + Kiln Channel; round 168r: + the 14 simple built-ins; the mixing suite, the reverbs of round 100, the delay / modulation suite of round 101, the dynamics of round 108, the voice tools of round 119, Voice Shift and Auto-pan (round 135), the Hardware Insert (round 164d)
     for (const auto kind : plugui::ownLayoutKinds())
     {
         if (kind == EffectKind::echoform || kind == EffectKind::spiralEcho || kind == EffectKind::orbit || kind == EffectKind::latticeMod
@@ -469,7 +470,9 @@ TEST (mixsuite_panels_place_every_parameter)
             {
                 const auto p = plugui::paramIndex (kind, item.param);
                 CHECK (p >= 0);
-                if (p >= 0)
+                if (p >= count) // round 190le: a hidden parameter with a control (Ridge's 32C voicing)
+                    CHECK (hiddenEffectParamName (kind, p) != nullptr);
+                else if (p >= 0)
                 {
                     bool variant = false; // another variant of a control already counted
                     for (const auto* other : byParam[(std::size_t) p])

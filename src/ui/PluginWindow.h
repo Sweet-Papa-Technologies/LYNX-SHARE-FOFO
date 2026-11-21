@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <memory>
 #include <vector>
 
@@ -39,6 +41,8 @@ void open (std::shared_ptr<void> owner, juce::AudioPluginInstance& plugin, const
 void setDockWorkspace (Workspace* workspace);
 // FL's plugin menu › Detached for an open editor: it closes and opens again in the other host (saved in the project).
 void setDetached (juce::AudioPluginInstance& plugin, bool detached);
+// Round 190in (shots): FL's ▸ wrapper menu of the plugin's open window (nullopt: no window open).
+std::optional<juce::PopupMenu> wrapperMenuForSnapshot (juce::AudioPluginInstance& plugin);
 // FL's Tools › Macros › "Switch all plugin editors to" › Attached / Detached (round 190i): every hosted plugin of the
 // song, and the open editors move to the other host.
 void setAllDetached (AudioEngine& engine, bool detached);
@@ -77,6 +81,29 @@ int reload (AudioEngine& engine, const std::vector<AudioEngine::HostedSlot>& whi
 // The user asked for the window of a plugin that is down: "<name> crashed and was switched off" with Reload (and, for a
 // plugin that ran inside LYNX, "Reload in a separate process"). `reopen` runs after a reload that worked.
 void promptReload (AudioEngine& engine, AudioEngine::HostedSlot where, std::function<void()> reopen);
+// Round 190gg (B1, LYNX-own; FL has no sandbox): after a plugin crashed inside LYNX, "Always run <plugin> in a separate
+// process". Offered unless every plugin already runs in one (Options) or this plugin is already on the list.
+bool canAlwaysRunSeparately (const juce::String& plugin);
+// Puts the plugin on the "always in a separate process" list (by its name, so new instances and other projects follow,
+// and a rescan keeps it), and turns "Run in a separate process" on for every instance of it in this project and for the
+// ones that are down: they start again in a process of their own, from their last captured settings (that is the
+// Reload). Their windows close first. A plugin in another process opens its editor in a window of its own (no docking).
+void alwaysRunSeparately (AudioEngine& engine, const juce::String& plugin);
+// The hint that goes with the choice (the dialogs' message and the buttons' tooltips)
+juce::String alwaysSeparateHint();
+// The main window's "Plugin crashed" prompt for a plugin that crashed inside LYNX (MainComponent): its text and buttons
+// (`reload`: the first button is Reload; `separate`: then "Always run <plugin> in a separate process"; Close is last).
+// `onLoad`: it crashed on its saved settings (no Reload: they would crash it again).
+struct CrashPrompt
+{
+    juce::String title, message;
+    juce::StringArray buttons;
+    bool reload = false, separate = false;
+};
+CrashPrompt crashPrompt (const juce::String& plugin, bool onLoad);
+// --snapshot / --stabilityshot (round 190gg): that prompt, and the notice a plugin window shows in place of the editor
+std::unique_ptr<juce::Component> makeCrashPromptPanel (const juce::String& plugin, bool onLoad);
+std::unique_ptr<juce::Component> makeCrashNoticePanel (const juce::String& plugin, bool offerSeparate);
 // A parameter gesture in an open plugin editor (`starting` = begin, else end), on the UI thread; the plugin is only
 // compared, it may be gone (REA round 143: Last tweaked, automation recording).
 extern std::function<void (const juce::AudioPluginInstance&, int, bool)> onGesture;
@@ -104,6 +131,14 @@ void scanPluginsWithProgress (AudioEngine& engine, std::function<void (int)> onD
 // (nullptr: gone); `instance` is the running plugin (may be null).
 juce::PopupMenu pluginProcessingMenu (AudioEngine& engine, const PluginRef& current, juce::AudioPluginInstance* instance,
                                       std::function<PluginRef* (Song&)> find);
+
+// FL's plugin menu items for a hosted plugin (round 190df; FL's PluginMenu): its spare state ("Store in spare state",
+// "Flip with spare state", FL's hint "A/B compare") and Parameters > "Link all parameters..." (the Remote control settings window
+// stepping through every parameter). `base`: the plugin's first parameter as an automation target (channelParam or
+// effectParam; none = no parameter items).
+void addPluginWrapperItems (juce::PopupMenu& menu, AudioEngine& engine, juce::AudioPluginInstance& plugin, const AutomationTarget& base);
+// The parameters "Link all parameters..." queues (FL: every parameter of the plugin [0x124dea0])
+std::vector<AutomationTarget> allPluginParameterTargets (juce::AudioPluginInstance& plugin, const AutomationTarget& base);
 
 // Menus of known plugins (instruments or effects): the favourites, then "More plugins..." (the plugin picker) and
 // the scan. `onChosen` receives the reference; from the picker (a window of its own, chosen later) it is only

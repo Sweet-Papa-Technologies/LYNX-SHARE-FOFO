@@ -14,6 +14,11 @@
 // Latency: two periods of the lowest detected pitch (70 Hz), reported to PDC; the dry signal is delayed to match.
 // Round trial187b: each channel has its own detector and shifter (as the reference, measured black-box); once shifted
 // the right channel runs 1.25 ms behind the left; Transpose at Pitch 0 / Formant 0 passes the input itself.
+// Round 190dp (Law = Measured, new instances): what the detector does not find voiced — noise, breath, consonants, a
+// tone above its range — moves with the formants as the reference's does ([black-box] its sine sweep comes out at
+// exactly the Formant shift above ~1.6 kHz: −3 st at Formant −3, +2 st at Formant +2, unshifted at Pitch +5 alone),
+// through longer flat-topped grains (core/VocalPitch.h, Psola::setUnvoicedShift). Law = Classic (projects saved
+// before) passes it through as round 135 … 190 did, bit for bit.
 // Meters (controlOutput): 0 = sung note / 127 (0 = unvoiced), 1 = the note sent out / 127, 2 = the held MIDI note / 127
 // (0 = none; round 137).
 
@@ -32,7 +37,15 @@ enum Param : int
     pitch, formant, link, mode, drive, mix,
     midi, // round 137 (appended, Off by default): the Channel Rack channel whose held notes set the pitch (the
           // original's MIDI control): Transpose / Quantize shift by (highest held note − C4), Robot sings that note
-    count
+    law,  // round 190dp (appended; Measured for new instances, Classic for projects saved before): the measured
+          // unvoiced path — noise, breath and what lies above the detector's range move with the formants, as the
+          // reference's do (black-box: its sweep and noise come out at the Formant shift where no pitch is found)
+    count,
+    // round 190ho, hidden (not in the info: no control, saved only while non-zero): the Measured law's revision.
+    // 0 = round 190dp's grains as they were (projects saved with 0.1.27 … 0.1.29), 1 = new instances: the start of a
+    // sung note, heard as unvoiced while the detector decides, is not read at the formant factor (it came out as a
+    // low thump at every onset; Psola::unshiftRecentUnvoiced). Law = Classic ignores it
+    revision = count
 };
 enum class Mode { transpose, quantize, robot };
 

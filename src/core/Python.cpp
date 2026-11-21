@@ -1,4 +1,5 @@
 #include "core/Python.h"
+#include "platform/CvWait.h"
 
 #include <algorithm>
 #include <array>
@@ -822,7 +823,7 @@ struct Host
         std::unique_lock<std::mutex> l (supervisorLock);
         while (! stopping)
         {
-            supervisorWake.wait_for (l, std::chrono::milliseconds (10));
+            cvwait::waitFor (supervisorWake, l, std::chrono::milliseconds (10)); // (round 190la: platform/CvWait.h)
             const auto d = deadline.load();
             if (d == 0)
                 continue;

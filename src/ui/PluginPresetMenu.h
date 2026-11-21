@@ -6,6 +6,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "core/PluginPresets.h"
+#include "core/PresetMix.h"
 #include "engine/AudioEngine.h"
 
 // Presets of hosted plugins from the plugin window (round 162d, issue #8; FL's wrapper: the presets menu and ◀ ▶):
@@ -34,6 +35,11 @@ juce::String saveWildcard (juce::AudioPluginInstance& plugin);
 // (the last one used first), then the selected channel's plugin; a .lynxpreset of an instrument nobody has open
 // becomes a new channel with that plugin. `message` receives what happened when nothing could take it.
 bool applyFromBrowser (AudioEngine& engine, const juce::File& file, juce::String& message);
+// Round 190fs: an FL preset (.fst) of a third-party plugin (FL's wrapper record). `load` reads it too (the plugin's
+// state carried over as from an .flp). From the Browser: into an open window of that plugin (or the selected channel's
+// plugin), else a new channel when the plugin is an instrument LYNX SHARE found; `message` says what to do otherwise.
+bool isFlPresetOfPlugin (const juce::File& file);
+bool applyFlPresetFromBrowser (AudioEngine& engine, const juce::File& file, juce::String& message);
 
 // Round 190ao (pain point 13; LYNX's own): the preset menu's "Play a note when a preset loads" — a short C5 on the
 // instrument after a preset is loaded while the song is stopped. A user setting (preset-audition.txt in the settings
@@ -50,6 +56,11 @@ public:
     void resized() override;
     void paint (juce::Graphics&) override;
     void mouseUp (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override
+    {
+        if (titleLook)
+            repaint(); // (the hovered part)
+    }
 
     int preferredWidth() const { return 250; }
     // Items the window adds at the end of the menu (issue #116: FL's "Detached", the last item of FL's plugin menu)
@@ -58,6 +69,18 @@ public:
     // when a preset loads"; the window plays the note.
     std::function<void()> onLoaded;
     void openMenu() { showMenu(); } // (tests / shots)
+
+    // Round 190in (details190if R8): FL's wrapper ▸ menu reuses the bar — its Presets ▸ submenu (the programs and the
+    // user's presets, then FL's Randomize and Hybridize), Save preset as... and the presets folder
+    juce::PopupMenu presetsMenu();
+    void saveAs();
+    juce::File presetFolder() const { return folderFor (plugin.getName()); }
+    // FL's Presets › Randomize ("gives random values to the published plugin settings": the plugin's automatable
+    // parameters) and Hybridize (a mode: a preset chosen while it is on brings a random half of those parameters)
+    void randomize();
+    static bool& hybridize() { return presetmix::hybridizeMode(); } // (one mode with the native editors' Hybridize)
+    // Round 190in (design190ia FW-5): in a window's title bar, FL's look — the name, dim, then ◀ ▶, no box
+    void setTitleLook (bool shouldBe);
 
 private:
     struct Entry
@@ -70,7 +93,6 @@ private:
     void step (int delta);
     void apply (const Entry& entry);
     void showMenu();
-    void saveAs();
     void loadFile();
     void exportFile();
     void setName (const juce::String& name);
@@ -82,5 +104,6 @@ private:
     juce::File currentFile;
     int currentProgram = -1;
     std::unique_ptr<juce::FileChooser> chooser;
+    bool titleLook = false;
 };
 } // namespace lynx::pluginpresetui

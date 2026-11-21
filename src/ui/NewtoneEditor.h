@@ -24,6 +24,18 @@ void open (AudioEngine& engine, int track, int slot);
 void closeAll();
 } // namespace NewtoneWindows
 
+// Round 190gw: the audio clip menu's "Pitch-correct sample" / "Time-warp sample" and the Sampler waveform menu's "Edit in
+// pitch corrector" / "Edit in time warper" (FL: Newtone / Newtime on the Master with the sample, live check 190gu B3):
+// LYNX's Newtone / Newtime on the Master (core mixerops::openSampleInMasterEditor) with `path` loaded, its window opened.
+void openSampleInMasterEditor (AudioEngine& engine, EffectKind kind, const std::string& path);
+
 // The editor alone (snapshots, tests)
 std::unique_ptr<juce::Component> makeNewtoneEditor (AudioEngine& engine, int track, int slot);
+// Round 190kj (--newtoneshot): put an editor made above in a state for a picture: "select:k,k...", "advanced", "cut",
+// "timesel:a,b" (output samples), "zoom:z", "lynxlook" (the round-165g layout, for the paint before / after); and the
+// average time of `paints` full paints in ms
+void setNewtoneShotState (juce::Component& editor, const juce::String& state);
+double newtonePaintMs (juce::Component& editor, int paints);
+// Round 190li (--newtoneshot190li): the editor's Edit menu, for a picture
+juce::PopupMenu newtoneEditMenuForSnapshot (juce::Component& editor);
 } // namespace lynx

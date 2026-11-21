@@ -1,5 +1,5 @@
 ---
-source: bcd8a275bd
+source: c4e89e7e72
 ---
 `Plik › Otwórz...` (`Ctrl+O`) otwiera własne projekty `.lynx` LYNX SHARE, a także pliki `.flp`, `.als`, `.flm` i `.mid`. Projekt z innego programu jest importem: staje się nowym, niezapisanym projektem LYNX SHARE, a oryginalny plik nigdy nie jest zapisywany.
 
@@ -16,8 +16,8 @@ source: bcd8a275bd
 | Format | Konwertowane | Niekonwertowane |
 |---|---|---|
 | `.flp` (FL Studio) | Kanały, sample, patterny, nuty slide i porta, wszystkie aranżacje, znaczniki, zmiany metrum, automatyka, powiązania z kontrolerami, Mixer z routingiem, sidechainy, EQ ścieżek i efekty natywne | Paczki FLEX są zaszyfrowane i nigdy nie są otwierane. Kanał FLEX dostaje patch syntezatora dobrany według nazwy presetu |
-| `.als` (Live 11 i 12) | Ścieżki MIDI, audio, grupowe i return, tempo, metrum, lokatory, pętla, głośność, panorama, wyciszenie, solo i wysyłki wraz z automatyką, klipy sesji i sceny, znaczniki warp | Własne efekty Live są pomijane. Racki zachowują tylko pierwszy łańcuch. Simpler, Sampler i racki perkusyjne stają się samplerami LYNX SHARE |
-| `.flm` (FL Studio Mobile) | Tempo, metrum, jeden insert miksera na kanał, jedna ścieżka Playlisty na tor, patterny, klipy audio z przesunięciem i wysokością, zestawy perkusyjne, sample DW Sampler i programy `.dwp` | Efekty i tory automatyki z FLM. Pozostałe generatory FLM grają wbudowanym syntezatorem |
+| `.als` (Live 11 i 12) | Ścieżki MIDI, audio, grupowe i return, tempo, metrum, lokatory, pętla, głośność, panorama, wyciszenie, solo i wysyłki wraz z automatyką, klipy sesji i sceny, znaczniki warp, racki i Racki perkusyjne oraz wiele własnych urządzeń Live (EQ Eight, Compressor, Glue Compressor, Reverb, Delay, Auto Filter, Saturator, Utility, Simpler, Drift i inne) jako własne urządzenia LYNX SHARE | Urządzenia Live bez odpowiednika w LYNX SHARE (Hybrid Reverb, Grain Delay, Amp, Roar, patche FM Operator i inne) są pomijane i wymienione na liście. Racki MIDI Effect nie są konwertowane |
+| `.flm` (FL Studio Mobile) | Tempo, metrum, jeden insert miksera na kanał, jedna ścieżka Playlisty na tor, patterny, klipy audio z przesunięciem i wysokością, zestawy perkusyjne, DW Sampler i programy `.dwp`, Slicer, MiniSynth, Transistor Bass, 3x Osc, GMSynth i SuperSaw, efekty, automatyka i zestawy akordów | Pozostałe generatory FLM grają wbudowanym syntezatorem |
 | `.mid` | Nuty, metrum i każda zmiana tempa | Plik MIDI nie niesie dźwięków: kanały dostają syntezator LYNX SHARE albo kanał MIDI Out |
 
 Pluginy innych firm VST2, VST3 i CLAP w pliku `.flp` oraz VST2 i VST3 w pliku `.als` wczytują się z zapisanym stanem, jeśli ten sam plugin jest zainstalowany na Twoim komputerze.
@@ -27,6 +27,12 @@ Pluginy innych firm VST2, VST3 i CLAP w pliku `.flp` oraz VST2 i VST3 w pliku `.
 Generatory i efekty FL Studio nie są ładowane. LYNX SHARE czyta ich zapisane ustawienia i odtwarza je na silnikach, które odtworzył od nowa. Każdy silnik ma poziom jakości, od `Exact` (bit w bit jak oryginał w każdym przetestowanym stanie) po `Placeholder` (ustawienia są zachowane, ale plugin milczy albo przepuszcza dźwięk bez zmian). Poziomy opisuje strona [Przejście z FL Studio](/wiki/coming-from-fl-studio/).
 
 Otwarcie pliku `.flp` działa bez zainstalowanego FL Studio. Niektóre silniki potrzebują fal, sampli lub impulsów, które są czytane z Twojej własnej instalacji FL Studio w czasie pracy.
+
+Plik `.flp`, który używa „FL Studio Mobile Rack” z FL Studio (własne „Save as FLP” w FL Studio Mobile zapisuje jeden na ścieżkę instrumentu), gra swój instrument i efekty na tych samych silnikach co `.flm`, podobnie efekt „FL Studio Mobile Rack FX”. Rack z zestawem perkusyjnym lub kilkoma instrumentami nadal gra wbudowanym syntezatorem.
+
+## Fabryczne brzmienia FL Studio Mobile
+
+Fabryczne brzmienia używane przez `.flm` (zestawy perkusyjne, programy DirectWave, SoundFonty, fale GMSynth) należą do FL Studio Mobile i nigdy nie są dołączane do LYNX SHARE. LYNX SHARE szuka ich w twojej własnej kopii folderu `Resources` aplikacji: dodaj go w `Ustawienia › Pliki › Zasoby FL Studio Mobile` (wskazanie folderu nad nim albo folderu instalacji FL Studio też działa). Instalacja FL Studio zawiera tylko część z nich i jest przeszukiwana po twoich folderach. Pliki, których nadal brakuje, są wymienione w oknie Brakujące pliki.
 
 ## Brakujące sample
 

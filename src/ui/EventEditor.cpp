@@ -17,6 +17,7 @@
 #include "ui/AutomationUi.h"
 #include "ui/Dialogs.h"
 #include "ui/MidiClipboard.h"
+#include "ui/MotionOverlay.h"
 #include "ui/I18n.h"
 #include "ui/Theme.h"
 #include "ui/ToolWindow.h"
@@ -33,6 +34,7 @@ bool sameTarget (const AutomationTarget& a, const AutomationTarget& b) noexcept
 bool bipolarTarget (const AutomationTarget& t) noexcept
 {
     return t.kind == AutomationTargetKind::channelPan || t.kind == AutomationTargetKind::mixerPan
+        || (t.kind == AutomationTargetKind::channelAdjust && t.param != leveladjust::volume) // (Levels adjustment offsets, round 190dz)
         || ((t.kind == AutomationTargetKind::channelParam || t.kind == AutomationTargetKind::effectParam) && midictl::isPitchBend (t.param));
 }
 
@@ -153,6 +155,7 @@ public:
         setSize (980, 400);
         targetChanged();
         setWantsKeyboardFocus (true);
+        gpuPlayhead.onHidden = [this] { repaint(); }; // (round 190ip: the overlay hid itself: the line is painted again)
         startTimerHz (30);
     }
 
@@ -167,7 +170,7 @@ public:
         const auto& pattern = currentPattern();
         const auto area = plotArea();
         const auto length = patternLength();
-        const auto bar = (std::int64_t) ppq * juce::jmax (1, song.beatsPerBar);
+        const auto bar = song.barTicks();
 
         g.setColour (colour::bg0);
         g.fillRect (area.withTop (area.getY() - rulerHeight));
@@ -213,7 +216,7 @@ public:
 
         // the channel's notes, faint, along the bottom (where the events will play)
         if (target.kind == AutomationTargetKind::channelVolume || target.kind == AutomationTargetKind::channelPan
-            || target.kind == AutomationTargetKind::channelParam)
+            || target.kind == AutomationTargetKind::channelParam || target.kind == AutomationTargetKind::channelAdjust)
         {
             g.setColour (colour::noteHard.withAlpha (0.35f));
             for (const auto& n : pattern.notes)
@@ -279,11 +282,8 @@ public:
         g.restoreState();
 
         // playback position
-        if (playhead >= 0.0)
-        {
-            g.setColour (colour::playhead);
-            g.drawVerticalLine ((int) tickToX (playhead), (float) area.getY() - rulerHeight, (float) area.getBottom());
-        }
+        if (playhead >= 0.0 && ! gpuPlayhead.isShowing()) // (round 190ip: the GPU moves it while playing)
+            paintPlayheadAt (g, (float) tickToX (playhead));
 
         // value read-out under the mouse
         if (hoverValue >= 0.0f)
@@ -545,27 +545,27 @@ private:
 
     // --- model access ---------------------------------------------------------------------------
 
+    // (round 190ea: safe on a song without patterns too, Song::activePattern)
     const Pattern& currentPattern() const
     {
-        const auto& song = engine.getSong();
-        return song.patterns[(std::size_t) juce::jlimit (0, (int) song.patterns.size() - 1, song.currentPattern)];
+        return engine.getSong().activePattern();
     }
 
     static Pattern& currentPattern (Song& s)
     {
-        return s.patterns[(std::size_t) juce::jlimit (0, (int) s.patterns.size() - 1, s.currentPattern)];
+        return s.activePattern();
     }
 
     std::int64_t patternLength() const
     {
-        return juce::jmax<std::int64_t> (ticksPerStep, currentPattern().effectiveLength (engine.getSong().beatsPerBar));
+        return juce::jmax<std::int64_t> (ticksPerStep, currentPattern().effectiveLength (engine.getSong().meter()));
     }
 
     std::int64_t gridTicks() const
     {
         static const std::int64_t steps[] = { ticksPerStep / 2, ticksPerStep, ppq / 2, ppq, -1 };
         const auto i = juce::jlimit (0, 4, gridBox.getSelectedItemIndex());
-        return steps[i] > 0 ? steps[i] : (std::int64_t) ppq * juce::jmax (1, engine.getSong().beatsPerBar);
+        return steps[i] > 0 ? steps[i] : engine.getSong().barTicks();
     }
 
     std::int64_t snap (double tick) const
@@ -1025,9 +1025,34 @@ private:
         if (tick != playhead)
         {
             playhead = tick;
-            repaint();
+            // round 190ip: while playing the GPU moves the line (the editor is not painted again 30 times a second);
+            // the frame that starts or ends, and whenever the overlay cannot, the editor is painted as before
+            const auto gpu = ui::stepMark (gpuPlayhead, tick >= 0.0 && isShowing(), playheadMark(), false);
+            if (! gpu.onOverlay || gpu.flipped)
+                repaint();
         }
     }
+
+    void paintPlayheadAt (juce::Graphics& g, float x)
+    {
+        const auto area = plotArea();
+        g.setColour (theme::colour::playhead);
+        g.drawVerticalLine ((int) x, (float) area.getY() - rulerHeight, (float) area.getBottom());
+    }
+
+    ui::MotionOverlay::Mark playheadMark() const
+    {
+        const auto area = plotArea();
+        ui::MotionOverlay::Mark m;
+        m.x = (float) tickToX (playhead);
+        m.extent = juce::Rectangle<int>::leftTopRightBottom (-2, area.getY() - rulerHeight, 2, area.getBottom());
+        m.clip = getLocalBounds();
+        m.look = ((std::uint64_t) (std::uint32_t) theme::colour::playhead.getARGB() << 32) ^ ((std::uint64_t) (std::uint32_t) area.getY() << 16)
+                 ^ (std::uint64_t) (std::uint32_t) area.getBottom();
+        return m;
+    }
+
+    ui::MotionOverlay gpuPlayhead { *this, [this] (juce::Graphics& g, float x) { paintPlayheadAt (g, x); } };
 
     AudioEngine& engine;
     AutomationTarget target;

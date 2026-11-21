@@ -103,9 +103,37 @@ inline void clipWrite (const Clip& c, const PatternEvents& lane, std::int64_t pa
         best = { at, e->value };
 }
 
+inline const Clip& clipOf (const Clip& c) noexcept { return c; }
+inline const Clip& clipOf (const Clip* c) noexcept { return *c; }
+
+// The clips of the playlist tempoAt reads (round perfgate190id): automation clips of a tempo automation and pattern
+// clips whose pattern has a Tempo lane, in playlist order. tempoAtIn (song, these, tick) == tempoAt (song, tick), and
+// a scan of the song's tempo (RackRenderer's shifter plan: every 16th of the song) no longer reads every clip each time
+inline std::vector<const Clip*> tempoClips (const Song& song)
+{
+    std::vector<const Clip*> clips;
+    for (const auto& c : song.playlist)
+        if ((c.kind == ClipKind::automation && c.automation >= 0 && c.automation < (int) song.automations.size()
+             && song.automations[(std::size_t) c.automation].target.kind == AutomationTargetKind::tempo)
+            || (c.kind == ClipKind::pattern && c.pattern >= 0 && c.pattern < (int) song.patterns.size()
+                && tempoLane (song.patterns[(std::size_t) c.pattern]) != nullptr))
+            clips.push_back (&c);
+    return clips;
+}
+
+template <typename Clips>
+double tempoAtIn (const Song& song, const Clips& playlist, double tick) noexcept;
+
 // The tempo (BPM) at `tick`: a song position in song mode (inside the song's length), the pattern position (counting
 // its loops from 0) in pattern mode.
 inline double tempoAt (const Song& song, double tick) noexcept
+{
+    return tempoAtIn (song, song.playlist, tick);
+}
+
+// tempoAt over `playlist` (the song's playlist, or a part of it in its order that holds every clip tempoClips gives)
+template <typename Clips>
+double tempoAtIn (const Song& song, const Clips& playlist, double tick) noexcept
 {
     const auto base = song.bpm;
     if (song.mode != PlayMode::song)
@@ -116,7 +144,7 @@ inline double tempoAt (const Song& song, double tick) noexcept
         const auto* lane = tempoLane (pattern);
         if (lane == nullptr)
             return base;
-        const auto length = (double) std::max<std::int64_t> (1, pattern.effectiveLength (song.beatsPerBar));
+        const auto length = (double) std::max<std::int64_t> (1, pattern.effectiveLength (song.meter()));
         const auto pass = std::floor (std::max (0.0, tick) / length);
         const auto* e = lastEvent (*lane, std::max (0.0, tick) - pass * length);
         if (e == nullptr && pass > 0.0)
@@ -134,8 +162,9 @@ inline double tempoAt (const Song& song, double tick) noexcept
         const Clip* inside = nullptr;
         const Clip* ended = nullptr;
         const Clip* first = nullptr;
-        for (const auto& c : song.playlist)
+        for (const auto& entry : playlist)
         {
+            const Clip& c = clipOf (entry);
             if (c.kind != ClipKind::automation || c.automation < 0 || c.automation >= (int) song.automations.size() || c.length <= 0
                 || c.muted || song.isTrackMuted (c.track))
                 continue;
@@ -164,12 +193,12 @@ inline double tempoAt (const Song& song, double tick) noexcept
 
     Write events;
     if (hasTempoEvents (song))
-        for (const auto& c : song.playlist)
-            if (c.kind == ClipKind::pattern && c.pattern >= 0 && c.pattern < (int) song.patterns.size() && ! c.muted && ! song.isTrackMuted (c.track))
+        for (const auto& entry : playlist)
+            if (const Clip& c = clipOf (entry); c.kind == ClipKind::pattern && c.pattern >= 0 && c.pattern < (int) song.patterns.size() && ! c.muted && ! song.isTrackMuted (c.track))
             {
                 const auto& pattern = song.patterns[(std::size_t) c.pattern];
                 if (const auto* lane = tempoLane (pattern))
-                    clipWrite (c, *lane, pattern.effectiveLength (song.beatsPerBar), tick, events);
+                    clipWrite (c, *lane, pattern.effectiveLength (song.meter()), tick, events);
             }
 
     if (events.any() && (! automation.any() || events.tick > automation.tick))

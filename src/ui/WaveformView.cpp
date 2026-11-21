@@ -1,4 +1,7 @@
 #include "ui/WaveformView.h"
+
+#include "core/SamplerPage.h"
+#include "core/Spectrogram.h"
 #include "platform/Paths.h"
 
 #include <algorithm>
@@ -285,9 +288,14 @@ void appendCleanWaveform (juce::Path& wave, float scale, juce::Rectangle<float> 
             smooth[(std::size_t) x] = std::max (c, (l + 2.0f * c + r) * 0.25f);
         }
 
-        const auto centre = body.getY() + laneHeight * ((float) lane + 0.5f);
+        auto centre = body.getY() + laneHeight * ((float) lane + 0.5f);
         const auto half = laneHeight * 0.5f - 1.0f;
-        const auto minHalf = 0.5f; // silence still shows as a hairline
+        auto minHalf = 0.5f; // silence still shows as a hairline
+        if (! style.silenceLine.isTransparent()) // (round 190ig: FL's 1 px silence line carries silence; the centre on a pixel)
+        {
+            centre = (std::floor (centre * scale) + 0.5f) / scale;
+            minHalf = 0.0f;
+        }
 
         // one closed path per run of valid columns: the top edge left to right, the bottom edge back
         int x = 0;
@@ -321,6 +329,16 @@ void paintCleanWaveform (juce::Graphics& g, juce::Rectangle<float> body, juce::R
     const auto scale = juce::jlimit (1.0f, 4.0f, g.getInternalContext().getPhysicalPixelScaleFactor());
     juce::Path wave;
     appendCleanWaveform (wave, scale, body, visible, summary, startFrame, framesPerPixel, style);
+    if (! style.silenceLine.isTransparent()) // FL's silence line: one physical pixel row per lane, under the waveform
+    {
+        const auto lanes = style.stereo && summary.channels > 1 ? 2 : 1;
+        g.setColour (style.silenceLine);
+        for (int lane = 0; lane < lanes; ++lane)
+        {
+            const auto centre = std::floor ((body.getY() + body.getHeight() / (float) lanes * ((float) lane + 0.5f)) * scale) / scale;
+            g.fillRect (juce::Rectangle<float> (visible.getX(), centre, visible.getWidth(), 1.0f / scale));
+        }
+    }
     g.setColour (style.classic);
     g.fillPath (wave);
 }
@@ -522,12 +540,142 @@ void WaveformDisplay::setStartOffset (float fraction)
     }
 }
 
-float WaveformDisplay::regionX (float fraction) const
+float WaveformDisplay::displayX (double fraction) const
 {
     const auto inner = getLocalBounds().toFloat().reduced (1.0f);
-    const auto x0 = inner.getX() + inner.getWidth() * juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionEnd : regionStart);
-    const auto x1 = inner.getX() + inner.getWidth() * juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionStart : regionEnd);
+    return inner.getX() + inner.getWidth() * (float) ((fraction - viewStart) / juce::jmax (1.0e-9, viewEnd - viewStart));
+}
+
+float WaveformDisplay::regionX (float fraction) const
+{
+    const auto x0 = displayX (juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionEnd : regionStart));
+    const auto x1 = displayX (juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionStart : regionEnd));
     return x0 + (x1 - x0) * juce::jlimit (0.0f, 1.0f, fraction);
+}
+
+double WaveformDisplay::fileFractionAt (float x) const
+{
+    const auto inner = getLocalBounds().toFloat().reduced (1.0f);
+    const auto shown = viewStart + (double) ((x - inner.getX()) / juce::jmax (1.0f, inner.getWidth())) * (viewEnd - viewStart);
+    return juce::jlimit (0.0, 1.0, reversed ? 1.0 - shown : shown);
+}
+
+WaveformDisplay::Handle WaveformDisplay::handleAt (juce::Point<float> p) const
+{
+    if (! handlesEditable || path.isEmpty())
+        return Handle::none;
+    constexpr float reach = 4.0f;
+    // (the loop's lines first: drawn over the start marker; the nearer one when both are in reach)
+    if (loopStart >= 0.0f && loopEnd >= loopStart)
+    {
+        const auto xa = displayX (reversed ? 1.0 - (double) loopEnd : (double) loopStart);
+        const auto xb = displayX (reversed ? 1.0 - (double) loopStart : (double) loopEnd);
+        const auto da = std::abs (p.x - xa), db = std::abs (p.x - xb);
+        if (juce::jmin (da, db) <= reach)
+        {
+            const auto onA = da < db || (da == db && p.y > (float) getHeight() * 0.5f); // (start = end: the lower half takes the start)
+            return (onA != reversed) ? Handle::loopStart : Handle::loopEnd;
+        }
+    }
+    if (std::abs (p.x - regionX (startOffset)) <= reach)
+        return Handle::start;
+    return Handle::none;
+}
+
+float WaveformDisplay::handleXForSnapshot (Handle h) const
+{
+    if (h == Handle::start)
+        return regionX (startOffset);
+    if (loopStart < 0.0f || loopEnd < loopStart)
+        return -1.0f;
+    const auto atStart = (h == Handle::loopStart) != reversed;
+    return displayX (reversed ? 1.0 - (double) (atStart ? loopEnd : loopStart) : (double) (atStart ? loopStart : loopEnd));
+}
+
+void WaveformDisplay::mouseMove (const juce::MouseEvent& e)
+{
+    setMouseCursor (handleAt (e.position) != Handle::none ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+}
+
+void WaveformDisplay::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragged == Handle::none || onHandleDrag == nullptr)
+        return;
+    if (dragged == Handle::start)
+    {
+        const auto x0 = regionX (0.0f), x1 = regionX (1.0f);
+        onHandleDrag (Handle::start, juce::jlimit (0.0, 1.0, (double) ((e.position.x - x0) / (std::abs (x1 - x0) < 1.0f ? 1.0f : x1 - x0))), e.mods.isShiftDown());
+        return;
+    }
+    onHandleDrag (dragged, fileFractionAt (e.position.x), e.mods.isShiftDown());
+}
+
+void WaveformDisplay::mouseUp (const juce::MouseEvent&)
+{
+    if (dragged == Handle::none)
+        return;
+    const auto was = dragged;
+    dragged = Handle::none;
+    if (onHandleDragEnd != nullptr)
+        onHandleDragEnd (was);
+}
+
+void WaveformDisplay::setWatermark (const juce::String& text)
+{
+    if (text != watermark)
+    {
+        watermark = text;
+        repaint();
+    }
+}
+
+void WaveformDisplay::setCaptionVisible (bool shown)
+{
+    if (shown != captionShown)
+    {
+        captionShown = shown;
+        repaint();
+    }
+}
+
+void WaveformDisplay::setLoop (float start, float end)
+{
+    if (start != loopStart || end != loopEnd)
+    {
+        loopStart = start;
+        loopEnd = end;
+        repaint();
+    }
+}
+
+void WaveformDisplay::setView (double start, double end)
+{
+    // at least 1/512 of the file shown, inside the file
+    const auto width = juce::jlimit (1.0 / 512.0, 1.0, end - start);
+    start = juce::jlimit (0.0, 1.0 - width, start);
+    if (start == viewStart && start + width == viewEnd)
+        return;
+    viewStart = start;
+    viewEnd = start + width;
+    repaint();
+    if (onViewChanged != nullptr)
+        onViewChanged();
+}
+
+void WaveformDisplay::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
+{
+    if (! zoomEnabled || w.deltaY == 0.0f)
+    {
+        juce::Component::mouseWheelMove (e, w);
+        return;
+    }
+    // the fraction under the mouse stays where it is
+    const auto inner = getLocalBounds().toFloat().reduced (1.0f);
+    const auto at = juce::jlimit (0.0, 1.0, (double) ((e.position.x - inner.getX()) / juce::jmax (1.0f, inner.getWidth())));
+    const auto anchor = viewStart + at * (viewEnd - viewStart);
+    const auto factor = std::pow (0.8, (double) w.deltaY * 4.0); // (wheel up = closer)
+    const auto width = juce::jlimit (1.0 / 512.0, 1.0, (viewEnd - viewStart) * factor);
+    setView (anchor - at * width, anchor - at * width + width);
 }
 
 juce::Rectangle<int> WaveformDisplay::locatorArea (float fraction) const
@@ -555,6 +703,14 @@ void WaveformDisplay::setLocator (float fraction)
     }
 }
 
+void WaveformDisplay::setCornerText (const juce::String& text)
+{
+    if (text == cornerText)
+        return;
+    cornerText = text;
+    repaint();
+}
+
 void WaveformDisplay::setCaption (const juce::String& text)
 {
     caption = text;
@@ -565,6 +721,47 @@ void WaveformDisplay::setEmptyText (const juce::String& text)
 {
     emptyText = text;
     repaint();
+}
+
+void WaveformDisplay::setFollowsSamplerViews (bool follows)
+{
+    samplerViews = follows;
+    repaint();
+}
+
+void WaveformDisplay::paintSpectrum (juce::Graphics& g, juce::Rectangle<float> inner, const SampleData& data)
+{
+    // one analysis column per pixel of the view (display order: a reversed sample reads backwards), kept until the
+    // file, the view or the size changes
+    const auto width = juce::jmax (1, juce::roundToInt (inner.getWidth())), height = juce::jmax (1, juce::roundToInt (inner.getHeight()));
+    const auto frames = (double) data.frames();
+    const auto key = path + "|" + juce::String (data.frames()) + "|" + juce::String (viewStart, 6) + "|" + juce::String (viewEnd, 6) + "|"
+                     + juce::String (width) + "x" + juce::String (height) + (reversed ? "|r" : "");
+    if (key != spectrumKey || ! spectrumImage.isValid())
+    {
+        const auto from = reversed ? frames * (1.0 - viewEnd) : frames * viewStart;
+        const auto to = reversed ? frames * (1.0 - viewStart) : frames * viewEnd;
+        const auto cells = spectrogram::compute (data.leftData(), data.isStereo() ? data.rightData() : nullptr, (std::int64_t) data.frames(), from, to, width);
+        spectrumImage = juce::Image (juce::Image::RGB, width, height, true);
+        if (cells.columns == width && cells.bins > 0)
+        {
+            juce::Image::BitmapData pixels (spectrumImage, juce::Image::BitmapData::writeOnly);
+            for (int x = 0; x < width; ++x)
+            {
+                const auto column = reversed ? width - 1 - x : x;
+                for (int y = 0; y < height; ++y)
+                {
+                    // frequency up, linear: the bottom row is 0 Hz, the top one the highest bin
+                    const auto bin = juce::jlimit (0, cells.bins - 1, (int) ((double) (height - 1 - y) / (double) height * cells.bins));
+                    const auto level = cells.level[(std::size_t) column * (std::size_t) cells.bins + (std::size_t) bin];
+                    pixels.setPixelColour (x, y, juce::Colour (spectrogram::colourOf (level)));
+                }
+            }
+        }
+        spectrumKey = key;
+    }
+    g.setOpacity (1.0f); // (drawImage takes the current colour's alpha: the centre line's is faint)
+    g.drawImage (spectrumImage, inner);
 }
 
 void WaveformDisplay::paint (juce::Graphics& g)
@@ -594,15 +791,46 @@ void WaveformDisplay::paint (juce::Graphics& g)
     }
 
     const auto frames = (double) summary->frames;
-    const auto perPixel = frames / (double) inner.getWidth();
-    paintWaveform (g, inner, *summary, reversed ? frames : 0.0, reversed ? -perPixel : perPixel,
-                   currentWaveStyle (colour::audioClip.brighter (0.3f), normalisingGain (*summary)));
+    const auto perPixel = frames * (viewEnd - viewStart) / (double) inner.getWidth();
+    const juce::Graphics::ScopedSaveState clipToInner (g);
+    g.reduceClipRegion (inner.toNearestInt());
+    // round 190dh: the faded name behind the waveform (FL's Sampler page)
+    if (watermark.isNotEmpty())
+    {
+        g.setColour (colour::textSecondary.withAlpha (0.22f));
+        g.setFont (font (juce::jlimit (14.0f, 34.0f, inner.getHeight() * 0.24f)));
+        g.drawText (watermark, inner.reduced (10.0f, 4.0f).removeFromTop (juce::jlimit (18.0f, 44.0f, inner.getHeight() * 0.32f)),
+                    juce::Justification::centredRight, false);
+        g.setFont (font (type::small));
+    }
+    // round 190gw: FL's Sampler view switches (the spectrogram wins when both are on)
+    const auto& views = samplerpage::waveViews();
+    const auto data = samplerViews && views.spectrum && source != nullptr ? source() : nullptr;
+    if (data != nullptr && data->frames() > 0)
+    {
+        paintSpectrum (g, inner, *data);
+        if (watermark.isNotEmpty()) // (FL's faded name shows over the spectrogram too)
+        {
+            g.setColour (colour::textSecondary.withAlpha (0.22f));
+            g.setFont (font (juce::jlimit (14.0f, 34.0f, inner.getHeight() * 0.24f)));
+            g.drawText (watermark, inner.reduced (10.0f, 4.0f).removeFromTop (juce::jlimit (18.0f, 44.0f, inner.getHeight() * 0.32f)),
+                        juce::Justification::centredRight, false);
+            g.setFont (font (type::small));
+        }
+    }
+    else
+    {
+        auto style = currentWaveStyle (colour::audioClip.brighter (0.3f), normalisingGain (*summary));
+        if (samplerViews && views.multichannel)
+            style.stereo = true;
+        paintWaveform (g, inner, *summary, reversed ? frames * (1.0 - viewStart) : frames * viewStart, reversed ? -perPixel : perPixel, style);
+    }
 
     // the part outside the region is dimmed; its edges are marked in the accent colour
     if (regionStart > 0.0f || regionEnd < 1.0f)
     {
-        const auto x0 = inner.getX() + inner.getWidth() * juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionEnd : regionStart);
-        const auto x1 = inner.getX() + inner.getWidth() * juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionStart : regionEnd);
+        const auto x0 = displayX (juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionEnd : regionStart));
+        const auto x1 = displayX (juce::jlimit (0.0f, 1.0f, reversed ? 1.0f - regionStart : regionEnd));
         g.setColour (colour::bg0.withAlpha (0.7f));
         g.fillRect (juce::Rectangle<float>::leftTopRightBottom (inner.getX(), inner.getY(), x0, inner.getBottom()));
         g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x1, inner.getY(), inner.getRight(), inner.getBottom()));
@@ -638,7 +866,40 @@ void WaveformDisplay::paint (juce::Graphics& g)
         g.fillRect (x - 0.75f, inner.getY(), 1.5f, inner.getHeight());
     }
 
+    // round 190dh: the loop the sampler plays. Live check 190ew SMP-3 / SMP-4 (FL 2026 shots): a red shaded band with
+    // red edges, and a red "Loop" label at the band's bottom left (START = END: no band, as in FL)
+    if (loopStart >= 0.0f && loopEnd >= loopStart)
+    {
+        const auto xa = displayX (reversed ? 1.0 - (double) loopEnd : (double) loopStart);
+        const auto xb = displayX (reversed ? 1.0 - (double) loopStart : (double) loopEnd);
+        if (loopEnd > loopStart)
+        {
+            g.setColour (colour::accent.withAlpha (0.20f));
+            g.fillRect (juce::Rectangle<float>::leftTopRightBottom (xa, inner.getY(), juce::jmax (xa + 1.0f, xb), inner.getBottom()));
+        }
+        g.setColour (colour::accent);
+        for (const auto x : { xa, xb })
+            g.fillRect (x - 0.5f, inner.getY(), 1.5f, inner.getHeight());
+        if (loopEnd > loopStart)
+        {
+            g.setFont (font (type::caption));
+            g.drawText (tr ("Loop"), juce::Rectangle<float> (xa + 4.0f, inner.getBottom() - 13.0f, 40.0f, 12.0f), juce::Justification::centredLeft, false);
+            g.setFont (font (type::small));
+        }
+    }
+
+    // round 190ey (live check 190ew SMP-7b): FL's bit-depth box at the bottom right ("16", "32" once precomputed)
+    if (cornerText.isNotEmpty())
+    {
+        g.setColour (colour::textSecondary);
+        g.setFont (font (type::caption));
+        g.drawText (cornerText, inner.reduced (6.0f, 3.0f).removeFromBottom (12.0f), juce::Justification::centredRight, false);
+        g.setFont (font (type::small));
+    }
+
     // caption: the file name and its length
+    if (! captionShown)
+        return;
     auto text = caption;
     if (text.isEmpty())
         text = juce::File (path).getFileName() + "  " + juce::String (frames / summary->sampleRate, 2) + " s"

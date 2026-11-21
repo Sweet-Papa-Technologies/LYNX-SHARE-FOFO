@@ -289,7 +289,7 @@ Each interaction has an ID, which section 3 uses for the gap matrix.
 | P20 | Arrangements: dropdown in the title bar; add, clone, rename, delete, merge one into another | [DOC][pl] |
 | P21 | Clip focus selector: chooses which clip type is on top for picking stacked clips | [DOC][pl-focus] |
 | P22 | Audio clip keys: transpose (7/8), reverse (9), stretch mode, fades view | [DOC][sc-pl] |
-| P23 | Dropping a plugin/audio file on a track header creates a linked instrument/audio track | [DOC][pl-trackmode] |
+| P23 | Dropping a plugin/audio file on a track header creates a linked instrument/audio track (round 190hf: a generator on a header makes it an instrument track, or replaces an instrument track's generator, on every selected track; an effect goes to the header's mixer track, first free slot; the lanes take no plugin; FLEngine 2026 [DECOMP], /mnt/e/lynx-work/dnd190hf/DROP-FACTS.md) | [DOC][pl-trackmode] |
 | P24 | Live clip launching ("performance" mode, Ctrl+P in the Playlist) | [DOC][perf] |
 | P25 | Audio clips show a detailed waveform at every zoom level; the sample's waveform is also drawn in the Sampler channel settings and while previewing in the Browser | [DOC][ac] [DOC][csm] [DOC][br] |
 
@@ -333,7 +333,7 @@ Each interaction has an ID, which section 3 uses for the gap matrix.
 | B1 | Click audio previews the first seconds; Alt+click (or an option) plays it fully; Shift+click from the mouse position | [DOC][br] |
 | B2 | Shift+Up/Down steps through files, previewing each, and **swaps each one into the selected channel** | [DOC][br] [DOC][sc] |
 | B3 | Enter / middle-click / "send to selected channel" loads the item into the selected channel | [DOC][br] [DOC][br-use] |
-| B4 | Drop targets: rack (new channel), Playlist (audio clip), mixer insert or slot (effect), mixer insert (instrument + routing), track header (linked track); Alt while dropping keeps the window closed | [DOC][br] [DOC][br-use] [DOC][mx] |
+| B4 | Drop targets: rack (new channel), Playlist (audio clip), mixer insert or slot (effect), mixer insert (instrument + routing), track header (linked track); Alt while dropping keeps the window closed. A sample dropped on a hosted plugin's own editor (Serum, a sampler) reaches the plugin as a file (issue #174: LYNX hands its drag to the system's file drag there) | [DOC][br] [DOC][br-use] [DOC][mx] |
 | B5 | Dropping on an existing channel / on the Piano Roll | not documented ([DOC][br]) |
 | B6 | Search (Ctrl+F): wildcards, AND/OR/NOT, exact phrase, current folder only, F2/F3 previous/next result | [DOC][br] |
 | B7 | Tabs (all, current project, plugin database, starred), user folders, layouts (tree, columns, samples with waveforms, plugin grid), tags, favourites (star) | [DOC][br] |
@@ -507,7 +507,7 @@ gesture or reduced scope · **No** = absent (searched, not found). Locations are
 |---|---|---|
 | A1 | Partial | Right-click any knob → clip + editor. With a time selection the clip spans it; otherwise the whole song. Goes on a new bottom track (not "highest empty track in view") |
 | A2 | **Done** (most) | Editor window: click adds, drag moves, **Shift / Ctrl pressed after the click lock time / value**, **right-click point menu: type value, copy/paste value, straight segment, delete**; Shift+right-click adds a point on the curve. **Inline in the Playlist** (Pencil/Brush): drag a point, click on the curve to add one, right-click a point deletes it |
-| A3 | Partial | Alt+drag on a segment sets tension; "straight segment" in the point menu. No curve-type menu (needs a per-segment shape in the model) |
+| A3 | **Done** | Alt+drag on a segment sets tension; the point menu has FL's **Mode** list (Smooth, Hold, Single curve 1–3, Double curve 1–3, Half sine, Stairs, Smooth stairs, Pulse, Wave) in the Playlist and in the editor, with FL's shapes (`core/FlCurve`, REA round 190bw), saved in `.lynx` and carried by `.flp` import and export; a new point takes the last mode and tension used, as in FL. "Straight segment" stays as a LYNX extra |
 | A4–A6 | No | — |
 | A7 | No | — |
 | A8 | Partial | Make unique and tempo automation exist |
@@ -773,7 +773,7 @@ search stepping, instrument drops on mixer inserts, record filters for automatio
   - colour scheme or skins;
   - step-button, LED, knob or fader art;
   - window title-bar *art* (the arrangement of its parts, see section 5, is followed);
-  - splash, mascot or logo (LYNX's splash uses its own pepper and its own synthesised sound).
+  - splash, mascot or logo (LYNX's splash uses its own logo, by w3teal, and its own synthesised sound).
   Since October 2026 the *arrangement* of the toolbar panels and window title bars follows FL's (section 5,
   the user's decision); everything is still drawn by LYNX.
 - **Names.** Generic terms are fine: Channel Rack, Step sequencer, Piano Roll, Playlist, Mixer, Browser,
@@ -978,7 +978,7 @@ left for later (P2).
 - FL shows a splash with its version while it starts. A General setting turns it off. [DOC][envgen]
 
 **LYNX** (`ui/Splash.*`, `core/StartupSound.*`):
-- A splash of its own: the user's pepper drops onto a dark card and bounces, then "LYNX" and the version slide
+- A splash of its own: the LYNX SHARE app icon (the logo by w3teal on its dark tile) drops onto a dark card and bounces, then "LYNX" and the version slide
   in while the audio engine and the workspace load. It lasts about 2 s.
 - A short start-up sound is synthesised in code: a whoosh, a landing "pop" timed to the first bounce, and a
   plucked chime.

@@ -973,6 +973,7 @@ bool parseMarkers (const std::uint8_t* data, std::size_t size, Document& out, st
     {
         std::uint32_t id = 0, position = 0, length = 0;
         std::string name;
+        int key = -1;
     };
     std::vector<Cue> cues;
     gotAny = false;
@@ -1047,6 +1048,34 @@ bool parseMarkers (const std::uint8_t* data, std::size_t size, Document& out, st
                     q = sb + subLen + (subLen & 1);
                 }
             }
+            else if (pass == 1 && std::memcmp (tag, "tlst", 4) == 0 && len >= 4) // round 190ez: FL Edison's trigger notes
+            {
+                // u32 count, then 24-byte entries: fourcc "cue ", u32 cue id - 1, u32 1, u8 0xFF, u8 note, u8 0x90, u8 0,
+                // u32 0, u32 0. Round 190gk: FL's own multi-entry files settle the first two words (an FL /R render with
+                // three markers, r167l: cue ids 0x10000..0x10002, entries 0xffff / 0x10000 / 0x10001 then 1 each;
+                // Edison's writer 0x613f00, REA 190h; Slicex 190r). LYNX 0.1.27 wrote {0, cue id} instead, which only
+                // matches FL for cue id 1: an entry whose second word is not FL's constant 1 is read that old way.
+                const auto count = (std::size_t) get32 (data + body);
+                for (std::size_t i = 0; i < count && 4 + (i + 1) * 24 <= len; ++i)
+                {
+                    const auto* t = data + body + 4 + i * 24;
+                    if (std::memcmp (t, "cue ", 4) != 0)
+                        continue;
+                    const auto second = get32 (t + 8);
+                    const auto id = second == 1 ? get32 (t + 4) + 1 : second;
+                    if (auto* c = findCue (id))
+                        c->key = t[13] < 128 ? (int) t[13] : -1;
+                }
+            }
+            else if (pass == 1 && std::memcmp (tag, "lxkn", 4) == 0) // round 190ee: LYNX 0.1.27's own chunk (read only)
+            {
+                for (std::size_t q = body; q + 8 <= body + len; q += 8)
+                    if (auto* c = findCue (get32 (data + q)))
+                    {
+                        const auto key = (int) get32 (data + q + 4);
+                        c->key = key >= 0 && key < 128 ? key : -1;
+                    }
+            }
             p = body + len + (len & 1);
         }
     }
@@ -1057,6 +1086,7 @@ bool parseMarkers (const std::uint8_t* data, std::size_t size, Document& out, st
         m.start = std::min<std::int64_t> (c.position, (std::int64_t) frames);
         m.end = std::min<std::int64_t> (m.start + c.length, (std::int64_t) frames);
         m.name = c.name;
+        m.keyNum = c.key;
         out.markers.push_back (std::move (m));
         gotAny = true;
     }
@@ -1064,6 +1094,30 @@ bool parseMarkers (const std::uint8_t* data, std::size_t size, Document& out, st
     return gotAny;
 }
 } // namespace
+
+void assignTriggerNotes (Document& doc, NoteLayout layout)
+{
+    const auto count = (int) doc.markers.size();
+    auto key = count - 0x41 < 1 ? 60 : std::max (0, 60 - ((count - 54) / 12) * 12); // (FL's start, 0x62b0b0)
+    if (layout == NoteLayout::none)
+        key = -1;
+    else if (layout == NoteLayout::c5)
+        key = 60;
+    // black keys of an octave (C = bit 0): C#, D#, F#, G#, A#
+    auto black = [] (int k) { return ((0x54a >> (k % 12)) & 1) != 0; };
+    for (auto& m : doc.markers)
+    {
+        if (layout == NoteLayout::whiteNotes)
+            while (black (key))
+                ++key;
+        if (layout == NoteLayout::blackNotes)
+            while (! black (key))
+                ++key;
+        m.keyNum = std::min (key, 124);
+        if (layout == NoteLayout::wholeKeyboard || layout == NoteLayout::whiteNotes || layout == NoteLayout::blackNotes)
+            ++key;
+    }
+}
 
 std::vector<std::uint8_t> encodeWav (const Document& doc, WavFormat format)
 {
@@ -1111,24 +1165,45 @@ std::vector<std::uint8_t> encodeWav (const Document& doc, WavFormat format)
         }
     endChunk (o, at);
 
-    if (doc.hasLoop())
+    // round gaps190kf: the sample properties' smpl / inst / acid as FL Edison's writer (0x613e00) makes them; written only
+    // when the properties say something (a file without them is the same as before)
+    const auto& props = doc.props;
+    if (doc.hasLoop() || props.hasPitchInfo())
     {
+        const auto pitch = smplPitchOf (props.middleNote, props.fineTune);
         at = beginChunk (o, "smpl");
         put32 (o, 0);                                                       // manufacturer
         put32 (o, 0);                                                       // product
         put32 (o, rate > 0 ? (std::uint32_t) (1000000000.0 / rate) : 0);   // sample period (ns)
-        put32 (o, 60);                                                      // unity note
-        put32 (o, 0);                                                       // pitch fraction
+        put32 (o, (std::uint32_t) pitch.unityNote);                         // unity note
+        put32 (o, pitch.fraction);                                          // pitch fraction
         put32 (o, 0);                                                       // SMPTE format
         put32 (o, 0);                                                       // SMPTE offset
-        put32 (o, 1);                                                       // loops
+        put32 (o, doc.hasLoop() ? 1 : 0);                                   // loops
         put32 (o, 0);                                                       // sampler data
-        put32 (o, 0);                                                       // loop id
-        put32 (o, 0);                                                       // forward
-        put32 (o, (std::uint32_t) doc.loopStart);
-        put32 (o, (std::uint32_t) (doc.loopEnd - 1));                       // inclusive
-        put32 (o, 0);                                                       // fraction
-        put32 (o, 0);                                                       // play count (infinite)
+        if (doc.hasLoop())
+        {
+            put32 (o, 0);                                                   // loop id
+            put32 (o, 0);                                                   // forward
+            put32 (o, (std::uint32_t) doc.loopStart);
+            put32 (o, (std::uint32_t) (doc.loopEnd - 1));                   // inclusive
+            put32 (o, 0);                                                   // fraction
+            put32 (o, 0);                                                   // play count (infinite)
+        }
+        endChunk (o, at);
+    }
+    if (props.hasPitchInfo())
+    {
+        const auto inst = instOf (props);
+        at = beginChunk (o, "inst");
+        o.insert (o.end(), inst.begin(), inst.end());
+        endChunk (o, at);
+    }
+    if (props.hasTempoInfo())
+    {
+        const auto acid = acidOf (props, (std::int64_t) frames, doc.audio.sampleRate);
+        at = beginChunk (o, "acid");
+        o.insert (o.end(), acid.begin(), acid.end());
         endChunk (o, at);
     }
 
@@ -1173,6 +1248,45 @@ std::vector<std::uint8_t> encodeWav (const Document& doc, WavFormat format)
                 endChunk (o, sub);
             }
         }
+        endChunk (o, at);
+
+        // the regions' trigger notes (Edison's Region › Trigger note) in FL Edison's own "tlst" chunk (round 190ez,
+        // layout from a WAV FL wrote: live FL check 190ew EDI-2), written only when a region has one, so files without
+        // them stay as they were. LYNX 0.1.27 wrote them in a chunk of its own ("lxkn"), still read above.
+        if (std::any_of (doc.markers.begin(), doc.markers.end(), [] (const Marker& m) { return m.keyNum >= 0; }))
+        {
+            at = beginChunk (o, "tlst");
+            put32 (o, (std::uint32_t) std::count_if (doc.markers.begin(), doc.markers.end(), [] (const Marker& m) { return m.keyNum >= 0; }));
+            for (std::size_t i = 0; i < doc.markers.size(); ++i)
+                if (doc.markers[i].keyNum >= 0)
+                {
+                    putTag (o, "cue ");
+                    put32 (o, (std::uint32_t) i); // the cue id (i + 1) minus one, as FL writes it (round 190gk)
+                    put32 (o, 1);
+                    o.push_back (0xff);
+                    o.push_back ((std::uint8_t) std::min (doc.markers[i].keyNum, 127));
+                    o.push_back (0x90);
+                    o.push_back (0);
+                    put32 (o, 0);
+                    put32 (o, 0);
+                }
+            endChunk (o, at);
+        }
+    }
+
+    // round gaps190kf: FL's LIST INFO (INAM, then ICMT; UTF-8 with its terminating zero, as FL's 0x617db0 writes them)
+    if (! props.name.empty() || ! props.comments.empty())
+    {
+        at = beginChunk (o, "LIST");
+        putTag (o, "INFO");
+        for (const auto& [tag, text] : { std::pair<const char*, const std::string*> { "INAM", &props.name }, { "ICMT", &props.comments } })
+            if (! text->empty())
+            {
+                const auto sub = beginChunk (o, tag);
+                o.insert (o.end(), text->begin(), text->end());
+                o.push_back (0);
+                endChunk (o, sub);
+            }
         endChunk (o, at);
     }
 
@@ -1248,7 +1362,312 @@ bool decodeWav (const std::uint8_t* data, std::size_t size, Document& out)
 
     bool any = false;
     parseMarkers (data, size, out, frames, any);
+    decodeWavProps (data, size, out); // (round gaps190kf)
+    // FL's Format › Precision shows a PCM file of 16 bits or fewer as "16Bit int" [FL 2026: sine440.wav, 16-bit, opens
+    // as 16Bit int — natives/ev/fl-sample-properties.png]; only the menu and the form read it (the samples are not touched)
+    out.props.int16 = format == 1 && bits <= 16;
     return true;
+}
+
+// --- click-free (smooth) editing (round gaps190kf) ---------------------------------------------------------------------
+namespace clickfree
+{
+void raisedCosineFade (std::vector<std::vector<float>>& channels, std::int64_t first, std::int64_t last, float from, float to)
+{
+    if (channels.empty())
+        return;
+    const auto frames = (std::int64_t) channels[0].size();
+    const auto step = 1.0 / (double) ((last - first) + 2);
+    for (auto i = std::max<std::int64_t> (first, 0); i <= std::min (last, frames - 1); ++i)
+    {
+        const auto x = (double) ((i - first) + 1) * step;
+        const auto g = (std::cos ((1.0 - x) * 3.141592653589793) + 1.0) * 0.5;
+        const auto gain = g * (double) (to - from) + (double) from;
+        for (auto& c : channels)
+            c[(std::size_t) i] = (float) ((double) c[(std::size_t) i] * gain);
+    }
+}
+
+namespace
+{
+unsigned checkedFlags (const Document& doc, std::int64_t first, std::int64_t last, unsigned flags)
+{
+    if ((flags & checkEnds) != 0)
+    {
+        if (first < 1)
+            flags &= ~left;
+        if (last >= doc.audio.frames() - 1)
+            flags &= ~right;
+    }
+    return flags;
+}
+// frames [from, from + n) of `src` (zeros outside it) into dst at `at`
+void copyFrames (const std::vector<std::vector<float>>& src, std::int64_t from, std::vector<std::vector<float>>& dst, std::int64_t at, std::int64_t n)
+{
+    for (std::size_t c = 0; c < dst.size(); ++c)
+    {
+        const auto& s = src[std::min (c, src.size() - 1)];
+        for (std::int64_t k = 0; k < n; ++k)
+        {
+            const auto i = from + k;
+            dst[c][(std::size_t) (at + k)] = i >= 0 && i < (std::int64_t) s.size() ? s[(std::size_t) i] : 0.0f;
+        }
+    }
+}
+} // namespace
+
+Take capture (Document& doc, std::int64_t first, std::int64_t last, unsigned flags)
+{
+    Take t;
+    auto& a = doc.audio;
+    if (a.empty())
+        return t;
+    flags = checkedFlags (doc, first, last, flags);
+    auto n = (std::int64_t) std::nearbyint (milliseconds * a.sampleRate * 0.001);
+    if ((flags & withinRange) != 0)
+        n = std::max<std::int64_t> (1, std::min (n, (last - first) + 1));
+    t.audio.assign ((std::size_t) a.numChannels(), std::vector<float> ((std::size_t) (2 * n), 0.0f));
+    copyFrames (a.channels, first, t.audio, 0, n);
+    copyFrames (a.channels, (last - n) + 1, t.audio, n, n);
+    if ((flags & fadeOwn) != 0)
+    {
+        if ((flags & left) != 0)
+            raisedCosineFade (a.channels, first, std::min ((first + n) - 1, last), 0.0f, 1.0f);
+        if ((flags & right) != 0)
+            raisedCosineFade (a.channels, std::max ((last - n) + 1, first), last, 1.0f, 0.0f);
+    }
+    return t;
+}
+
+void blend (Document& doc, const Take& take, std::int64_t first, std::int64_t last, unsigned flags)
+{
+    auto& a = doc.audio;
+    const auto half = take.half();
+    if (a.empty() || half <= 0)
+        return;
+    flags = checkedFlags (doc, first, last, flags);
+    const auto frames = a.frames();
+    auto temp = take.audio;
+    const auto mixIn = [&] (std::int64_t from, std::int64_t at, std::int64_t n) {
+        for (std::size_t c = 0; c < a.channels.size(); ++c)
+        {
+            const auto& s = temp[std::min (c, temp.size() - 1)];
+            for (std::int64_t k = 0; k < n; ++k)
+                if (at + k >= 0 && at + k < frames)
+                    a.channels[c][(std::size_t) (at + k)] += s[(std::size_t) (from + k)];
+        }
+    };
+    if (const auto n = std::min (half, frames - first); n > 0)
+    {
+        if ((flags & left) != 0)
+        {
+            raisedCosineFade (temp, 0, n - 1, 1.0f, 0.0f);
+            if ((flags & fadeOwn) != 0)
+                raisedCosineFade (a.channels, first, (first + n) - 1, 0.0f, 1.0f);
+            mixIn (0, first, n);
+        }
+        else if (first < 1 && (flags & fadeFileEnds) != 0)
+            raisedCosineFade (a.channels, first, (first + n) - 1, 0.0f, 1.0f);
+    }
+    if (const auto n = std::min (half, last + 1); n > 0)
+    {
+        const auto from = (last - n) + 1;
+        if ((flags & right) != 0)
+        {
+            raisedCosineFade (temp, 2 * half - n, 2 * half - 1, 0.0f, 1.0f);
+            if ((flags & fadeOwn) != 0)
+                raisedCosineFade (a.channels, from, last, 1.0f, 0.0f);
+            mixIn (2 * half - n, from, n);
+        }
+        else if (last >= frames - 1 && (flags & fadeFileEnds) != 0)
+            raisedCosineFade (a.channels, from, last, 1.0f, 0.0f);
+    }
+}
+
+// (FL 0x8702c0: Delete / Cut take 0xF41 around the range and blend 0x3C0 at the seam; Clear and Paste replace take 0xE41
+// and blend 0x640 over the range; Paste insert and Insert silence take 0x641 at the insertion point and blend 0x640 over
+// what was inserted; Trim takes 0xE41 and fades the kept part's ends, 0x6C0)
+void eraseClickFree (Document& doc, Range r)
+{
+    r = clamp (doc, r);
+    if (r.empty())
+        return;
+    const auto take = capture (doc, r.start, r.end - 1, 0xF41);
+    erase (doc, r);
+    blend (doc, take, r.start, r.start - 1, 0x3C0);
+}
+
+void clearClickFree (Document& doc, Range r)
+{
+    r = clamp (doc, r);
+    if (r.empty())
+        return;
+    const auto take = capture (doc, r.start, r.end - 1, 0xE41);
+    clear (doc, r);
+    blend (doc, take, r.start, r.end - 1, 0x640);
+}
+
+void insertClickFree (Document& doc, std::int64_t at, const Audio& clip)
+{
+    const auto before = doc.audio.frames();
+    const auto take = capture (doc, at, at - 1, 0x641);
+    insert (doc, at, clip);
+    const auto added = doc.audio.frames() - before;
+    if (before > 0 && added > 0)
+        blend (doc, take, at, at + added - 1, 0x640);
+}
+
+void pasteReplaceClickFree (Document& doc, Range r, const Audio& clip)
+{
+    r = clamp (doc, r);
+    if (r.empty() || doc.audio.empty())
+    {
+        pasteReplace (doc, r, clip);
+        return;
+    }
+    const auto before = doc.audio.frames();
+    const auto take = capture (doc, r.start, r.end - 1, 0xE41);
+    pasteReplace (doc, r, clip);
+    const auto length = r.length() + (doc.audio.frames() - before);
+    if (length > 0)
+        blend (doc, take, r.start, r.start + length - 1, 0x640);
+}
+
+void insertSilenceClickFree (Document& doc, std::int64_t at, std::int64_t frames)
+{
+    const auto take = capture (doc, at, at - 1, 0x641);
+    insertSilence (doc, at, frames);
+    if (frames > 0)
+        blend (doc, take, at, at + frames - 1, 0x640);
+}
+
+void trimClickFree (Document& doc, Range r)
+{
+    r = clamp (doc, r);
+    if (r.empty())
+        return;
+    const auto take = capture (doc, r.start, r.end - 1, 0xE41);
+    trim (doc, r);
+    blend (doc, take, 0, doc.audio.frames() - 1, 0x6C0);
+}
+} // namespace clickfree
+
+// --- sample properties (round gaps190kf) ------------------------------------------------------------------------------
+namespace
+{
+// FL's Round (banker's, cvtsd2si) and Trunc
+std::int64_t flRound (double v) noexcept { return (std::int64_t) std::nearbyint (v); }
+std::int64_t flTrunc (double v) noexcept { return (std::int64_t) v; }
+} // namespace
+
+SmplPitch smplPitchOf (int middleNote, double fineTune) noexcept
+{
+    SmplPitch p;
+    const auto semis = flTrunc (fineTune / 100.0 + 12000.0) - 12000; // (FL: Trunc (fine / 100 + 12000) − 12000)
+    p.unityNote = (int) std::clamp<std::int64_t> ((std::int64_t) middleNote - semis, 0, 127);
+    p.fraction = (std::uint32_t) flRound ((fineTune - (double) (semis * 100)) * 42949672.96);
+    return p;
+}
+
+std::array<std::uint8_t, 7> instOf (const SampleProps& props) noexcept
+{
+    const auto semis = flRound (props.fineTune / 100.0 + 12000.0) - 12000;
+    const auto fine = std::clamp<std::int64_t> (flRound (props.fineTune - (double) (semis * 100)), -50, 50);
+    return { (std::uint8_t) std::clamp<std::int64_t> ((std::int64_t) props.middleNote - semis, 0, 127), (std::uint8_t) (std::int8_t) fine, 0,
+             (std::uint8_t) props.lowNote, (std::uint8_t) props.highNote, (std::uint8_t) props.lowVelocity, (std::uint8_t) props.highVelocity };
+}
+
+std::array<std::uint8_t, 24> acidOf (const SampleProps& props, std::int64_t frames, double sampleRate) noexcept
+{
+    const auto noTempo = props.tempo == 0.0;
+    const auto tempo = props.tempo <= 0.0 ? 120.0 : props.tempo;
+    const auto beatsPerFrame = tempo / (std::max (1.0, sampleRate) * 60.0);
+    const auto beats = flRound ((double) frames * beatsPerFrame);
+    const auto back = flRound ((double) beats / beatsPerFrame);
+    std::uint32_t flags = std::llabs (back - frames) < 3 ? 0u : (noTempo ? 0u : 4u);
+    if (! props.tempoSync)
+        flags |= 1u; // one-shot
+    const auto bpm = noTempo ? 0.0f : (float) props.tempo;
+    std::uint32_t bpmBits;
+    std::memcpy (&bpmBits, &bpm, 4);
+    std::array<std::uint8_t, 24> a {};
+    const auto at32 = [&a] (int i, std::uint32_t v) {
+        for (int k = 0; k < 4; ++k)
+            a[(std::size_t) (i + k)] = (std::uint8_t) (v >> (8 * k));
+    };
+    at32 (0, flags);
+    at32 (4, 0x80003c);                      // root note 60, then 0x80
+    at32 (8, 0);                             // (a float FL leaves 0)
+    at32 (12, (std::uint32_t) beats);
+    at32 (16, 4u | (4u << 16));              // meter denominator 4, numerator 4
+    at32 (20, bpmBits);
+    return a;
+}
+
+bool decodeWavProps (const std::uint8_t* data, std::size_t size, Document& out)
+{
+    if (data == nullptr || size < 12 || std::memcmp (data, "RIFF", 4) != 0 || std::memcmp (data + 8, "WAVE", 4) != 0)
+        return false;
+    auto& p = out.props;
+    bool any = false;
+    const auto text = [] (const std::uint8_t* s, std::size_t n) { return std::string (reinterpret_cast<const char*> (s), strnlen (reinterpret_cast<const char*> (s), n)); };
+    for (std::size_t q = 12; q + 8 <= size;)
+    {
+        const auto* tag = data + q;
+        const auto len = (std::size_t) get32 (data + q + 4);
+        const auto body = q + 8;
+        if (body + len > size)
+            break;
+        if (std::memcmp (tag, "smpl", 4) == 0 && len >= 20) // (FL 0x6191d0 → 0x619180)
+        {
+            const auto unity = (int) get32 (data + body + 12);
+            p.middleNote = unity >= 0 && unity <= 127 ? unity : 60;
+            p.fineTune = (double) get32 (data + body + 16) / 4294967296.0 * 100.0;
+            any = true;
+        }
+        else if (std::memcmp (tag, "inst", 4) == 0 && len >= 7) // (FL 0x619290: its note only when smpl gave no fine tune)
+        {
+            const auto* b = data + body;
+            if (p.fineTune == 0.0)
+            {
+                p.middleNote = b[0] <= 127 ? (int) b[0] : 60;
+                p.fineTune = (double) (std::int8_t) b[1];
+            }
+            p.lowNote = b[3];
+            p.highNote = b[4];
+            p.lowVelocity = b[5];
+            p.highVelocity = b[6];
+            any = true;
+        }
+        else if (std::memcmp (tag, "acid", 4) == 0 && len >= 24) // (FL 0x619320)
+        {
+            const auto flags = get32 (data + body);
+            float bpm;
+            std::memcpy (&bpm, data + body + 20, 4);
+            if ((flags & 4) != 0 || (flags & 0x11) != 0)
+                p.tempo = (double) bpm;
+            else if (const auto frames = out.audio.frames(); frames > 0)
+                p.tempo = (double) get32 (data + body + 12) * out.audio.sampleRate * 60.0 / (double) frames; // (FL 0x62c560: the tempo from the beats)
+            p.tempoSync = (flags & 1) == 0;
+            any = true;
+        }
+        else if (std::memcmp (tag, "LIST", 4) == 0 && len >= 4 && std::memcmp (data + body, "INFO", 4) == 0) // (FL 0x619d30)
+        {
+            for (auto r = body + 4; r + 8 <= body + len;)
+            {
+                const auto subLen = (std::size_t) get32 (data + r + 4);
+                if (r + 8 + subLen > body + len)
+                    break;
+                if (std::memcmp (data + r, "INAM", 4) == 0)
+                    p.name = text (data + r + 8, subLen), any = true;
+                else if (std::memcmp (data + r, "ICMT", 4) == 0)
+                    p.comments = text (data + r + 8, subLen), any = true;
+                r += 8 + subLen + (subLen & 1);
+            }
+        }
+        q = body + len + (len & 1);
+    }
+    return any;
 }
 
 bool decodeWavMarkers (const std::uint8_t* data, std::size_t size, Document& out)
@@ -1283,6 +1702,13 @@ WavExtras decodeWavExtras (const std::uint8_t* data, std::size_t size, std::int6
         {
             const auto beats = get32 (data + body + 12);
             x.acidBeats = beats > 0 && beats < 65536 ? (float) beats : 0.0f;
+        }
+        // FL's slice list (round 190aj layout: u32, u32 count = regions + 1, 20 header bytes, 24-byte entries; the first
+        // entry is no slice): what FL's Sampler page calls the sample's slice markers (round 190ey, live check 190ew SMP-1)
+        if (std::memcmp (data + p, "strc", 4) == 0 && len >= 28)
+        {
+            const auto count = get32 (data + body + 4);
+            x.sliceMarkers = count > 1 && count < 65536 ? (int) count - 1 : 0;
         }
         p = body + len + (len & 1);
     }

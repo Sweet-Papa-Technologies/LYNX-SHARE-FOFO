@@ -1,3 +1,4 @@
+#include "core/EscClose.h"
 #include "ui/WindowOwner.h"
 #include "ui/PluginWindow.h"
 #include "ui/PluginPicker.h"
@@ -12,12 +13,15 @@
 #endif
 
 #include "core/CrashReport.h"
+#include "core/FlControlMenus.h"
+#include "core/MidiControls.h"
 #include "core/EditorLimit.h"
 #include "core/PinOnTop.h"
 #include "core/Preferences.h"
 #include "core/FlWrapper.h"
 #include "core/MixerOps.h"
 #include "core/LastTweaked.h"
+#include "core/LayoutStyle.h"
 #include "engine/PluginHost.h"
 #include "engine/PluginSandbox.h"
 #include "engine/Text.h"
@@ -27,7 +31,10 @@
 #include "ui/NativeChild.h"
 #include "ui/LiveRemoteUi.h"
 #include "ui/PluginHeader.h"
+#include "ui/RemoteControl.h"
 #include "ui/Workspace.h"
+#include "ui/WrapperMenu.h"
+#include "ui/ChannelSettings.h"
 #include "platform/Paths.h"
 #include "ui/Theme.h"
 
@@ -43,6 +50,49 @@ namespace lynx
 {
 namespace
 {
+// FL's "Spare state" of a hosted plugin [PluginMenu Sparestate1] (the wrapper ▸ menu and the preset menu, round
+// 190in): the kept state belongs to this plugin instance and is only flipped into the same plugin
+std::map<const void*, juce::String>& spareKeptFor()
+{
+    static std::map<const void*, juce::String> kept;
+    return kept;
+}
+
+bool hasSpareState (juce::AudioPluginInstance& plugin)
+{
+    const auto id = plugin.getPluginDescription().createIdentifierString();
+    auto& kept = spareKeptFor();
+    if (const auto it = kept.find (&plugin); it != kept.end() && it->second != id)
+    {
+        sparestate::shared().forget (&plugin);
+        kept.erase (it);
+    }
+    return sparestate::shared().has (&plugin);
+}
+
+// (round 190gg: under the crash guard, callPluginFromUi; a crash switches the plugin off)
+void storeSpareState (juce::AudioPluginInstance& plugin)
+{
+    juce::MemoryBlock state;
+    if (! callPluginFromUi (plugin, "storing its spare state", [&] { plugin.getStateInformation (state); }))
+        return;
+    sparestate::shared().store (&plugin, { (const std::uint8_t*) state.getData(), (const std::uint8_t*) state.getData() + state.getSize() });
+    spareKeptFor()[&plugin] = plugin.getPluginDescription().createIdentifierString();
+}
+
+void flipSpareState (AudioEngine& engine, juce::AudioPluginInstance& plugin)
+{
+    juce::MemoryBlock state;
+    if (! callPluginFromUi (plugin, "storing its spare state", [&] { plugin.getStateInformation (state); }))
+        return;
+    if (const auto load = sparestate::shared().flip (&plugin, { (const std::uint8_t*) state.getData(),
+                                                                (const std::uint8_t*) state.getData() + state.getSize() }))
+    {
+        callPluginFromUi (plugin, "loading its spare state", [&] { plugin.setStateInformation (load->data(), (int) load->size()); });
+        engine.markModified();
+    }
+}
+
 void toggleWrapperOption (AudioEngine& engine, const std::function<PluginRef* (Song&)>& find, juce::AudioPluginInstance* instance,
                           bool PluginRef::*option, bool recreates);
 
@@ -356,7 +406,7 @@ public:
         inPort.onChange = [this] { setPort (inPort.getSelectedId() - 2, false); };
         // FL's Output port: the notes the plugin sends out play the plugins on that input port (instruments in the
         // Channel rack that send MIDI)
-        outPort.setTooltip (tr ("MIDI output port number: the notes this plugin sends play the plugins whose input port it is"));
+        outPort.setTooltip (tr ("MIDI output port number: the notes this plugin sends play the plugins whose input port it is, and the MIDI output devices with this port (Settings › MIDI)"));
         outPort.onChange = [this] { setPort (outPort.getSelectedId() - 2, true); };
         outPort.setEnabled (channel && plugin.producesMidi());
         // FL's Info › Latency: what the plugin reports, or set by hand (menu: Reset, Set in ms / samples / beats)
@@ -481,7 +531,8 @@ public:
     ~WrapperSettingsPage() override { engine.removeChangeListener (this); }
 
     // (+ Options › Bit size where it applies; + the MIDI group's Velocity row for an instrument, round 190ao)
-    int preferredHeight() const { return (bridge32Supported() ? 474 : 410) + (instrumentChannel ? rowHeight : 0); }
+    // (round 190ks: + the MIDI group's "Record notes from the plugin window" row)
+    int preferredHeight() const { return (bridge32Supported() ? 474 : 410) + rowHeight + (instrumentChannel ? rowHeight : 0); }
     void selectTab (int t) { showTab (juce::jlimit (0, 2, t)); }
 
     void paint (juce::Graphics& g) override
@@ -951,6 +1002,21 @@ public:
                 onReload();
         };
         addAndMakeVisible (reload);
+        // round 190gg (B1): from now on in a process of its own (shown when that is still possible)
+        separate.onClick = [this] {
+            if (onSeparate)
+                onSeparate();
+        };
+        separate.setTooltip (PluginWindows::alwaysSeparateHint());
+        addChildComponent (separate);
+    }
+
+    void setSeparate (std::function<void()> run, const juce::String& pluginName)
+    {
+        onSeparate = std::move (run);
+        separate.setButtonText (tr ("Always run {0} in a separate process", { pluginName }));
+        separate.setVisible (onSeparate != nullptr);
+        resized();
     }
 
     void setPluginName (const juce::String& name)
@@ -974,13 +1040,25 @@ public:
                           juce::Justification::centredTop, 3);
     }
 
-    void resized() override { reload.setBounds (getLocalBounds().reduced (16, 12).removeFromBottom (28).withSizeKeepingCentre (140, 28)); }
+    void resized() override
+    {
+        auto row = getLocalBounds().reduced (16, 12).removeFromBottom (28);
+        if (! separate.isVisible())
+        {
+            reload.setBounds (row.withSizeKeepingCentre (140, 28));
+            return;
+        }
+        const auto wide = juce::jmin (row.getWidth() - 148, separate.getBestWidthForHeight (28) + 24);
+        row = row.withSizeKeepingCentre (140 + 8 + wide, 28);
+        reload.setBounds (row.removeFromLeft (140));
+        separate.setBounds (row.removeFromRight (wide));
+    }
 
-    std::function<void()> onReload;
+    std::function<void()> onReload, onSeparate;
 
 private:
     juce::String title;
-    juce::TextButton reload;
+    juce::TextButton reload, separate;
 };
 
 // The window's content with FL's wrapper header: the plugin's editor, or the wrapper settings page (gear).
@@ -989,7 +1067,7 @@ class WrappedEditor final : public juce::Component
 public:
     WrappedEditor (juce::AudioProcessorEditor* e, AudioEngine& engine, std::function<PluginRef* (Song&)> find, juce::AudioPluginInstance& plugin,
                    bool channel, int scTrack = -1, int scSlot = -1)
-        : engineRef (engine), sideTrack (scTrack), sideSlot (scSlot),
+        : engineRef (engine), hosted (plugin), sideTrack (scTrack), sideSlot (scSlot),
           editor (e), page (engine, std::move (find), plugin, channel, scTrack, scSlot), presets (plugin, [&engine] { engine.markModified(); })
     {
         // round 177b: a plugin with a sidechain input gets the picker in its header (the input is fed from the slot's
@@ -1027,11 +1105,30 @@ public:
         };
         for (auto* b : { &pluginTab, &settingsTab })
         {
-            b->setClickingTogglesState (false); // LYNX's tab look (as the channel window's): the shown one filled
+            // round 190in (design190ia FW-7): FL's 44 px icon tabs (the plug, the wrench), as the channel window's
+            b->setClickingTogglesState (false);
+            b->setFlat (true);
+            b->setCorners (false, false);
+            b->setOnColour (theme::colour::bg5);
+            b->setIconColourWhenOn (theme::colour::ledOn);
+            b->setIconColour (theme::colour::textSecondary);
+            b->setIconSizing (0.5f, 22.0f);
+            b->setWantsKeyboardFocus (false);
             addAndMakeVisible (b);
         }
-        pluginTab.setTooltip (tr ("The plugin's own editor"));
-        settingsTab.setTooltip (tr ("Plugin wrapper settings: processing, bridging and MIDI options"));
+        pluginTab.setTooltip (tr ("Plugin") + ": " + tr ("The plugin's own editor"));
+        settingsTab.setTooltip (tr ("Wrapper settings") + ": " + tr ("Plugin wrapper settings: processing, bridging and MIDI options"));
+        // FL's ▸ wrapper menu (round 190in, R8): in the strip until a docked frame takes it into its title strip
+        addAndMakeVisible (menuArrow);
+        menuArrow.onClick = [this] {
+            if (onWrapperMenu)
+                onWrapperMenu (menuArrow);
+        };
+        // FW-7: a channel's plugin shows FL's ON / PAN / VOL / PITCH / RANGE / TRACK at the right, as FL's wrapper does
+        if (channel)
+            if (const auto index = page.channelIndex(); index >= 0)
+                if ((channelControls = makeChannelHeaderControls (engine, index)) != nullptr)
+                    addAndMakeVisible (*channelControls);
         pluginTab.onClick = [this] { show (false); };
         settingsTab.onClick = [this] { show (true); };
         addAndMakeVisible (editor.get());
@@ -1066,16 +1163,32 @@ public:
     void showPinned (bool on) { pin.setToggleState (on, juce::dontSendNotification); }
 
     // round 190ao: the plugin went down (the window's timer): the notice with "Reload" takes the editor's place
-    void setDown (bool isDown, std::function<void()> reload)
+    void setDown (bool isDown, std::function<void()> reload, std::function<void()> separate = {}, const juce::String& pluginName = {})
     {
         if (isDown == down)
             return;
         down = isDown;
         notice.onReload = std::move (reload);
+        notice.setSeparate (std::move (separate), pluginName); // (round 190gg, B1)
         show (settings);
     }
     bool isDown() const noexcept { return down; }
-    void setMenuExtension (std::function<void (juce::PopupMenu&)> extend) { presets.extendMenu = std::move (extend); }
+    // the host's items (Detached, Pin on top) come last, after FL's spare state and parameter items (round 190df)
+    void setMenuExtension (std::function<void (juce::PopupMenu&)> extend)
+    {
+        presets.extendMenu = [this, extend = std::move (extend)] (juce::PopupMenu& menu) {
+            const auto channel = page.channelIndex();
+            const auto base = channel >= 0 ? AutomationTarget { AutomationTargetKind::channelParam, channel, 0, 0 }
+                              : sideTrack >= 0 && sideSlot >= 0 ? AutomationTarget { AutomationTargetKind::effectParam, sideTrack, sideSlot, 0 }
+                                                                : AutomationTarget {};
+            addPluginWrapperItems (menu, engineRef, hosted, base);
+            if (extend)
+            {
+                menu.addSeparator();
+                extend (menu);
+            }
+        };
+    }
 
     void refreshKeyboardPriority()
     {
@@ -1111,18 +1224,45 @@ public:
 
     void paint (juce::Graphics& g) override
     {
-        g.setColour (theme::colour::bg0);
+        // round 190in (FW-7): FL's 46 px strip, as the channel window's (bg3, a line under it, a line after each tab)
+        g.setColour (theme::colour::bg3);
         g.fillRect (getLocalBounds().removeFromTop (headerHeight));
+        g.setColour (theme::colour::border);
+        g.fillRect (0, headerHeight - 1, getWidth(), 1);
+        for (auto* t : { &pluginTab, &settingsTab })
+            g.fillRect (t->getRight(), 0, 1, headerHeight - 1);
     }
+
+    // round 190in (FW-5 / R8): a docked frame shows the presets and the ▸ menu in its title strip
+    void movePresetsTo (juce::Component& titleOwner)
+    {
+        presetsInTitle = true;
+        menuArrow.setVisible (false);
+        presets.setTitleLook (true);
+        titleOwner.addAndMakeVisible (presets);
+        resized();
+    }
+    juce::Component& presetComponent() noexcept { return presets; }
+    pluginpresetui::PresetBar& presetBar() noexcept { return presets; }
+    std::function<void (juce::Component&)> onWrapperMenu;
+    int channelIndex() const { return page.channelIndex(); }
 
     void resized() override
     {
         auto area = getLocalBounds();
-        auto header = area.removeFromTop (headerHeight).reduced (4, 3);
-        pluginTab.setBounds (header.removeFromLeft (80));
-        header.removeFromLeft (4);
-        settingsTab.setBounds (header.removeFromLeft (130));
-        header.removeFromLeft (8);
+        auto header = area.removeFromTop (headerHeight - 1);
+        if (menuArrow.isVisible())
+            menuArrow.setBounds (header.removeFromLeft (20).withSizeKeepingCentre (20, 24));
+        pluginTab.setBounds (header.removeFromLeft (44));
+        header.removeFromLeft (1);
+        settingsTab.setBounds (header.removeFromLeft (44));
+        header.removeFromLeft (9);
+        if (channelControls != nullptr)
+        {
+            channelControls->setBounds (header.removeFromRight (channelHeaderControlsWidth()));
+            header.removeFromRight (4);
+        }
+        header = header.withSizeKeepingCentre (header.getWidth(), 26);
         if (pin.isVisible())
         {
             pin.setBounds (header.removeFromRight (26));
@@ -1135,7 +1275,8 @@ public:
         }
         keyboardPriority.setBounds (header.removeFromLeft (26));
         header.removeFromLeft (4);
-        presets.setBounds (header.removeFromLeft (juce::jmin (presets.preferredWidth(), header.getWidth())));
+        if (! presetsInTitle)
+            presets.setBounds (header.removeFromLeft (juce::jmin (presets.preferredWidth(), header.getWidth())));
         page.setBounds (area);
         notice.setBounds (area);
         if (editor != nullptr && ! settings && ! down)
@@ -1155,8 +1296,11 @@ public:
     }
 
 private:
-    static constexpr int headerHeight = 30, minWidth = 4 + 80 + 4 + 130 + 8 + 30 + 250 + 4;
+    // round 190in (FW-5 / FW-7): FL's 46 px strip; ▸, two 44 px tabs, the keyboard button, the presets
+    static constexpr int headerHeight = 46, minWidth = 20 + 44 + 1 + 44 + 9 + 30 + 250 + 4;
+    int minimumWidth() const { return minWidth + (channelControls != nullptr ? channelHeaderControlsWidth() + 4 : 0); }
     AudioEngine& engineRef;
+    juce::AudioPluginInstance& hosted; // (round 190df: the plugin menu's spare state and parameter items)
     int sideTrack = -1, sideSlot = -1;
     juce::TextButton sidechain;
     KeyboardPriorityButton keyboardPriority;
@@ -1166,9 +1310,9 @@ private:
     void fitEditor()
     {
         if (down) // (the notice: at least a readable size, the editor's when that is larger)
-            setSize (juce::jmax (minWidth, getWidth()), juce::jmax (150 + headerHeight, getHeight()));
+            setSize (juce::jmax (minimumWidth(), getWidth()), juce::jmax (150 + headerHeight, getHeight()));
         else if (editor != nullptr)
-            setSize (juce::jmax (minWidth, editor->getWidth()), editor->getHeight() + headerHeight);
+            setSize (juce::jmax (minimumWidth(), editor->getWidth()), editor->getHeight() + headerHeight);
     }
 
     void show (bool showSettings)
@@ -1213,8 +1357,10 @@ private:
     WrapperSettingsPage page;
     CrashNotice notice;
     pluginpresetui::PresetBar presets;
-    juce::TextButton pluginTab { tr ("Plugin") }, settingsTab { juce::String::fromUTF8 ("\xe2\x9a\x99 ") + tr ("Wrapper settings") };
-    bool settings = false, laying = false, down = false;
+    IconButton pluginTab { tr ("Plugin"), Icon::pluginPicker }, settingsTab { tr ("Wrapper settings"), Icon::wrench };
+    wrappermenu::MenuArrow menuArrow;
+    std::unique_ptr<juce::Component> channelControls; // (a channel's plugin: FL's ON / PAN / VOL / PITCH / RANGE / TRACK)
+    bool settings = false, laying = false, down = false, presetsInTitle = false;
 };
 
 // Issue #116: FL's docked plugin windows (developer switch, ui/NativeChild.h). The desktop that hosts them, and whether
@@ -1279,6 +1425,7 @@ public:
                     addDetachedItem (menu);
                 addPinItem (menu);
             });
+            wrapped->onWrapperMenu = [this] (juce::Component& anchor) { showWrapperMenu (anchor); }; // (round 190in, R8)
             content.reset (wrapped);
         }
         else
@@ -1327,16 +1474,122 @@ public:
         });
     }
 
+    // FL's wrapper ▸ menu of a hosted plugin (round 190in, details190if R8: DF-120; FL manual Plugin wrapper › Plugin
+    // Menu): FL's items in FL's order (ui/WrapperMenu.h), the Channel column for a channel's plugin
+    void showWrapperMenu (juce::Component& anchor)
+    {
+        buildWrapperMenu().showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&anchor));
+    }
+
+    juce::PopupMenu buildWrapperMenu()
+    {
+        wrappermenu::Spec spec;
+        auto* wrapped = dynamic_cast<WrappedEditor*> (shownContent);
+        auto* engine = context.engine;
+        const auto channelIndex = wrapped != nullptr && context.channel ? wrapped->channelIndex() : -1;
+        if (engine != nullptr && channelIndex >= 0)
+        {
+            spec.channel = true;
+            if (channelWrapperItemsHandler())
+                channelWrapperItemsHandler() (channelIndex, spec);
+            spec.routeToFreeMixerTrack = [engine, channelIndex] {
+                engine->editSong ([channelIndex] (Song& s) {
+                    if (channelIndex < (int) s.channels.size())
+                        s.channels[(std::size_t) channelIndex].mixerTrack = s.claimFreeInsert();
+                });
+            };
+        }
+        if (wrapped != nullptr)
+        {
+            const juce::Component::SafePointer<WrappedEditor> safe (wrapped);
+            spec.presets = [safe] (juce::PopupMenu& m) {
+                if (safe != nullptr)
+                    m = safe->presetBar().presetsMenu();
+            };
+            spec.savePresetAs = [safe] {
+                if (safe != nullptr)
+                    safe->presetBar().saveAs();
+            };
+            if (locateInBrowserHandler())
+                spec.browsePresets = [folder = wrapped->presetBar().presetFolder()] {
+                    folder.createDirectory();
+                    if (locateInBrowserHandler())
+                        locateInBrowserHandler() (folder);
+                };
+        }
+        auto* p = &plugin;
+        if (engine != nullptr)
+        {
+            // FL's "Add to plugin database (flag as favorite)": LYNX's favourites (the picker's stars)
+            const auto id = plugin.getPluginDescription().createIdentifierString().toStdString();
+            spec.addToDatabase = [engine, id] {
+                auto& host = engine->getPluginHost();
+                host.setFavourite (id, host.favourites().count (id) == 0);
+            };
+            spec.storeSpare = [p] { storeSpareState (*p); };
+            if (hasSpareState (plugin))
+                spec.flipSpare = [engine, p] { flipSpareState (*engine, *p); };
+            const auto base = channelIndex >= 0 ? AutomationTarget { AutomationTargetKind::channelParam, channelIndex, 0, 0 }
+                              : context.track >= 0 && context.slot >= 0 ? AutomationTarget { AutomationTargetKind::effectParam, context.track, context.slot, 0 }
+                                                                        : AutomationTarget {};
+            if (const auto targets = allPluginParameterTargets (plugin, base); ! targets.empty())
+                spec.linkAll = [engine, targets] { openRemoteControlSettings (*engine, targets, false); };
+            if (context.find)
+                if (const auto* ref = context.find (const_cast<Song&> (engine->getSong())))
+                {
+                    spec.threaded = ref->threaded;
+                    spec.toggleThreaded = [engine, find = context.find] {
+                        engine->editSong ([find] (Song& song) {
+                            if (auto* r = find (song))
+                                r->threaded = ! r->threaded;
+                        });
+                    };
+                }
+            if (const auto& song = engine->getSong(); context.track >= 0 && context.track < (int) song.mixer.size() && context.slot >= 0
+                                                      && context.slot < (int) song.mixer[(std::size_t) context.track].effects.size())
+            {
+                spec.smartDisable = song.mixer[(std::size_t) context.track].effects[(std::size_t) context.slot].smartDisable;
+                spec.toggleSmartDisable = [engine, t = context.track, sl = context.slot] {
+                    engine->editSong ([t, sl] (Song& song) {
+                        if (t < (int) song.mixer.size() && sl < (int) song.mixer[(std::size_t) t].effects.size())
+                            song.mixer[(std::size_t) t].effects[(std::size_t) sl].smartDisable = ! song.mixer[(std::size_t) t].effects[(std::size_t) sl].smartDisable;
+                    });
+                };
+            }
+        }
+        // FL's "Make editor thumbnail": the Plugin picker's picture of this plugin, from its editor now
+        spec.thumbnail = [editor = shownEditor, key = thumbKey] {
+            if (editor != nullptr)
+                pluginthumbs::captureEditor (key, *editor);
+        };
+        if (canDock (plugin))
+        {
+            const auto detached = opensDetached (plugin, context);
+            spec.detached = detached;
+            spec.toggleDetached = [p, detached] { juce::MessageManager::callAsync ([p, detached] { setDetachedAndReopen (*p, ! detached); }); };
+        }
+        else
+            spec.detached = true;
+        spec.extra = [this] (juce::PopupMenu& m) { addPinItem (m); };
+        return wrappermenu::build (spec);
+    }
+
 protected:
     void startHost()
     {
         crashguard::note (("editor shown: " + plugin.getName()).toStdString()); // (its OpenGL / GPU setup runs when shown)
         plugin.addListener (this); // the editor's gestures: Last tweaked, automation recording (REA round 143)
         startTimerHz (10);         // its moves without gestures (round 162d)
+        // round 190gq: while its editor is open, the plugin's channel / insert stays real-time (render-ahead): what the
+        // editor shows and what a tweak does are heard at once
+        if (context.engine != nullptr)
+            context.engine->setEditorOpen (this, context.find, context.channel ? -1 : context.track, true);
     }
 
     void stopHost()
     {
+        if (context.engine != nullptr)
+            context.engine->setEditorOpen (this, {}, -1, false);
         editorlimit::forget (&plugin);
         crashguard::note (("closing the editor of " + plugin.getName()).toStdString());
         stopTimer();
@@ -1384,7 +1637,18 @@ private:
             wrapped->refreshKeyboardPriority(); // (undo, a project loaded)
             // round 190ao: the plugin went down while its window is open: the notice with "Reload" (only on request)
             if (context.reload && ! wrapped->isDown() && (isSandboxedPluginDead (plugin) || (context.down && context.down())))
-                wrapped->setDown (true, [reload = context.reload] { juce::MessageManager::callAsync (reload); });
+            {
+                // round 190gg (B1): a plugin that crashed inside LYNX may run in a process of its own from now on
+                std::function<void()> separate;
+                juce::String name;
+                if (const auto* ref = context.engine != nullptr && context.find ? context.find (const_cast<Song&> (context.engine->getSong())) : nullptr)
+                    name = juce::String::fromUTF8 (ref->name.c_str());
+                if (! isSandboxedPlugin (plugin) && ! isBridged32 (plugin) && PluginWindows::canAlwaysRunSeparately (name))
+                    separate = [engine = context.engine, name] {
+                        juce::MessageManager::callAsync ([engine, name] { PluginWindows::alwaysRunSeparately (*engine, name); });
+                    };
+                wrapped->setDown (true, [reload = context.reload] { juce::MessageManager::callAsync (reload); }, std::move (separate), name);
+            }
         }
         if (const auto moved = changes.tick (active); moved >= 0 && PluginWindows::onGesture)
         {
@@ -1551,7 +1815,7 @@ public:
         setName (title);
         setOpaque (true);
         setWantsKeyboardFocus (true);
-        for (auto* b : { &menuButton, &minimiseButton, &closeButton })
+        for (auto* b : { &minimiseButton, &closeButton })
         {
             b->setFlat (true);
             b->setIconSizing (0.62f, 14.0f);
@@ -1559,8 +1823,9 @@ public:
             b->setMouseClickGrabsKeyboardFocus (false);
             addAndMakeVisible (b);
         }
-        menuButton.setTooltip (tr ("Plugin options"));
-        menuButton.onClick = [this] { showMenu(); };
+        // FL's ▸ wrapper menu at the title's left (round 190in, R8)
+        addAndMakeVisible (menuButton);
+        menuButton.onClick = [this] { showWrapperMenu (menuButton); };
         minimiseButton.setTooltip (tr ("Minimize"));
         minimiseButton.onClick = [this] { setMinimisedFrame (! minimised); };
         closeButton.setTooltip (tr ("Close"));
@@ -1569,6 +1834,12 @@ public:
         shownContent = content.get();
         addAndMakeVisible (*content);
         content->addMouseListener (this, true); // a click anywhere in it brings the frame in front
+        // round 190in (design190ia FW-5): FL's title strip holds the preset ◀ name ▶ (the strip under it gives them up)
+        if (auto* wrapped = dynamic_cast<WrappedEditor*> (content.get()))
+        {
+            wrapped->movePresetsTo (*this);
+            titlePresets = &wrapped->presetComponent();
+        }
         if (editorResizable)
         {
             corner = std::make_unique<juce::ResizableCornerComponent> (this, &limits);
@@ -1582,10 +1853,18 @@ public:
         if (! nativechild::attach (*this, workspace))
             workspace.addAndMakeVisible (*this); // (no native window: a plain child of the desktop)
         nativechild::forwardUnusedKeys (*this);
+        // round 190ev (issue #152): a click in the plugin's own view (its native window, which JUCE never hears of)
+        // brings the frame in front too, as a click on the frame does
+        nativechild::raiseOnAnyClick (*this, [this] {
+            lastUsed() = key();
+            editorlimit::touch (key());
+            focusLinked();
+        });
         getProperties().set ("lynxPluginWindow", true);
         useClassicRendering();
         setVisible (true);
         toFront (false);
+        noteEditorRaised (*this); // (issue #191: opened by a press in a panel, it stays in front of that panel)
         nativechild::raiseOverlays();
         startHost();
     }
@@ -1626,6 +1905,7 @@ public:
         if (minimised)
             setMinimisedFrame (false);
         toFront (true);
+        noteEditorRaised (*this); // (issue #191)
         nativechild::raiseOverlays();
         lastUsed() = key();
         editorlimit::touch (key()); // (round 189o: the limit closes the least recently used editors)
@@ -1643,7 +1923,15 @@ public:
             return;
         if (e.mods.isPopupMenu() && e.y < titleHeight)
         {
-            showMenu();
+            // FL: a right-click on a channel window's title renames the channel (DF-119); else the wrapper menu
+            wrappermenu::Spec spec;
+            if (auto* wrapped = dynamic_cast<WrappedEditor*> (shownContent); wrapped != nullptr && getContext().channel && wrapped->channelIndex() >= 0
+                                                                            && channelWrapperItemsHandler())
+                channelWrapperItemsHandler() (wrapped->channelIndex(), spec);
+            if (spec.rename != nullptr)
+                spec.rename();
+            else
+                showWrapperMenu (menuButton);
             return;
         }
         dragging = e.y < titleHeight;
@@ -1673,7 +1961,7 @@ public:
 
     bool keyPressed (const juce::KeyPress& press) override
     {
-        if (press == juce::KeyPress::escapeKey) // FL closes the focused plugin window with Esc (round 170h)
+        if (press == juce::KeyPress::escapeKey && escclose::enabled()) // FL closes the focused plugin window with Esc (round 170h; #217's switch)
         {
             juce::MessageManager::callAsync ([k = key()] { closeHostOf (k); });
             return true;
@@ -1690,10 +1978,23 @@ public:
         g.fillRect (strip);
         g.setColour (colour::border);
         g.fillRect (strip.removeFromBottom (1));
+        auto text = getLocalBounds().removeFromTop (titleHeight).withTrimmedLeft (menuButton.getRight() + 4).withTrimmedRight (2 * titleHeight + 6);
+        if (titlePresets != nullptr && titlePresets->getParentComponent() == this)
+            text.setRight (titlePresets->getX() - 6);
+        // FL's two tones (round 190in, FW-5): "Name" bright, " (target)" dim
+        const auto title = hostTitle();
+        const auto open = title.lastIndexOf (" (");
+        const auto head = open > 0 && title.endsWithChar (')') ? title.substring (0, open) : title;
         g.setColour (colour::textPrimary);
         g.setFont (font (type::body, true));
-        auto text = getLocalBounds().removeFromTop (titleHeight).withTrimmedLeft (menuButton.getRight() + 4).withTrimmedRight (2 * titleHeight + 6);
-        g.drawFittedText (hostTitle(), text, juce::Justification::centredLeft, 1, 0.9f);
+        const auto headW = juce::jmin (text.getWidth(), juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), head) + 1);
+        g.drawFittedText (head, text.withWidth (headW), juce::Justification::centredLeft, 1, 0.9f);
+        if (head.length() < title.length())
+        {
+            g.setColour (colour::textSecondary);
+            g.setFont (font (type::body));
+            g.drawText (title.substring (open), text.withTrimmedLeft (headW), juce::Justification::centredLeft, true);
+        }
     }
 
     void paintOverChildren (juce::Graphics& g) override
@@ -1705,10 +2006,15 @@ public:
     void resized() override
     {
         auto strip = getLocalBounds().removeFromTop (titleHeight).reduced (3, 2);
-        menuButton.setBounds (strip.removeFromLeft (strip.getHeight()));
+        menuButton.setBounds (strip.removeFromLeft (18));
         closeButton.setBounds (strip.removeFromRight (strip.getHeight()));
         strip.removeFromRight (2);
         minimiseButton.setBounds (strip.removeFromRight (strip.getHeight()));
+        if (titlePresets != nullptr && titlePresets->getParentComponent() == this)
+        {
+            strip.removeFromRight (6);
+            titlePresets->setBounds (strip.removeFromRight (juce::jmin (190, juce::jmax (0, strip.getWidth() / 2))));
+        }
         if (shownContent != nullptr && ! minimised)
         {
             const juce::ScopedValueSetter<bool> guard (laying, true);
@@ -1730,16 +2036,6 @@ public:
 
 private:
     static constexpr int titleHeight = 24;
-
-    void showMenu()
-    {
-        juce::PopupMenu menu;
-        menu.addSectionHeader (hostTitle());
-        addDetachedItem (menu);
-        menu.addSeparator();
-        menu.addItem (tr ("Close"), [k = key()] { juce::MessageManager::callAsync ([k] { closeHostOf (k); }); });
-        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&menuButton));
-    }
 
     // FL's minimise of a docked window: only the title strip stays
     void setMinimisedFrame (bool shouldBe)
@@ -1774,7 +2070,9 @@ private:
     }
 
     Workspace& workspace;
-    IconButton menuButton { "menu", Icon::panelMenu }, minimiseButton { "minimise", Icon::minimise }, closeButton { "close", Icon::close };
+    wrappermenu::MenuArrow menuButton;
+    IconButton minimiseButton { "minimise", Icon::minimise }, closeButton { "close", Icon::close };
+    juce::Component* titlePresets = nullptr; // the wrapper's preset bar, in the title strip (owned by the wrapper)
     juce::ComponentBoundsConstrainer limits;
     std::unique_ptr<juce::ResizableCornerComponent> corner;
     juce::Rectangle<int> dragStart;
@@ -1856,7 +2154,10 @@ void pinnedWindowsChanged()
 std::unique_ptr<EditorHost> makeHost (std::shared_ptr<void> owner, juce::AudioPluginInstance& plugin, const juce::String& title,
                                       PluginWindows::WrapperContext context)
 {
-    if (! opensDetached (plugin, context))
+    // issue #191: opened from a floating panel window in the Clip-launch or Simple layout, a docked frame would be behind
+    // that window (it lives in the main window): the editor opens as a window of its own this time (not saved)
+    const auto fromFloating = layoutstyle::current() != layoutstyle::Style::pattern && openedFromFloatingPanel();
+    if (! opensDetached (plugin, context) && ! fromFloating)
         return std::make_unique<DockedPluginFrame> (std::move (owner), plugin, title, std::move (context), *dockWorkspace());
     return std::make_unique<PluginWindow> (std::move (owner), plugin, title, std::move (context));
 }
@@ -2061,6 +2362,13 @@ private:
 
 namespace PluginWindows
 {
+std::optional<juce::PopupMenu> wrapperMenuForSnapshot (juce::AudioPluginInstance& plugin)
+{
+    if (const auto it = windows().find (&plugin); it != windows().end())
+        return it->second->buildWrapperMenu();
+    return std::nullopt;
+}
+
 bool letsHostProcessKeys (juce::Component& window)
 {
     auto* w = dynamic_cast<PluginWindow*> (&window);
@@ -2113,6 +2421,12 @@ void open (std::shared_ptr<void> owner, juce::AudioPluginInstance& plugin, const
     }
 
     installEditorGuard(); // (issue #32: a fault in the plugin's own window closes the editor, not LYNX)
+    // round 190gg (B4): the editor is made under the crash guard before any window exists (the host below then takes
+    // the same one). A plugin that crashes making it is switched off like after a crash while playing, and the
+    // "Plugin crashed" prompt says so; no window opens.
+    crashguard::note (("making the editor of " + plugin.getName()).toStdString());
+    if (! callPluginFromUi (plugin, "making its editor", [&plugin] { plugin.createEditorIfNeeded(); }))
+        return;
     open[&plugin] = makeHost (std::move (owner), plugin, title, std::move (context));
     // FL's "Limit the number of open plugin editors" (round 189o, core/EditorLimit.h): past 25, the oldest closes
     editorlimit::opened (&plugin, [k = &plugin] {
@@ -2293,6 +2607,85 @@ void promptReload (AudioEngine& engine, AudioEngine::HostedSlot where, std::func
     });
 }
 
+bool canAlwaysRunSeparately (const juce::String& plugin)
+{
+    return plugin.isNotEmpty() && plugin != "?" && ! pluginSandboxEnabled() && ! pluginAlwaysSeparate (plugin);
+}
+
+juce::String alwaysSeparateHint()
+{
+    return tr ("In a separate process a crash of the plugin cannot take LYNX SHARE down. Its window then opens on its own "
+               "(it cannot be docked).");
+}
+
+CrashPrompt crashPrompt (const juce::String& plugin, bool onLoad)
+{
+    CrashPrompt p;
+    p.title = tr ("Plugin crashed");
+    p.reload = ! onLoad;
+    p.separate = canAlwaysRunSeparately (plugin);
+    p.message = tr ("{0} crashed and was switched off.", { plugin }) + "\n\n"
+                + tr ("LYNX SHARE and your project kept running (an effect is bypassed, an instrument stays silent). Save your project.");
+    if (p.reload)
+    {
+        p.message << " " << tr ("Reload starts it again with the settings from the last save or backup.");
+        p.buttons.add (tr ("Reload"));
+    }
+    if (p.separate)
+    {
+        p.message << "\n\n" << alwaysSeparateHint();
+        p.buttons.add (tr ("Always run {0} in a separate process", { plugin }));
+    }
+    p.buttons.add (tr ("Close"));
+    return p;
+}
+
+std::unique_ptr<juce::Component> makeCrashPromptPanel (const juce::String& plugin, bool onLoad)
+{
+    const auto p = crashPrompt (plugin, onLoad);
+    auto window = std::make_unique<juce::AlertWindow> (p.title, p.message, juce::MessageBoxIconType::WarningIcon);
+    for (int i = 0; i < p.buttons.size(); ++i)
+        window->addButton (p.buttons[i], i + 1 < p.buttons.size() ? i + 1 : 0);
+    return window;
+}
+
+std::unique_ptr<juce::Component> makeCrashNoticePanel (const juce::String& plugin, bool offerSeparate)
+{
+    auto notice = std::make_unique<CrashNotice>();
+    notice->setPluginName (plugin);
+    notice->onReload = [] {};
+    if (offerSeparate)
+        notice->setSeparate ([] {}, plugin);
+    notice->setSize (560, 220);
+    return notice;
+}
+
+void alwaysRunSeparately (AudioEngine& engine, const juce::String& plugin)
+{
+    const auto name = plugin.toStdString();
+    auto which = engine.downHostedPlugins (name);
+    const auto& song = engine.getSong();
+    for (std::size_t c = 0; c < song.channels.size(); ++c)
+        if (song.channels[c].instrument == InstrumentKind::plugin && song.channels[c].plugin.name == name)
+            which.push_back ({ (int) c, -1, -1 });
+    for (std::size_t t = 0; t < song.mixer.size(); ++t)
+        for (std::size_t k = 0; k < song.mixer[t].effects.size(); ++k)
+            if (song.mixer[t].effects[k].kind == EffectKind::plugin && song.mixer[t].effects[k].plugin.name == name)
+                which.push_back ({ -1, (int) t, (int) k });
+    if (which.empty())
+        which = engine.downHostedPlugins(); // (the crash names the plugin as it calls itself; the project may not)
+    for (const auto& w : which)
+        if (auto* instance = instanceAt (engine, w)) // (a window keeps the old instance alive)
+            close (*instance);
+    engine.capturePluginStates(); // (the running ones start from their current settings; a crashed one keeps its last)
+    setPluginAlwaysSeparate (plugin, true);
+    engine.editSong ([which] (Song& s) {
+        for (const auto& w : which)
+            if (auto* r = const_cast<PluginRef*> (refAt (s, w)))
+                r->separateProcess = true; // (a changed option makes the plugin again: in its own process now)
+    });
+}
+
 int editorCrashCount()
 {
     return (int) editorCrashList().size();
@@ -2462,5 +2855,39 @@ void addPluginItems (juce::PopupMenu& menu, AudioEngine& engine, bool instrument
 
     menu.addSeparator();
     menu.addItem (tr ("Scan for plugins ({0})...", { platform::pluginFormatNames() }), [&engine] { engine.getPluginHost().startBackgroundScan(); });
+}
+} // namespace lynx
+
+namespace lynx
+{
+std::vector<AutomationTarget> allPluginParameterTargets (juce::AudioPluginInstance& plugin, const AutomationTarget& base)
+{
+    std::vector<AutomationTarget> targets;
+    if (base.kind != AutomationTargetKind::channelParam && base.kind != AutomationTargetKind::effectParam)
+        return targets;
+    const auto count = juce::jmin (plugin.getParameters().size(), midictl::ccBase); // (the indexes plugin parameters use)
+    for (int i = 0; i < count; ++i)
+    {
+        auto t = base;
+        t.param = i;
+        targets.push_back (t);
+    }
+    return targets;
+}
+
+void addPluginWrapperItems (juce::PopupMenu& menu, AudioEngine& engine, juce::AudioPluginInstance& plugin, const AutomationTarget& base)
+{
+    // FL's "Spare state" section [PluginMenu Sparestate1], with FL's names (FL-native equivalents keep FL's names)
+    const auto has = hasSpareState (plugin);
+    menu.addSectionHeader (tr ("Spare state"));
+    menu.addItem (tr ("Store in spare state"), [&plugin] { storeSpareState (plugin); });
+    menu.addItem (tr ("Flip with spare state"), has, false, [&engine, &plugin] { flipSpareState (engine, plugin); });
+    // FL's "Parameters" section [PluginMenu N51]: Link all parameters... (Browse parameters is left out: LYNX's
+    // Browser does not list a plugin's parameters)
+    const auto targets = allPluginParameterTargets (plugin, base);
+    if (base.kind == AutomationTargetKind::none)
+        return;
+    menu.addSectionHeader (tr ("Parameters"));
+    menu.addItem (tr ("Link all parameters..."), ! targets.empty(), false, [&engine, targets] { openRemoteControlSettings (engine, targets, false); });
 }
 } // namespace lynx

@@ -1,6 +1,8 @@
+#include "core/FlCurve.h"
 #include "ui/FlMods.h"
 #include "ui/WindowOwner.h"
 #include "ui/AutomationUi.h"
+#include "ui/RemoteControl.h"
 #include "core/PlaylistOps.h"
 #include "core/LastTweaked.h"
 
@@ -13,9 +15,11 @@
 #include "core/MidiControls.h"
 #include "core/MidiOut.h"
 #include "core/FlSynths.h"
+#include "core/SynthParams.h"
 #include "engine/Text.h"
 #include "core/EditorGestures.h"
 #include "ui/EditorTools.h"
+#include "ui/FrameTicker.h"
 #include "ui/EventEditor.h"
 #include "ui/I18n.h"
 #include "ui/HintBar.h"
@@ -93,8 +97,7 @@ public:
 
 class AutomationEditor final : public juce::Component,
                                public ui::HintSource,
-                               private juce::ChangeListener,
-                               private juce::Timer
+                               private juce::ChangeListener
 {
 public:
     AutomationEditor (AudioEngine& e, int index)
@@ -105,7 +108,6 @@ public:
         buildLfoPanel();
         refreshLfoPanel();
         setSize (760, 330);
-        startTimerHz (30);
     }
 
     // round 177b: FL's LFO mode (REA FUN_00f62690 / FUN_00f6b6a0): with the LFO on, the editor edits the LFO's own points
@@ -156,7 +158,7 @@ public:
 
         const auto& song = engine.getSong();
         const auto area = plotArea();
-        const auto bar = (std::int64_t) ppq * juce::jmax (1, song.beatsPerBar);
+        const auto bar = song.barTicks();
 
         g.setColour (colour::bg0);
         g.fillRect (area);
@@ -197,7 +199,9 @@ public:
         const auto& points = editedPoints (*a);
         const auto lfo = a->lfo.on;
 
-        for (auto x = area.getX(); x <= area.getRight(); x += lfo ? 1 : 2)
+        // (a sample per pixel; round 190bw: Hold, Stairs and Pulse segments keep square corners)
+        auto lastY = 0.0f, lastAmpY = 0.0f;
+        for (auto x = area.getX(); x <= area.getRight(); ++x)
         {
             const auto tick = xToTick (x);
             // FL draws the LFO alone around the middle: 0.5 + the swing (half the waveform × the amplitude) / 2
@@ -205,8 +209,11 @@ public:
 
             if (x == area.getX())
                 curve.startNewSubPath ((float) x, y);
-            else
+            else if (lfo)
                 curve.lineTo ((float) x, y);
+            else
+                automationLineTo (curve, (float) x - 1.0f, lastY, (float) x, y, [&] { return valueToY (curveAt (*a, xToTick ((double) x - 0.5))); });
+            lastY = y;
 
             // FL draws the amplitude line from the first point to the last one, nothing past it
             if (lfo && ! points.empty() && tick >= (double) points.front().tick && tick <= (double) points.back().tick)
@@ -215,7 +222,8 @@ public:
                 if (! ampStarted)
                     amp.startNewSubPath ((float) x, ya), ampStarted = true;
                 else
-                    amp.lineTo ((float) x, ya);
+                    automationLineTo (amp, (float) x - 1.0f, lastAmpY, (float) x, ya, [&] { return valueToY (curveAt (*a, xToTick ((double) x - 0.5))); });
+                lastAmpY = ya;
             }
         }
 
@@ -241,7 +249,7 @@ public:
             g.fillPath (fill);
         }
         g.setColour (colour::automation);
-        g.strokePath (curve, juce::PathStrokeType (lfo ? 1.5f : 2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.strokePath (curve, juce::PathStrokeType (lfo ? 1.5f : 2.0f, lfo ? juce::PathStrokeType::curved : juce::PathStrokeType::mitered, juce::PathStrokeType::rounded));
         if (lfo)
         {
             g.setColour (colour::textSecondary.withAlpha (0.45f));
@@ -374,10 +382,8 @@ public:
             }
             if (handle >= 0) // FL: right-click on the tension handle = straight segment
             {
-                edit ([handle] (Automation& x) {
-                    if (handle < (int) editedPoints (x).size())
-                        editedPoints (x)[(std::size_t) handle].tension = 0.0f;
-                });
+                automationPointMemory().tension = 0.0f; // FL's "default tension" also clears the editor's memory
+                edit ([handle] (Automation& x) { setAutomationSegmentTension (editedPoints (x), handle, 0.0f); });
                 return;
             }
             // FL: right-click adds a point there, dragged while the button is held (Shift: on the curve, keeping its
@@ -398,6 +404,7 @@ public:
         if (handle >= 0) // the tension handle: up / down bends the segment
         {
             tensionPoint = handle;
+            rememberSegment (editedPoints (*a)[(std::size_t) handle]);
             tensionStart = editedPoints (*a)[(std::size_t) handle].tension;
             tensionSign = editedPoints (*a)[(std::size_t) handle + 1].value >= editedPoints (*a)[(std::size_t) handle].value ? -1.0f : 1.0f;
             return;
@@ -415,6 +422,7 @@ public:
 
             if (tensionPoint >= 0)
             {
+                rememberSegment (editedPoints (*a)[(std::size_t) tensionPoint]);
                 tensionStart = editedPoints (*a)[(std::size_t) tensionPoint].tension;
                 tensionSign = editedPoints (*a)[(std::size_t) tensionPoint + 1].value >= editedPoints (*a)[(std::size_t) tensionPoint].value ? -1.0f : 1.0f;
             }
@@ -433,16 +441,19 @@ public:
         addAndDrag (p);
     }
 
+    // FL: a new point takes the mode and tension last used in the editor (the segment that ends at it); the rest of
+    // the segment it splits keeps its curve
     void addAndDrag (const AutomationPoint& p)
     {
-        edit ([p] (Automation& x) {
-            editedPoints (x).push_back (p);
-            std::stable_sort (editedPoints (x).begin(), editedPoints (x).end(), [] (auto& l, auto& r) { return l.tick < r.tick; });
-        });
+        int added = -1;
+        edit ([p, &added, m = automationPointMemory()] (Automation& x) { added = insertAutomationPoint (editedPoints (x), p, m.mode, m.tension); });
+        dragPoint = added;
+    }
 
-        for (int i = 0; i < (int) editedPoints (*current()).size(); ++i)
-            if (editedPoints (*current())[(std::size_t) i].tick == p.tick && editedPoints (*current())[(std::size_t) i].value == p.value)
-                dragPoint = i;
+    // the tension drag: FL's editor remembers the dragged segment's mode and tension for the next new point
+    static void rememberSegment (const AutomationPoint& p)
+    {
+        automationPointMemory() = { p.mode < flcurve::modeCount ? (int) p.mode : 0, p.tension };
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
@@ -463,7 +474,8 @@ public:
         {
             const auto up = -(float) e.getDistanceFromDragStartY() / (flmods::ctrl (e.mods) ? 400.0f : 100.0f);
             const auto tension = juce::jlimit (-1.0f, 1.0f, tensionStart + tensionSign * up); // the segment follows the mouse
-            edit ([i = tensionPoint, tension] (Automation& x) { editedPoints (x)[(std::size_t) i].tension = tension; });
+            automationPointMemory().tension = tension;
+            edit ([i = tensionPoint, tension] (Automation& x) { setAutomationSegmentTension (editedPoints (x), i, tension); });
             return;
         }
 
@@ -527,11 +539,22 @@ private:
 
     void showPointMenu (int point)
     {
+        // FL's point menu [RES FLEngine EEACPointMenu; the look: the envelope editor's menu, shot fl-lp-point-menu]:
+        // Delete, the Mode block, then Copy value / Paste value / Type in value...; LYNX's own commands follow
         const auto* a = current();
         const auto value = editedPoints (*a)[(std::size_t) point].value;
         juce::PopupMenu menu;
-        menu.addSectionHeader (valueText (value));
-        menu.addItem (tr ("Type value..."), [this, point] { typeValue (point); });
+        // FL's header is the point's place in the clip, "Point 2/14" (live check 190cq, shot curves190bw-01)
+        menu.addSectionHeader (automationPointMenuHeader (point, (int) editedPoints (*a).size()));
+        menu.addItem (tr ("Delete"), editedPoints (*a).size() > 1, false, [this, point] {
+            edit ([point] (Automation& x) {
+                if (editedPoints (x).size() > 1)
+                    eraseAutomationPoint (editedPoints (x), point);
+            });
+        });
+        addAutomationModeItems (menu, automationPointMode (editedPoints (*a), point), point > 0,
+                                [this, point] (int mode) { edit ([point, mode] (Automation& x) { setAutomationPointMode (editedPoints (x), point, mode); }); });
+        menu.addSeparator();
         menu.addItem (tr ("Copy value"), [value] { copiedAutomationValue() = value; });
         menu.addItem (tr ("Paste value"), copiedAutomationValue() >= 0.0f, false, [this, point] {
             edit ([point, v = copiedAutomationValue()] (Automation& x) {
@@ -539,20 +562,11 @@ private:
                     editedPoints (x)[(std::size_t) point].value = v;
             });
         });
+        menu.addItem (tr ("Type in value..."), [this, point] { typeValue (point); });
+        menu.addSeparator();
         menu.addItem (tr ("Straight segment (reset the curve)"), [this, point] {
-            edit ([point] (Automation& x) {
-                if (point < (int) editedPoints (x).size())
-                    editedPoints (x)[(std::size_t) point].tension = 0.0f;
-            });
+            edit ([point] (Automation& x) { setAutomationSegmentTension (editedPoints (x), point, 0.0f); });
         });
-        menu.addSeparator();
-        menu.addItem (tr ("Delete point"), editedPoints (*a).size() > 1, false, [this, point] {
-            edit ([point] (Automation& x) {
-                if (point < (int) editedPoints (x).size() && editedPoints (x).size() > 1)
-                    editedPoints (x).erase (editedPoints (x).begin() + point);
-            });
-        });
-        menu.addSeparator();
         menu.addSubMenu (tr ("Whole curve"), curveMenu());
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMousePosition());
     }
@@ -571,8 +585,8 @@ private:
         });
         menu.addItem (tr ("All segments straight"), [this] {
             edit ([] (Automation& x) {
-                for (auto& p : editedPoints (x))
-                    p.tension = 0.0f;
+                for (int i = 0; i < (int) editedPoints (x).size(); ++i)
+                    setAutomationSegmentTension (editedPoints (x), i, 0.0f);
             });
         });
         return menu;
@@ -727,7 +741,7 @@ private:
     std::vector<ctlui::Knob*> lfoKnobs;
     bool lfoShown = false;
     double tickToX (double tick) const { return plotArea().getX() + (tick - scroll) * pixelsPerTick; }
-    double xToTick (int x) const { return juce::jmax (0.0, (x - plotArea().getX()) / pixelsPerTick + scroll); }
+    double xToTick (double x) const { return juce::jmax (0.0, (x - plotArea().getX()) / pixelsPerTick + scroll); }
     float valueToY (float v) const { return (float) plotArea().getBottom() - v * (float) plotArea().getHeight(); }
     float yToValue (int y) const { return juce::jlimit (0.0f, 1.0f, (float) (plotArea().getBottom() - y) / (float) plotArea().getHeight()); }
 
@@ -795,26 +809,45 @@ private:
         repaint();
     }
 
-    void timerCallback() override
+    // Round 190im (DE-124): the playhead moves on the shared display-rate ticker (ui/FrameTicker.h) instead of the editor's
+    // own 30 Hz timer, which ran with the window open even while stopped and repainted the whole editor on every change.
+    // Stopped, the ticker's shared idle poll asks this step (one atomic load) and nothing repaints; playing, only the
+    // playhead's old and new columns are repainted.
+    bool playheadStep()
     {
         // position within the automation, if one of its clips is under the cursor
         auto tick = -1.0;
         const auto& song = engine.getSong();
+        const auto playing = engine.getTransport().playing.load (std::memory_order_relaxed);
 
-        if (song.mode == PlayMode::song && engine.getTransport().playing.load())
+        if (playing && song.mode == PlayMode::song && isShowing())
         {
-            const auto position = engine.songPlayheadTicks();
+            const auto position = engine.songPlayheadTicks() + engine.playheadAdvanceTicks();
 
             for (const auto& c : song.playlist)
                 if (c.kind == ClipKind::automation && c.automation == automation && position >= (double) c.start && position < (double) c.end())
                     tick = position - (double) c.start + (double) c.offset;
         }
 
-        if (tick != playhead)
+        if (tick == playhead)
+            return playing;
+        const auto column = [this] (double t) {
+            return t >= 0.0 ? juce::Rectangle<int> ((int) tickToX (t) - 2, 0, 5, getHeight()).getIntersection (plotArea().expanded (1))
+                            : juce::Rectangle<int>();
+        };
+        const auto before = column (playhead);
+        playhead = tick;
+        const auto after = column (playhead);
+        if (! before.isEmpty() && ! after.isEmpty() && std::abs (before.getX() - after.getX()) <= 5)
+            repaint (before.getUnion (after));
+        else
         {
-            playhead = tick;
-            repaint();
+            if (! before.isEmpty())
+                repaint (before);
+            if (! after.isEmpty())
+                repaint (after);
         }
+        return true;
     }
 
     AudioEngine& engine;
@@ -826,6 +859,7 @@ private:
     double panStart = 0.0;
     float tensionStart = 0.0f, tensionSign = 1.0f;
     double playhead = -1.0;
+    ui::FrameTicker frames { *this, [this] (double) { return playheadStep(); } };
 };
 
 class AutomationWindow final : public juce::DocumentWindow
@@ -840,7 +874,7 @@ public:
         setResizeLimits (400, 200, 4000, 2000);
         centreWithSize (getWidth(), getHeight());
         setVisible (true);
-        keepAboveMainWindow (*this);
+        dockOrKeepAbove (*this); // FL's docked plugin window (round 190ev)
     }
 
     int getIndex() const { return static_cast<AutomationEditor*> (getContentComponent())->getIndex(); }
@@ -873,6 +907,37 @@ float& copiedAutomationValue()
 {
     static float value = -1.0f;
     return value;
+}
+
+AutomationPointMemory& automationPointMemory()
+{
+    static AutomationPointMemory memory;
+    return memory;
+}
+
+juce::String automationPointMenuHeader (int point, int count)
+{
+    return tr ("Point {0}/{1}", { juce::String (point + 1), juce::String (count) });
+}
+
+void addAutomationModeItems (juce::PopupMenu& menu, int current, bool enabled, std::function<void (int)> pick)
+{
+    // FL's order [RES FLEngine TFruityLoopsMainForm.EEACPointMenu: PtCurve10Menu, 2, 0, 7, 11, 1, 8, 12, 9, 3, 4, 5, 6]
+    static const int order[] = { flcurve::smooth, flcurve::hold, flcurve::singleCurve, flcurve::singleCurve2, flcurve::singleCurve3,
+                                 flcurve::doubleCurve, flcurve::doubleCurve2, flcurve::doubleCurve3, flcurve::halfSine, flcurve::stairs,
+                                 flcurve::smoothStairs, flcurve::pulse, flcurve::wave };
+    menu.addSectionHeader (tr ("Mode"));
+    for (const auto mode : order)
+    {
+        juce::PopupMenu::Item item (tr (flcurve::modeName (mode)));
+        item.setEnabled (enabled);
+        item.setTicked (mode == current);
+        item.setAction ([pick, mode] {
+            automationPointMemory().mode = mode;
+            pick (mode);
+        });
+        menu.addItem (item);
+    }
 }
 
 void typeAutomationPointValue (AudioEngine& engine, int automation, int point)
@@ -911,6 +976,12 @@ juce::String describeAutomationTarget (AudioEngine& engine, const AutomationTarg
     {
         case AutomationTargetKind::channelVolume: return channelName + " - " + tr ("Volume");
         case AutomationTargetKind::channelPan: return channelName + " - " + tr ("Pan");
+        case AutomationTargetKind::channelAdjust: // the Misc tab's Levels adjustment (round 190dz; FL's knob hints)
+            return channelName + " - "
+                   + (t.param == leveladjust::pan      ? tr ("Panning offset")
+                      : t.param == leveladjust::volume ? tr ("Volume multiplier")
+                      : t.param == leveladjust::modX   ? tr ("Modulation X offset")
+                                                       : tr ("Modulation Y offset"));
         case AutomationTargetKind::mixerVolume: return trackName + " - " + tr ("Volume");
         case AutomationTargetKind::mixerPan: return trackName + " - " + tr ("Pan");
 
@@ -941,6 +1012,13 @@ juce::String describeAutomationTarget (AudioEngine& engine, const AutomationTarg
                      && t.param < samplerparam::count) // (issue #12)
                 param = tr (samplerparam::name (t.param));
             else if (t.kind == AutomationTargetKind::channelParam && t.index >= 0 && t.index < (int) song.channels.size()
+                     && song.channels[(std::size_t) t.index].instrument == InstrumentKind::synth && synthparam::valid (t.param)) // (issue #152)
+            {
+                const auto k = synthparam::indexOf (t.param);
+                const auto knob = tr (synthparam::rangeOf (k).name);
+                param = synthparam::oscOf (k) > 0 ? tr ("Osc {0}", { juce::String (synthparam::oscOf (k)) }) + " " + knob : knob;
+            }
+            else if (t.kind == AutomationTargetKind::channelParam && t.index >= 0 && t.index < (int) song.channels.size()
                      && song.channels[(std::size_t) t.index].instrument == InstrumentKind::midiOut && t.param >= 0
                      && t.param <= midiout::controlCount) // (round 167i)
             {
@@ -961,6 +1039,7 @@ juce::String describeAutomationTarget (AudioEngine& engine, const AutomationTarg
         }
 
         case AutomationTargetKind::tempo: return tr ("Tempo");
+        case AutomationTargetKind::crossfader: return tr ("Main") + " - " + tr ("Crossfade"); // (round 190kc: Live's Main › Mixer › Crossfade)
         case AutomationTargetKind::vcaLevel: // (round 177a)
             return t.index >= 0 && t.index < (int) song.vcas.size() ? nameOf (song.vcas[(std::size_t) t.index].name) + " - " + tr ("VCA level")
                                                                    : tr ("VCA level");
@@ -980,6 +1059,28 @@ juce::String describeAutomationTarget (AudioEngine& engine, const AutomationTarg
     }
 
     return tr ("(no target)");
+}
+
+juce::String targetValueTextAt (AudioEngine& engine, const AutomationTarget& target, float value)
+{
+    value = juce::jlimit (0.0f, 1.0f, value);
+    if (target.kind == AutomationTargetKind::channelParam || target.kind == AutomationTargetKind::effectParam)
+    {
+        if (midictl::isMidiParam (target.param))
+            return juce::String (juce::roundToInt (value * 127.0f));
+        if (auto* plugin = pluginFor (engine, target))
+        {
+            if (target.param < 0 || target.param >= plugin->getParameters().size())
+                return {};
+            auto* p = plugin->getParameters()[target.param];
+            auto text = p->getText (value, 40).trim();
+            if (text.isNotEmpty())
+                if (const auto label = p->getLabel().trim(); label.isNotEmpty() && ! text.endsWith (label))
+                    text << " " << label;
+            return text;
+        }
+    }
+    return juce::String::fromUTF8 (lasttweak::valueText (engine.getSong(), target, value).c_str());
 }
 
 juce::String describeTargetValue (AudioEngine& engine, const AutomationTarget& target)
@@ -1060,6 +1161,7 @@ void addAutomationClip (AudioEngine& engine, const AutomationTarget& target, con
         a.name = name;
         a.target = target;
         a.points = { { 0, value, 0.0f }, { place.length, value, 0.0f } };
+        a.colour = autoclipplace::colourFor (target); // FL: by parameter (round 190jd)
         s.automations.push_back (std::move (a));
 
         Clip clip;
@@ -1700,10 +1802,14 @@ void addAutomationItem (juce::PopupMenu& menu, AudioEngine& engine, const Automa
     menu.addItem (tr ("Link to MIDI controller (move a knob on the controller)"), [&engine, target] {
         engine.learnMidiController (target);
     });
+    // FL's "Link to controller..." (round 190bt): the Remote control settings window, where the link is seen and
+    // edited (port, channel, controller, formula, smoothing); the item above stays the one-step way
+    menu.addItem (tr ("Link to controller..."), [&engine, target] { openRemoteControlSettings (engine, { target }, false); });
     // FL's "Override global link..." (form "Global link settings"): a link for every project, kept in the settings
     menu.addItem (tr ("Override global link... (for all projects: move a knob on the controller)"), [&engine, target] {
         engine.learnGlobalLink (target);
     });
+    menu.addItem (tr ("Override global link..."), [&engine, target] { openRemoteControlSettings (engine, { target }, true); });
 
     if (target.kind != AutomationTargetKind::tempo)
         addControllerLinkItems (menu, engine, target);

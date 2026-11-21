@@ -4,19 +4,12 @@
 
 #include <algorithm>
 
-#include "core/ControlSurface.h"
 #include "core/FlSynths.h"
-#include "core/FruityDance.h"
-#include "core/MidiControls.h"
-#include "core/SoundFont.h"
 #include "core/NativeEngines.h"
 #include "core/PluginCatalog.h"
 #include "core/PluginDbFolder.h"
 #include "core/Preferences.h"
 #include "core/ProjectContents.h"
-#include "core/VideoPlayer.h"
-#include "core/VoltageController.h"
-#include "core/Vfx.h"
 #include "engine/PluginHost.h"
 #include "platform/Paths.h"
 #include "ui/ChannelRackComponent.h"
@@ -29,99 +22,21 @@ namespace lynx::quickpick
 {
 std::vector<GeneratorEntry> generatorEntries (AudioEngine& engine, bool withUnavailable)
 {
-    std::vector<GeneratorEntry> out;
-    auto add = [&out] (std::string english, juce::String label, juce::String detail, int folder, int section, InstrumentKind kind,
-                       std::function<std::optional<ChannelDef>()> make) {
-        out.push_back ({ "lynx:gen:" + english, std::move (label), std::move (detail), folder, std::move (make), section, kind });
-    };
-    // a built-in whose channel is `kind` with the English name; `setup` fills its state
-    auto builtIn = [&add] (const char* english, juce::String label, int section, InstrumentKind kind, std::function<void (ChannelDef&)> setup = nullptr) {
-        add (english, std::move (label), tr ("built-in"), 0, section, kind, [kind, name = std::string (english), setup] {
-            ChannelDef c;
-            c.name = name;
-            c.instrument = kind;
-            if (setup)
-                setup (c);
-            return std::optional<ChannelDef> (c);
-        });
-    };
-
-    // the first block, FL's menu order (Kick … Synth)
-    builtIn (TR_NOOP ("Kick"), tr ("Kick"), 0, InstrumentKind::kick);
-    builtIn (TR_NOOP ("Snare"), tr ("Snare"), 0, InstrumentKind::snare);
-    builtIn (TR_NOOP ("Hat"), tr ("Hat"), 0, InstrumentKind::hat);
-    builtIn (TR_NOOP ("Clap"), tr ("Clap"), 0, InstrumentKind::clap);
-    builtIn (TR_NOOP ("Synth"), tr ("Synth"), 0, InstrumentKind::synth);
-
-    // built-in controllers and tools (rounds 133–165): no sound of their own
-    builtIn (TR_NOOP ("Envelope Controller"), tr ("Envelope Controller"), 1, InstrumentKind::controller,
-             [] (ChannelDef& c) { c.controllerState = writeEnvelopeController (defaultEnvelopeController()); });
-    builtIn (TR_NOOP ("Keyboard Controller"), tr ("Keyboard Controller"), 1, InstrumentKind::controller,
-             [] (ChannelDef& c) { c.controllerState = defaultKeyboardController(); });
-    add ("MIDI Out", tr ("MIDI Out"), tr ("built-in"), 0, 1, InstrumentKind::midiOut, [&engine] {
-        ChannelDef c;
-        c.name = "MIDI Out";
-        c.instrument = InstrumentKind::midiOut;
-        // FL gives each new MIDI Out the next MIDI channel, skipping the drum channel 10 (REA_rodada16 §1.1)
-        int count = 0;
-        for (const auto& ch : engine.getSong().channels)
-            count += ch.instrument == InstrumentKind::midiOut;
-        midictl::MidiOutSettings settings;
-        settings.channel = count % 15 >= 9 ? count % 15 + 1 : count % 15;
-        midictl::writeMidiOut (c.pluginState, settings);
-        return std::optional<ChannelDef> (c);
-    });
-    builtIn (TR_NOOP ("Layer"), tr ("Layer"), 1, InstrumentKind::layer);
-    builtIn ("Dashboard", "Dashboard", 1, InstrumentKind::dashboard, [] (ChannelDef& c) { c.patcher.surface = surface::starterControls(); });
-    builtIn ("Voltage Controller", "Voltage Controller", 1, InstrumentKind::voltage,
-             [] (ChannelDef& c) { c.pluginState = voltage::write (voltage::Settings {}); });
-    builtIn ("Fruity Dance", "Fruity Dance", 1, InstrumentKind::fruitydance, [] (ChannelDef& c) { c.pluginState = dance::toState (dance::Settings {}); });
-    builtIn ("Fruity Video Player", "Fruity Video Player", 1, InstrumentKind::videoplayer,
-             [] (ChannelDef& c) { c.pluginState = video::write (video::Settings {}); });
-    builtIn ("Patcher", tr ("Patcher"), 2, InstrumentKind::patcher);
-    // round 183c: Live-style Instrument Rack (a Patcher in rack mode, core/Rack.h)
-    builtIn (TR_NOOP ("Instrument Rack"), tr ("Instrument Rack"), 2, InstrumentKind::patcher,
-             [] (ChannelDef& c) { c.patcher = rack::makeRack (RackDoc::Kind::instrument); });
-    // ...and a standalone MIDI Effect Rack: its chains' notes play its children (decision R1, like a Layer's)
-    builtIn (TR_NOOP ("MIDI Effect Rack"), tr ("MIDI Effect Rack"), 2, InstrumentKind::patcher,
-             [] (ChannelDef& c) { c.patcher = rack::makeRack (RackDoc::Kind::midiEffect); });
-    add ("LYNX Soundfont", "LYNX Soundfont", tr ("built-in"), 0, 2, InstrumentKind::soundfont, [] { return std::optional<ChannelDef> (sf::makeChannel()); });
-
-    // FL's own instrument engines (round 142)
-    const auto& fl = flStudioAccess();
-    for (const auto& e : natives::instrumentEngines())
+    auto out = generators::entries (engine, withUnavailable);
+    for (auto& entry : out)
     {
-        const auto available = natives::available (e, fl);
-        if (available || withUnavailable)
+        if (entry.folder == 1)
         {
-            add (e.name, flEngineName (e), tr ("built-in FL engine"), 1, 1, e.kind, [kind = e.kind] { return natives::makeChannel (kind, flStudioAccess()); });
-            out.back().available = available;
+            if (const auto* native = natives::instrumentEngine (entry.kind))
+                entry.label = flEngineName (*native);
+            entry.detail = tr ("built-in FL engine");
+        }
+        else if (entry.folder != 3)
+        {
+            entry.label = tr (entry.label);
+            entry.detail = tr ("built-in");
         }
     }
-
-    // FL's VFX note processors (round 164b): channels with no sound, they play other channels / Patcher nodes
-    for (const auto kind : vfx::allKinds)
-        add (vfx::flName (kind), vfx::flName (kind), tr ("built-in"), 2, 1, InstrumentKind::vfx, [kind] {
-            ChannelDef c;
-            vfx::makeChannel (c, kind);
-            return std::optional<ChannelDef> (c);
-        });
-
-    auto types = engine.getPluginHost().getKnownPlugins().getTypes();
-    std::sort (types.begin(), types.end(), [] (const auto& a, const auto& b) { return a.name.compareIgnoreCase (b.name) < 0; });
-    for (const auto& t : types)
-        if (t.isInstrument)
-        {
-            const auto id = t.createIdentifierString().toStdString();
-            out.push_back ({ id, t.name, t.manufacturerName + " · " + t.pluginFormatName, 3, [id, name = t.name.toStdString()] {
-                                ChannelDef c;
-                                c.name = name;
-                                c.instrument = InstrumentKind::plugin;
-                                c.plugin.id = id;
-                                c.plugin.name = name;
-                                return std::optional<ChannelDef> (c);
-                            }, 1, InstrumentKind::plugin });
-        }
     return out;
 }
 
@@ -329,24 +244,79 @@ juce::File pluginDatabaseEntry (const std::string& key, bool instruments)
     return path.empty() ? juce::File() : juce::File (juce::String::fromUTF8 (path.c_str()));
 }
 
+namespace
+{
+// Round 190mf: the Plugin database as last read, kept while nothing that it was read from changed. The Channel rack's
+// "+" menu read the whole folder every time it opened more than two seconds after the last read (~200-250 ms on a PC
+// with many plugins, round 190ma). With the folder watched (the app: ui/MainComponent's folderwatch::Watcher, which
+// reads it again by itself after a change made in the file manager, and markPluginDatabaseChanged), a menu only reads
+// it again when the plugin list changed (a scan, the Plugin manager: KnownPluginList's change messages, and its size
+// for a change whose message has not arrived yet) or when it was marked changed. Unwatched: the two-second throttle.
+struct PluginListStamp final : juce::ChangeListener
+{
+    int changes = 0;
+    void changeListenerCallback (juce::ChangeBroadcaster*) override { ++changes; }
+};
+PluginListStamp& pluginListStamp()
+{
+    static PluginListStamp stamp;
+    return stamp;
+}
+bool databaseWatched = false, databaseRead = false;
+const PluginHost* readHost = nullptr;
+int readListChanges = -1, readListSize = -1;
+RefreshTimes lastTimes;
+} // namespace
+
 void markPluginDatabaseChanged()
 {
     lastDatabaseRefresh = 0; // (the next menu, picker or Browser reads the folder again, without the two-second wait)
+    databaseRead = false;
 }
+
+void setPluginDatabaseWatched (bool watched) { databaseWatched = watched; }
+
+bool pluginDatabaseCurrent (AudioEngine& engine)
+{
+    auto& host = engine.getPluginHost();
+    return databaseWatched && databaseRead && readHost == &host && readListChanges == pluginListStamp().changes
+           && readListSize == host.getKnownPlugins().getNumTypes();
+}
+
+RefreshTimes lastRefreshTimes() { return lastTimes; }
 
 void refreshPluginDatabase (AudioEngine& engine, bool force)
 {
     auto& host = engine.getPluginHost();
     if (! host.isPersistent() || databaseBusy)
         return;
+    if (! force && pluginDatabaseCurrent (engine)) // (round 190mf: nothing it was read from changed)
+        return;
     const auto now = juce::Time::getMillisecondCounter();
-    if (! force && lastDatabaseRefresh != 0 && now - lastDatabaseRefresh < 2000)
+    if (! force && ! databaseWatched && lastDatabaseRefresh != 0 && now - lastDatabaseRefresh < 2000)
         return;
     const juce::ScopedValueSetter<bool> busy (databaseBusy, true);
+    if (readHost != &host)
+    {
+        host.getKnownPlugins().addChangeListener (&pluginListStamp());
+        readHost = &host;
+    }
+    const auto changes = pluginListStamp().changes;
+    const auto size = host.getKnownPlugins().getNumTypes();
+    const auto t0 = juce::Time::getMillisecondCounterHiRes();
     plugindb::State state { host.databaseFolders(), host.pluginNames() };
-    if (plugindb::refresh (pluginDatabaseFolder().getFullPathName().toStdString(), databasePlugins (engine), state).ok)
+    const auto plugins = databasePlugins (engine);
+    const auto t1 = juce::Time::getMillisecondCounterHiRes();
+    // (Installed, the "copy from here" folder, is written on a thread of its own: round 190go)
+    const auto ok = plugindb::refresh (pluginDatabaseFolder().getFullPathName().toStdString(), plugins, state, true).ok;
+    if (ok)
         host.adoptDatabase (state.folders, state.names);
+    const auto t2 = juce::Time::getMillisecondCounterHiRes();
+    lastTimes = { t1 - t0, t2 - t1, lastTimes.reads + 1 };
     lastDatabaseRefresh = juce::Time::getMillisecondCounter();
+    databaseRead = ok;
+    readListChanges = changes;
+    readListSize = size;
 }
 
 void installPluginDatabase (AudioEngine& engine)
@@ -354,7 +324,11 @@ void installPluginDatabase (AudioEngine& engine)
     auto& host = engine.getPluginHost();
     if (! host.isPersistent())
         return;
-    refreshPluginDatabase (engine, true);
+    // (round 190go: not forced: the Browser, built just before, read the folder a moment ago; read twice in a row it
+    // cost the start-up a second pass over every entry of the user's tree)
+    if (readHost != &host) // (round 190mf: a new host: what was read for another one does not count)
+        databaseRead = false;
+    refreshPluginDatabase (engine);
     host.onDatabaseEdited = [&engine] {
         auto& h = engine.getPluginHost();
         if (databaseBusy)

@@ -35,6 +35,15 @@ struct MissingPlugin
 // The last component of a path saved on Windows or elsewhere ('\\' and '/' both separate).
 std::string pathFileName (const std::string& path);
 
+// The entry a list-box row shows, or nullptr for a row past the end of `list`. JUCE's ListBox also asks for rows below
+// the last one (ListBoxModel::paintListBoxItem: "rowNumber may be greater than the number of rows"); at a larger
+// interface size the Missing files window painted such a row and read past its list (issue #165: a crash on opening).
+template <typename T>
+const T* listRowEntry (const std::vector<T>& list, int row) noexcept
+{
+    return row >= 0 && (std::size_t) row < list.size() ? &list[(std::size_t) row] : nullptr;
+}
+
 // Adds `user` to the entry for `path` (one entry per path, case-insensitive on the separators and letters).
 void addMissingFile (std::vector<MissingFile>& list, const std::string& path, const std::string& user);
 
@@ -53,10 +62,17 @@ int relocateByName (std::vector<MissingFile>& missing, const std::vector<std::st
 
 // Lists, recursively, the files under `folder` whose names match a missing file (the search a dialog runs).
 // `listFolder(folder, onEntry)` reports each entry as (path, isFolder); `onEntry` returning false stops the walk.
-// `maxEntries` bounds the walk (0 = no bound); `cancelled` is polled between entries.
+// `maxEntries` bounds the walk (0 = no bound); `cancelled` is polled between entries. `onHit` is told each match as
+// soon as it is found (issue #159: the window shows and can apply them while a slow drive is still being walked).
 std::vector<std::string> searchFolderForMissing (const std::vector<MissingFile>& missing, const std::string& folder,
                                                  const std::function<void (const std::string&, const std::function<bool (const std::string&, bool)>&)>& listFolder,
-                                                 std::size_t maxEntries = 0, const std::function<bool()>& cancelled = {});
+                                                 std::size_t maxEntries = 0, const std::function<bool()>& cancelled = {},
+                                                 const std::function<void (const std::string&)>& onHit = {});
+
+// Picks again, from every candidate found so far, the files a running search placed (`placedBySearch[i]`: file i had no
+// place and wasn't skipped when the search began; a later, better match replaces an earlier one, as if the whole search
+// had ended). Returns how many of them have a place now.
+int relocateFromSearch (std::vector<MissingFile>& missing, const std::vector<bool>& placedBySearch, const std::vector<std::string>& candidates);
 
 // original path → found path, for the files that were found.
 std::map<std::string, std::string> relocationMap (const std::vector<MissingFile>& missing);

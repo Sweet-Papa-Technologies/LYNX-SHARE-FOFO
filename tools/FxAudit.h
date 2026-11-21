@@ -222,7 +222,7 @@ inline bool isNoSound (EffectKind k)
     {
         case EffectKind::peakController: case EffectKind::formulaController: case EffectKind::waveCandy: case EffectKind::visualizer:
         case EffectKind::xyController: case EffectKind::xyzController: case EffectKind::controlSurface: case EffectKind::bigClock:
-        case EffectKind::tuner: case EffectKind::htmlNotebook: case EffectKind::edison:
+        case EffectKind::tuner: case EffectKind::htmlNotebook:
             return true;
         default:
             return false;
@@ -239,8 +239,10 @@ inline const char* skipReason (EffectKind k)
         case EffectKind::patcher: return "a container (its nodes are audited on their own)";
         case EffectKind::hardwareInsert: return "needs an audio device (round trip through hardware)";
         case EffectKind::waveCandy: case EffectKind::visualizer: case EffectKind::bigClock: case EffectKind::htmlNotebook:
-        case EffectKind::tuner: case EffectKind::edison:
+        case EffectKind::tuner:
             return "visual only: no sound, no control output";
+        case EffectKind::edison: // (round 190cd)
+            return "a recorder / editor: its controls act on its own recording and playback, the input passes through";
         default: return nullptr;
     }
 }
@@ -465,6 +467,11 @@ inline Output run (const EffectSlot& built, const EffectSlot& played, const Prog
         fx->setSongPosition (tick);
         fx->setPlaying (true);
         fx->setHeldNotes (held.data(), (int) held.size());
+        // round 190ee: Pitcher takes its notes from a MIDI port (a MIDI Out on that port): the same chord arrives there
+        // (a held note's repeated note on changes nothing)
+        if (slot.kind == EffectKind::pitchCorrect)
+            for (const auto key : { 60, 64, 67, 71 })
+                fx->midiNote (key, 100, 0);
         if (o.sidechain)
         {
             fx->setSidechain (prog.scL.data() + at, prog.scR.data() + at);
@@ -1027,6 +1034,41 @@ inline std::vector<Hint> hintsFor (EffectKind kind)
             out.push_back (h);
             break;
         }
+        case EffectKind::pocketMultiband:
+            // (round 190cm) FLM's defaults compress nothing (thresholds at 0 dB, ratios 1:1): a band's attack and
+            // release are heard once it works
+            for (const char* band : { "Low", "Mid", "High" })
+            {
+                const auto t = std::string (band) + " threshold", r = std::string (band) + " ratio";
+                out.push_back (named (std::string ("the ") + band + " band compressing (threshold −34 dB, ratio 31:1)", { { t.c_str(), 0.3f }, { r.c_str(), 1.0f } }));
+            }
+            break;
+        case EffectKind::pocketTapeStop:
+        {
+            // (round 190cm) FLM's Tape Stop acts on an edge of Play while the song runs (spec-tapestop.md §3.2): the
+            // times, Warp and Sync shape the ramp that edge starts; held on it passes the input, held off it is silent
+            const auto play = plugui::paramIndex (kind, "Play");
+            auto stop = named ("Sync on, Play switched off while the pad plays (the stop ramp)", { { "Sync", 1.0f } });
+            stop.move = play, stop.moveTo = 0.0f;
+            auto start = named ("Play off, switched on while the pad plays (the start ramp)", { { "Play", 0.0f } });
+            start.move = play, start.moveTo = 1.0f;
+            auto startSynced = named ("Sync on and Play off, switched on while the pad plays (the start ramp)", { { "Sync", 1.0f }, { "Play", 0.0f } });
+            startSynced.move = play, startSynced.moveTo = 1.0f;
+            out.push_back (stop), out.push_back (start), out.push_back (startSynced);
+            break;
+        }
+        case EffectKind::timeprism: // (round 190ko) the freezer's retrigger modes need three switches together
+            out.push_back (named ("the freezer re-freezing every interval in beats", { { "Freezer", 1.0f }, { "Freeze", 1.0f }, { "Freeze mode", 1.0f },
+                                                                                       { "Retrigger", 1.0f }, { "Sync units", 1.0f }, { "Delay", 0.0f } }));
+            out.push_back (named ("the freezer re-freezing every interval in ms", { { "Freezer", 1.0f }, { "Freeze", 1.0f }, { "Freeze mode", 1.0f },
+                                                                                    { "Retrigger", 1.0f }, { "Sync units", 0.0f }, { "Delay", 0.0f } }));
+            out.push_back (named ("the freezer re-freezing every interval in ms, enveloped", { { "Freezer", 1.0f }, { "Freeze", 1.0f },
+                                                                                              { "Freeze mode", 1.0f }, { "Retrigger", 1.0f },
+                                                                                              { "Sync units", 0.0f }, { "Fade type", 1.0f },
+                                                                                              { "Delay", 0.0f } }));
+            out.push_back (named ("the freezer at onsets, enveloped", { { "Freezer", 1.0f }, { "Freeze", 1.0f }, { "Freeze mode", 1.0f },
+                                                                        { "Retrigger", 0.0f }, { "Fade type", 1.0f }, { "Delay", 0.0f } }));
+            break;
         default:
             break;
     }

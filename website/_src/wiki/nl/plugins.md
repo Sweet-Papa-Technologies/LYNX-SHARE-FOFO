@@ -1,5 +1,5 @@
 ---
-source: be0fc22373
+source: 1c440a7810
 ---
 ![Het onderste deel van het Pluginbeheer, met de opmerking dat elk pluginbestand in een apart proces wordt onderzocht](/assets/img/wiki/plugin-manager-scan.webp)
 
@@ -62,7 +62,7 @@ Standaard draait een plugin binnen LYNX SHARE, dus een plugin die crasht kan het
 
 Als zo'n plugin crasht of niet meer reageert, wordt hij gemute, verschijnt er een melding en blijft LYNX SHARE draaien. Met `Herladen` in die melding start de plugin opnieuw met de instellingen van de laatste save of back-up, zonder het project opnieuw te openen. De editor van de plugin opent in een eigen venster en kan niet worden vastgemaakt of vastgezet.
 
-Om dit voor één plugin te doen, gebruik je `In een apart proces draaien` of `Always run <plugin> in a separate process` in het wrappermenu van het pluginvenster. Als de editor van een plugin crasht, biedt de melding die verschijnt ook de tweede aan.
+Om dit voor één plugin te doen, gebruik je `In een apart proces draaien` of `<plugin> altijd in een apart proces draaien` in het wrappermenu van het pluginvenster. Als de editor van een plugin crasht, biedt de melding die verschijnt ook de tweede aan.
 
 Dit werkt op Windows en Linux, en sinds 0.1.25 op macOS.
 
@@ -89,6 +89,19 @@ Op Windows draaien 32-bit VST2- en VST3-plugins via een brug (`LYNX-bridge32.exe
 ## De uitgangen van een instrument naar aparte inserts sturen
 
 Een instrumentplugin met meerdere uitgangen kan elke uitgang op een eigen Mixer-insert laten spelen. Klik in het venster van de plugin op `Wrapper-instellingen` en dan op het tabblad `Verwerking`. Onder `Verbindingen` heeft elke uitgang een lampje dat hem aan of uit zet en een getal: op hoeveel inserts na de eigen insert van het kanaal hij speelt. `Uitgangen automatisch toewijzen` geeft elke uitgang de volgende insert, en met `Reset` ga je terug naar de standaardwaarden.
+
+## De eigen plugins van FL Studio
+
+De eigen plugins van FL Studio, zoals Sytrus, Harmor en Patcher, werken alleen binnen FL Studio. Om ze in LYNX SHARE te gebruiken, gebruik je de pluginversie van FL Studio die erbij zit. Op Windows wordt die geïnstalleerd als `FL Studio VSTi` en `FL Studio VSTi (Multi)` in `C:\Program Files\Common Files\VST2`. Op macOS is het een Audio Unit.
+
+1. Scan naar plugins. Beide verschijnen als instrumenten met de leverancier Image-Line. De eerste scan kan even duren, omdat heel FL Studio binnen de plugin start.
+2. Voeg `FL Studio VSTi` toe aan een kanaal en open zijn venster. Klik op het FL Studio-logo om het eigen venster van FL Studio te openen, met zijn Channel Rack, Mixer en browser.
+3. Voeg in de Channel Rack van FL Studio een instrument toe. Een nieuwe FL Studio-plugin begint met één lege Sampler en maakt geen geluid tot je er een toevoegt. Noten van LYNX SHARE spelen het kanaal dat in de Channel Rack van FL Studio is geselecteerd.
+4. De eigen patterns van FL Studio spelen mee als LYNX SHARE speelt, op het tempo van LYNX SHARE.
+
+Wat je binnen FL Studio bouwt, wordt met het LYNX SHARE-project opgeslagen. `FL Studio VSTi (Multi)` heeft 16 stereo-uitgangen, die op aparte inserts kunnen spelen (zie de sectie hierboven). Je FL Studio-licentie bepaalt welke FL-plugins erin werken. LYNX SHARE laadt de pluginbestanden van FL Studio niet zelf.
+
+Als de FL Studio-plugin als `Laden mislukt` wordt vermeld, klik dan met de rechtermuisknop erop in `Opties › Pluginbeheer...` en kies `Opnieuw proberen (dit bestand nu scannen)`.
 
 ## De map Plugin database
 

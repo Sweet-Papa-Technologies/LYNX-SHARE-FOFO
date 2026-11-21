@@ -1,4 +1,5 @@
 #include "core/SimpleTracks.h"
+#include "core/SimplePads.h"
 
 #include <algorithm>
 #include <cctype>
@@ -6,8 +7,11 @@
 #include <cstdlib>
 
 #include "core/AutoWarp.h"
+#include "core/EffectPresets.h"
+#include "core/Effects.h"
 #include "core/PlaylistOps.h"
 #include "core/PlaylistTrackOps.h"
+#include "core/ProjectKey.h"
 
 namespace lynx::simpletracks
 {
@@ -67,6 +71,10 @@ Result addAudio (Song& song, int track, const Request& request)
     {
         m.inputChannel = std::max (-1, request.input);
         m.inputStereo = request.inputStereo;
+        // a voice / guitar / bass track records its input alone (FL's answer "Yes" to "switch to External input
+        // only", issue #152): with FL's default Post EQ the take also held whatever else played through the insert
+        if (m.inputChannel >= 0)
+            m.recordSource = RecordSource::externalInput;
     }
     r.track = track;
     r.insert = insert;
@@ -88,15 +96,23 @@ Result addAudio (Song& song, int track, const Request& request)
             c.sampler.stretchBeats = request.audioBeats;
             c.sampler.keepPitch = true;
         }
+        if (request.audioKeyRoot >= 0) // the file's key (round 190ds)
+        {
+            c.sampler.loopKeyRoot = request.audioKeyRoot % 12;
+            c.sampler.loopKeyMinor = request.audioKeyMinor;
+            c.sampler.loopKeySource = (std::uint8_t) std::clamp (request.audioKeySource, 0, 3);
+        }
         song.channels.push_back (std::move (c));
         r.channels = { (int) song.channels.size() - 1 };
         Clip clip;
+        clip.followKey = request.followKey;
         clip.kind = ClipKind::audio;
         clip.channel = r.channels[0];
         clip.track = track;
         clip.start = std::max<std::int64_t> (0, request.start);
         clip.length = request.audioBeats > 0.0f ? std::max<std::int64_t> (1, std::llround ((double) request.audioBeats * ppq)) : request.audioLength;
         song.playlist.push_back (clip);
+        projectkey::retuneClip (song.playlist.back(), song, projectkey::get (song)); // (moved to the project key)
         song.mode = PlayMode::song;
     }
     return r;
@@ -105,9 +121,13 @@ Result addAudio (Song& song, int track, const Request& request)
 // The notes of `request.pattern` on `channel`, placed at the song's start on `track` (an Instrument made from a MIDI track)
 void placeInstrumentNotes (Song& song, int track, int channel, const std::string& name, std::uint32_t colour, Result& r, const Request& request)
 {
-    if (! request.pattern)
+    if (! request.pattern && request.emptyBars <= 0)
         return;
-    auto pattern = *request.pattern;
+    Pattern pattern;
+    if (request.pattern)
+        pattern = *request.pattern;
+    else
+        pattern.lengthTicks = (std::int64_t) request.emptyBars * song.barTicks();
     pattern.name = name;
     pattern.colour = colour;
     for (auto& n : pattern.notes)
@@ -120,7 +140,7 @@ void placeInstrumentNotes (Song& song, int track, int channel, const std::string
     clip.pattern = r.pattern;
     clip.track = track;
     clip.start = std::max<std::int64_t> (0, request.start);
-    clip.length = song.patterns[(std::size_t) r.pattern].effectiveLength (song.beatsPerBar);
+    clip.length = song.patterns[(std::size_t) r.pattern].effectiveLength (song.meter());
     song.playlist.push_back (clip);
     song.mode = PlayMode::song;
 }
@@ -179,6 +199,8 @@ Result addDrums (Song& song, int track, const Request& request)
         channel.mixerTrack = insert;
         channel.group = r.group;
         channel.colour = colour;
+        if (request.kind == Kind::pads)
+            simplepads::apply (channel, 0); // (its choke group becomes this insert's own)
         song.channels.push_back (std::move (channel));
         r.channels.push_back ((int) song.channels.size() - 1);
     }
@@ -213,10 +235,10 @@ Result addDrums (Song& song, int track, const Request& request)
     clip.pattern = r.pattern;
     clip.track = track;
     clip.start = 0;
-    clip.length = song.patterns[(std::size_t) r.pattern].effectiveLength (song.beatsPerBar);
+    clip.length = song.patterns[(std::size_t) r.pattern].effectiveLength (song.meter());
     song.playlist.push_back (clip);
     // the same pattern again and again until `fillBars` bars are covered (whole clips: a 3-bar pattern covers 6)
-    const auto wanted = (std::int64_t) std::clamp (request.fillBars, 0, 64) * song.beatsPerBar * ppq;
+    const auto wanted = (std::int64_t) std::clamp (request.fillBars, 0, 64) * song.barTicks();
     for (auto at = clip.length; clip.length > 0 && at < wanted; at += clip.length)
     {
         clip.start = at;
@@ -247,7 +269,8 @@ const char* defaultName (Kind kind) noexcept
         case Kind::voice: return "Voice";
         case Kind::instrument: return "Instrument";
         case Kind::drums: return "Drums";
-        case Kind::sampler: return "Sampler";
+        case Kind::sampler:
+        case Kind::pads: return "Sampler";
         case Kind::guitar: return "Guitar";
         case Kind::bass: return "Bass";
         case Kind::audio: break;
@@ -263,12 +286,30 @@ std::uint32_t defaultColour (Kind kind) noexcept
         case Kind::voice: return 0xFFD0645Au;
         case Kind::instrument: return 0xFF4FA3A5u;
         case Kind::drums: return 0xFFD39B3Eu;
-        case Kind::sampler: return 0xFF8E6CC9u;
+        case Kind::sampler:
+        case Kind::pads: return 0xFF8E6CC9u;
         case Kind::guitar: return 0xFF5C9E5Au;
         case Kind::bass: return 0xFF4C7FC2u;
         case Kind::audio: break;
     }
     return 0xFF9A8F7Fu;
+}
+
+trackicons::Icon iconOf (Kind kind) noexcept
+{
+    using I = trackicons::Icon;
+    switch (kind)
+    {
+        case Kind::voice: return I::microphone;
+        case Kind::instrument: return I::piano;
+        case Kind::drums: return I::drumMachine;
+        case Kind::sampler: return I::sample;
+        case Kind::pads: return I::steps;
+        case Kind::guitar: return I::electricGuitar;
+        case Kind::bass: return I::bass;
+        case Kind::audio: break;
+    }
+    return I::audio;
 }
 
 bool isAudioKind (Kind kind) noexcept
@@ -294,6 +335,17 @@ int nextEmptyTrack (const Song& song)
         if (! used[(std::size_t) t])
             return t;
     return -1;
+}
+
+int rowsShown (const Song& song, int rows)
+{
+    int last = -1;
+    for (const auto& c : song.playlist)
+        last = std::max (last, c.track);
+    for (int t = (int) song.playlistTracks.size(); --t > last;)
+        if (song.playlistTracks[(std::size_t) t].mode != PlaylistTrackMode::unassigned || ! song.playlistTracks[(std::size_t) t].name.empty())
+            last = t;
+    return std::clamp (std::max (last, nextEmptyTrack (song)) + 1, 1, std::max (1, rows));
 }
 
 double tempoInName (const std::string& name, bool* explicitBpm)
@@ -330,7 +382,7 @@ double tempoInName (const std::string& name, bool* explicitBpm)
     return 0.0;
 }
 
-float loopBeats (const std::string& name, double seconds, float acidBeats, int beatsPerBar) noexcept
+float loopBeats (const std::string& name, double seconds, float acidBeats, Meter meter) noexcept
 {
     if (! (seconds > 0.0) || seconds > 70.0)
         return 0.0f;
@@ -341,7 +393,7 @@ float loopBeats (const std::string& name, double seconds, float acidBeats, int b
     if (! (bpm > 0.0))
         return 0.0f;
     const auto beats = seconds * bpm / 60.0;
-    const auto bar = (double) std::max (1, beatsPerBar);
+    const auto bar = (double) meter.bar() / ppq; // (in quarter notes)
     if (const auto bars = std::round (beats / bar); bars >= 1.0 && std::abs (beats - bars * bar) <= 0.25)
         return (float) (bars * bar);
     if (const auto whole = std::round (beats); whole >= 1.0 && whole < bar && std::abs (beats - whole) <= 0.08)
@@ -362,7 +414,8 @@ Result addTrack (Song& song, const Request& request)
     {
         case Kind::instrument:
         case Kind::sampler: r = addInstrument (work, track, request); break;
-        case Kind::drums: r = addDrums (work, track, request); break;
+        case Kind::drums:
+        case Kind::pads: r = addDrums (work, track, request); break;
         case Kind::voice:
         case Kind::guitar:
         case Kind::bass:
@@ -390,7 +443,7 @@ std::string rename (Song& song, int track, const std::string& name)
         song.mixer[(std::size_t) insert].name = unique;
     if ((*kind == Kind::instrument || *kind == Kind::sampler) && validChannel (song, t.channel))
         song.channels[(std::size_t) t.channel].name = unique;
-    if (*kind == Kind::drums && ! old.empty())
+    if ((*kind == Kind::drums || *kind == Kind::pads) && ! old.empty())
     {
         // the kit's group and the track's pattern carry the track's name
         for (const auto& c : song.channels)
@@ -401,6 +454,11 @@ std::string rename (Song& song, int track, const std::string& name)
             if (clip.track == track && clip.kind == ClipKind::pattern && clip.pattern >= 0 && clip.pattern < (int) song.patterns.size()
                 && song.patterns[(std::size_t) clip.pattern].name == old)
                 song.patterns[(std::size_t) clip.pattern].name = unique;
+        // round 190lr: the Drum Machine's patterns B … H ("<track> B", core/SimpleSteps.h) keep their letter
+        for (auto& p : song.patterns)
+            if (p.name.size() == old.size() + 2 && p.name.compare (0, old.size(), old) == 0 && p.name[old.size()] == ' '
+                && p.name.back() >= 'B' && p.name.back() <= 'H')
+                p.name = unique + p.name.substr (old.size());
     }
     return unique;
 }
@@ -417,7 +475,7 @@ void recolour (Song& song, int track, std::uint32_t colour)
         song.mixer[(std::size_t) insert].colour = colour;
     if ((*kind == Kind::instrument || *kind == Kind::sampler) && validChannel (song, t.channel))
         song.channels[(std::size_t) t.channel].colour = colour;
-    if (*kind == Kind::drums)
+    if (*kind == Kind::drums || *kind == Kind::pads)
         for (auto& c : song.channels)
             if (c.mixerTrack == insert && c.instrument != InstrumentKind::audioClip)
                 c.colour = colour;
@@ -431,8 +489,181 @@ std::optional<Kind> kindOf (const Song& song, int track)
     if (t.mode == PlaylistTrackMode::instrument && validChannel (song, t.channel))
         return song.channels[(std::size_t) t.channel].instrument == InstrumentKind::sampler ? Kind::sampler : Kind::instrument;
     if (t.mode == PlaylistTrackMode::audio && validInsert (song, t.mixerTrack))
-        return insertHasInstruments (song, t.mixerTrack) ? Kind::drums : Kind::audio;
+    {
+        if (! insertHasInstruments (song, t.mixerTrack))
+            return Kind::audio;
+        // round 190fo: a Sampler track's pads are marked on their channels
+        const auto pads = std::any_of (song.channels.begin(), song.channels.end(), [insert = t.mixerTrack] (const ChannelDef& c) {
+            return c.mixerTrack == insert && c.simplePad.index >= 0;
+        });
+        return pads ? Kind::pads : Kind::drums;
+    }
     return std::nullopt;
+}
+
+int resetLevels (Song& song)
+{
+    int changed = 0;
+    for (int t = 0; t < (int) song.playlistTracks.size(); ++t)
+    {
+        if (! kindOf (song, t))
+            continue;
+        const auto insert = insertOf (song, t);
+        if (! validInsert (song, insert))
+            continue;
+        auto& m = song.mixer[(std::size_t) insert];
+        if (m.volume != unityFader || m.pan != 0.0f)
+        {
+            m.volume = unityFader;
+            m.pan = 0.0f;
+            ++changed;
+        }
+    }
+    return changed;
+}
+
+int sharedReverb (const Song& song)
+{
+    for (int i = 1; i < (int) song.mixer.size(); ++i)
+        if (const auto& m = song.mixer[(std::size_t) i]; m.name == "Reverb" && ! m.effects.empty() && m.effects.front().kind == EffectKind::atrium)
+            return i;
+    return -1;
+}
+
+int ensureSharedReverb (Song& song)
+{
+    if (const auto have = sharedReverb (song); have >= 0)
+        return have;
+    const auto insert = trackmodes::freeMixerTrack (song);
+    if (insert <= 0 || insert >= (int) song.mixer.size())
+        return -1;
+    auto& m = song.mixer[(std::size_t) insert];
+    m.name = "Reverb";
+    m.colour = 0xFF5B7FA6u;
+    m.inputChannel = -1;
+    auto fx = makeEffectSlot (EffectKind::atrium);
+    // a return: only the reverb (Mix fully wet), a medium room, the lows kept out of it
+    for (const auto& [name, value] : { std::pair { "Mix", 1.0f }, { "Decay", 0.44f }, { "Low cut", 0.2f } })
+        if (const auto p = presets::paramByName (EffectKind::atrium, name); p >= 0 && p < maxEffectParams)
+            fx.params[(std::size_t) p] = value;
+    m.effects.push_back (std::move (fx));
+    return insert;
+}
+
+float reverbSend (const Song& song, int insert)
+{
+    const auto reverb = sharedReverb (song);
+    if (reverb < 0 || insert <= 0 || insert >= (int) song.mixer.size() || insert == reverb)
+        return 0.0f;
+    for (const auto& s : song.mixer[(std::size_t) insert].sends)
+        if (s.target == reverb)
+            return s.level;
+    return 0.0f;
+}
+
+bool setReverbSend (Song& song, int insert, float level)
+{
+    if (insert <= 0 || insert >= (int) song.mixer.size())
+        return false;
+    level = std::clamp (level, 0.0f, 1.0f);
+    const auto reverb = level > 0.0f ? ensureSharedReverb (song) : sharedReverb (song);
+    if (reverb < 0 || reverb == insert)
+        return level <= 0.0f;
+    auto& sends = song.mixer[(std::size_t) insert].sends;
+    const auto at = std::find_if (sends.begin(), sends.end(), [reverb] (const MixerSend& s) { return s.target == reverb; });
+    if (level <= 0.0f)
+    {
+        if (at != sends.end())
+            sends.erase (at);
+        return true;
+    }
+    if (at != sends.end())
+        at->level = level;
+    else
+        sends.push_back ({ reverb, level, false });
+    return true;
+}
+
+std::string stemTrackName (const std::string& stem)
+{
+    std::size_t i = 0;
+    while (i < stem.size() && i < 3 && std::isdigit ((unsigned char) stem[i]))
+        ++i;
+    if (i == 0 || i >= stem.size() || (stem[i] != '_' && stem[i] != ' ' && stem[i] != '-'))
+        return stem;
+    auto j = i;
+    while (j < stem.size() && (stem[j] == '_' || stem[j] == ' ' || stem[j] == '-'))
+        ++j;
+    return j < stem.size() ? stem.substr (j) : stem;
+}
+
+std::vector<FolderItem> folderPlan (std::vector<std::string> paths)
+{
+    const auto lower = [] (std::string s) {
+        for (auto& c : s)
+            c = (char) std::tolower ((unsigned char) c);
+        return s;
+    };
+    const auto fileName = [] (const std::string& p) { const auto at = p.find_last_of ('/'); return at == std::string::npos ? p : p.substr (at + 1); };
+    const auto stemOf = [] (const std::string& f) { const auto dot = f.find_last_of ('.'); return dot == std::string::npos ? f : f.substr (0, dot); };
+    const auto extOf = [&lower] (const std::string& f) { const auto dot = f.find_last_of ('.'); return dot == std::string::npos ? std::string() : lower (f.substr (dot + 1)); };
+    // natural order of the file names (01 < 2 < 10), then the path
+    const auto naturalLess = [&lower, &fileName] (const std::string& a, const std::string& b) {
+        const auto x = lower (fileName (a)), y = lower (fileName (b));
+        std::size_t i = 0, j = 0;
+        while (i < x.size() && j < y.size())
+        {
+            if (std::isdigit ((unsigned char) x[i]) && std::isdigit ((unsigned char) y[j]))
+            {
+                std::size_t ei = i, ej = j;
+                while (ei < x.size() && std::isdigit ((unsigned char) x[ei]))
+                    ++ei;
+                while (ej < y.size() && std::isdigit ((unsigned char) y[ej]))
+                    ++ej;
+                const auto nx = std::strtoull (x.substr (i, ei - i).c_str(), nullptr, 10), ny = std::strtoull (y.substr (j, ej - j).c_str(), nullptr, 10);
+                if (nx != ny)
+                    return nx < ny;
+                i = ei, j = ej;
+                continue;
+            }
+            if (x[i] != y[j])
+                return x[i] < y[j];
+            ++i, ++j;
+        }
+        return x.size() - i < y.size() - j || (x.size() - i == y.size() - j && a < b);
+    };
+    std::sort (paths.begin(), paths.end(), naturalLess);
+    static const std::vector<std::string> audioExt { "wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a", "wv" };
+    std::vector<FolderItem> out;
+    std::vector<std::string> audioNames;
+    for (const auto& p : paths)
+    {
+        const auto file = fileName (p);
+        const auto ext = extOf (file);
+        if (file.empty() || file[0] == '.')
+            continue;
+        const auto midi = ext == "mid" || ext == "midi";
+        if (! midi && std::find (audioExt.begin(), audioExt.end(), ext) == audioExt.end())
+            continue;
+        const auto stem = stemOf (file);
+        if (midi && lower (stem).find ("(all tracks)") != std::string::npos)
+            continue;
+        if (! midi && lower (stem).size() >= 9 && lower (stem).rfind ("- mixdown") == lower (stem).size() - 9)
+            continue; // (LYNX's export puts the whole song beside the stems)
+        FolderItem item;
+        item.path = p;
+        item.name = stemTrackName (stem);
+        item.midi = midi;
+        if (! midi)
+            audioNames.push_back (lower (item.name));
+        out.push_back (std::move (item));
+    }
+    for (auto& item : out)
+        if (item.midi && std::find (audioNames.begin(), audioNames.end(), lower (item.name)) != audioNames.end())
+            item.muted = true;
+    // audio first, then MIDI, each in name order (the stems are the song; the notes come after them)
+    std::stable_partition (out.begin(), out.end(), [] (const FolderItem& i) { return ! i.midi; });
+    return out;
 }
 
 bool isEmptySong (const Song& song)
@@ -448,6 +679,47 @@ bool isEmptySong (const Song& song)
         if (t.mode != PlaylistTrackMode::unassigned || ! t.name.empty())
             return false;
     return true;
+}
+
+int patternOf (const Song& song, int track)
+{
+    const auto kind = kindOf (song, track);
+    if (kind != Kind::instrument && kind != Kind::sampler)
+        return -1;
+    const Clip* first = nullptr;
+    for (const auto& c : song.playlist)
+        if (c.kind == ClipKind::pattern && c.track == track && c.pattern >= 0 && c.pattern < (int) song.patterns.size()
+            && (first == nullptr || c.start < first->start))
+            first = &c;
+    return first != nullptr ? first->pattern : -1;
+}
+
+int ensurePattern (Song& song, int track, int bars, bool* made)
+{
+    if (made != nullptr)
+        *made = false;
+    if (const auto p = patternOf (song, track); p >= 0)
+        return p;
+    const auto kind = kindOf (song, track);
+    if (kind != Kind::instrument && kind != Kind::sampler)
+        return -1;
+    const auto& t = song.playlistTracks[(std::size_t) track];
+    Pattern pattern;
+    pattern.name = ! t.name.empty() ? t.name : song.channels[(std::size_t) t.channel].name;
+    pattern.colour = song.channels[(std::size_t) t.channel].colour;
+    pattern.lengthTicks = (std::int64_t) std::max (1, bars) * song.barTicks();
+    song.patterns.push_back (std::move (pattern));
+    Clip clip;
+    clip.kind = ClipKind::pattern;
+    clip.pattern = (int) song.patterns.size() - 1;
+    clip.track = track;
+    clip.start = 0;
+    clip.length = song.patterns.back().effectiveLength (song.meter());
+    song.playlist.push_back (clip);
+    song.mode = PlayMode::song;
+    if (made != nullptr)
+        *made = true;
+    return clip.pattern;
 }
 
 int insertOf (const Song& song, int track)

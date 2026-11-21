@@ -15,6 +15,7 @@
 // Threads: the UI posts commands into Runtime::commands; the audio thread applies them at the start of a block, never
 // allocates, and publishes what plays per track (Runtime::tracks).
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bitset>
@@ -40,6 +41,14 @@ constexpr std::size_t slotKeyBase = 900000;
 ClipGrid& ensureGrid (Song& song);
 // The clip in (track, scene), or nullptr.
 const Clip* clipAt (const ClipGrid& grid, int track, int scene) noexcept;
+// Round 190hr (Live's Start marker inside the loop, detail-016): how far into its loop a launch of a clip `length` ticks
+// long starts — the slot's startMarker with Loop on (kept inside the loop), else 0.
+inline double startLead (const ClipGridSlot& slot, std::int64_t length) noexcept
+{
+    if (! slot.loop || slot.startMarker <= 0 || length <= 1)
+        return 0.0;
+    return (double) std::min<std::int64_t> (slot.startMarker, length - 1);
+}
 // Puts a clip in a slot, replacing what is there; its settings start at their defaults. `clip` keeps what it plays
 // (kind, source, length, offset, gain…); pattern and audio clips only. Returns the slot's id, −1 when it cannot be placed.
 int setClip (Song& song, int track, int scene, Clip clip);
@@ -55,7 +64,7 @@ int insertScene (Song& song, int at);
 bool removeScene (Song& song, int scene); // with its clips (a grid keeps at least one scene)
 
 // Ticks of a launch quantisation (0 = none; `global` is resolved by the caller).
-double quantTicks (LaunchQuant quant, int beatsPerBar) noexcept;
+double quantTicks (LaunchQuant quant, Meter meter) noexcept; // (bars of the meter; note values are absolute, as Live's)
 
 // A row's clips form groups: runs of filled slots in a column, as follow actions see them. Writes the rows of the group
 // holding `scene` on `track` to out[] (capacity rows), in order; returns how many, 0 for an empty slot.
@@ -67,6 +76,11 @@ struct FollowOutcome
     int scene = -1; // the row to launch, −1 = none
 };
 FollowOutcome followTarget (const ClipGrid& grid, int track, int scene, FollowKind kind, int jump, std::uint32_t random) noexcept;
+// Round 190lr (DL-14): what a scene's follow action leads to from scene `scene` among the grid's scenes (Live: the
+// scenes play the part of a column's clips; Next after the last scene is the first, as in a clip group).
+FollowOutcome sceneFollowTarget (const ClipGrid& grid, int scene, FollowKind kind, int jump, std::uint32_t random) noexcept;
+// Whether scene `scene` has a follow action that will act (its own switch and the grid's "Enable Follow Actions")
+bool sceneFollows (const ClipGrid& grid, int scene) noexcept;
 
 // A pass the recorder turns into a Playlist clip: the clip in `slot`, played from song tick `songTick` for `length`
 // ticks, starting `offset` ticks into the clip (its own offset not included).
@@ -86,10 +100,33 @@ GridIndex makeIndex (const ClipGrid& grid);
 
 struct Command
 {
-    enum class Type : std::uint8_t { launch, release, launchScene, stopTrack, stopAll, backToArrangement, reset };
+    // record / recordEnd (round 190bv, core/SessionOps.h): a recording into the empty slot (track, scene) starts on the
+    // next point of the global quantisation — what plays on the track ends there and the track is taken — and
+    // recordEnd ends it on the next one (`scene` 1: the UI then launches the new clip; 0: the track stops).
+    // record on a track that already records into another slot (round 190cy, as Live 12.4.16 does): that recording
+    // ends on the next point and plays on in a loop, and the new slot records from there; a record the engine cannot
+    // take is told back as a cancelled take (until == from).
+    // `at` > 0 on record: a fixed length in ticks, the recording ends by itself. `at` >= 0 on launch: the clip's
+    // position 0 is at that point of the clock (the end of its recording), whenever the command arrives; the launch
+    // waits for the clip to exist, since the song that holds it is published separately.
+    // (round 190kc: cancelLaunch = Live's "Cancel Launch" of the Relative Session Mapping Strip: the launches still
+    // waiting for their grid point are dropped, what plays goes on)
+    // (round 190lr, DL-38: trackBackToArrangement = Live's per-track Back to Arrangement: `track` only gives its Playlist
+    // clips back, at once)
+    enum class Type : std::uint8_t { launch, release, launchScene, stopTrack, stopAll, backToArrangement, reset, record, recordEnd, cancelLaunch, trackBackToArrangement };
     Type type = Type::launch;
     int track = 0;
     int scene = 0;
+    double at = -1.0;
+};
+
+// A slot recording whose end is known (audio → UI): [from, until) on the clock; until == from: it was cancelled before
+// it began. `thenPlay`: the UI launches the new clip at `until`.
+struct RecordedTake
+{
+    int track = 0, scene = 0;
+    double from = 0.0, until = 0.0;
+    bool thenPlay = false;
 };
 
 static_assert (maxTracks == scheduleMaskTracks);
@@ -143,6 +180,11 @@ public:
 
     // test access: the slot playing on a track (−1 = none)
     int playingOn (int track) const noexcept;
+    // test access: the scene a track records into (−1 = none) and its range on the clock
+    int recordingOn (int track) const noexcept;
+    // test access (round 190lr): the scene whose follow action waits, and when it acts on the clock (−1 / infinity: none)
+    int sceneFollowScene() const noexcept { return followScene; }
+    double sceneFollowTime() const noexcept { return followSceneAt; }
 
 private:
     static constexpr double never = std::numeric_limits<double>::infinity();
@@ -162,6 +204,18 @@ private:
         Play current, previous, next;
         int heldSlot = -1;        // gate / repeat: the slot whose trigger is down
         double repeatEvery = 0.0; // repeat: while held, the clip starts over at this rate
+        // recording into a slot (round 190bv): the scene, and [recFrom, recUntil) on the clock (never: still open)
+        int recScene = -1;
+        double recFrom = never, recUntil = never;
+        bool recStarted = false, recThenPlay = false, recTold = false;
+        // another slot's record button pressed while recording (round 190cy, Live 12.4.16): the slot that records next,
+        // from the end of this recording (with its fixed length in ticks, 0: open)
+        int recNextScene = -1;
+        double recNextLength = 0.0;
+        // a launch that waits for its clip to exist (the recorded clip arrives with the next published song)
+        int wantScene = -1;
+        double wantAnchor = 0.0;
+        int wantBlocks = 0;
     };
     struct Takeover
     {
@@ -182,12 +236,24 @@ private:
     TrackState* stateOf (int track, bool create) noexcept;
     void launch (const Song& song, const ClipGrid& grid, const GridIndex& index, TrackState& t, int slot, double now) noexcept;
     void stopTrack (const Song& song, const ClipGrid& grid, TrackState& t, double now) noexcept;
+    void endRecording (const Song& song, const ClipGrid& grid, TrackState& t, double now, bool thenPlay, Runtime* runtime) noexcept;
+    void tellTake (TrackState& t, Runtime* runtime) noexcept;
+    void dropNextRecording (TrackState& t, Runtime* runtime) noexcept;
+    static void tellCancelled (Runtime* runtime, int track, int scene) noexcept;
+    Runtime* commandRuntime = nullptr; // (while apply() runs)
     void apply (const Song& song, const ClipGrid& grid, const GridIndex& index, const Command& c, double now) noexcept;
     void addCut (const ClipGrid& grid, const GridIndex& index, const Play& p, double at) noexcept;
     void scheduleFollow (const ClipGrid& grid, const GridIndex& index, Play& p) noexcept;
     void follow (const Song& song, const ClipGrid& grid, const GridIndex& index, TrackState& t, double at) noexcept;
     void recordPartial (const ClipGrid& grid, const GridIndex& index, const Play& p, double at, Runtime* runtime) noexcept;
     std::uint32_t nextRandom() noexcept;
+    // round 190lr (DL-14): the launched scene's follow action, and launching a scene's clips at once (a follow action
+    // waits for each clip's own quantisation, not the global one)
+    void launchScene (const Song& song, const ClipGrid& grid, const GridIndex& index, int scene, double now, bool byFollow) noexcept;
+    void sceneFollow (const Song& song, const ClipGrid& grid, const GridIndex& index, double at) noexcept;
+    int followScene = -1;
+    double followSceneAt = never;
+    bool followLaunch = false;
     std::uint32_t rng = 0x9E3779B9u;
     double lastEnd = 0.0;
 };
@@ -209,13 +275,23 @@ public:
         std::atomic<float> progress { 0.0f };
         std::atomic<bool> stopping { false }; // a stop waits for its grid point
         std::atomic<bool> taken { false }; // its Playlist clips are silent until "back to arrangement"
+        // recording into a slot (round 190bv): the scene being recorded (−1 = none), the one waiting for its start, and
+        // while a clip plays: where its position 0 is on the clock (overdub needs it)
+        std::atomic<int> recording { -1 }, recordPending { -1 };
+        std::atomic<double> recordFrom { 0.0 };
+        std::atomic<double> anchor { 0.0 };
     };
     std::array<TrackView, maxTracks> tracks;
     std::atomic<bool> anyPlaying { false };
+    std::atomic<bool> running { false }; // the clock runs (the song plays): set by playBlock, cleared when the transport stops
 
     // UI → audio: record the passes; audio → UI: the passes that ended
     std::atomic<bool> recording { false };
     SpscQueue<RecordedPass, 1024> recorded;
+    SpscQueue<RecordedTake, 256> takes; // audio → UI: slot recordings whose end is known (round 190bv)
+    // audio → UI: the clock at the start of the last block and what must be added to a song position to get the clock
+    // (constant between wraps of the song; the recorder places played notes with it)
+    std::atomic<double> clockNow { 0.0 }, clockMinusSong { 0.0 };
 
     Player player;
     double clock = 0.0; // the steady clock (ticks): the transport's position when playback started, never wrapping

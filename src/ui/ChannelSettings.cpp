@@ -2,7 +2,15 @@
 #include "ui/WindowOwner.h"
 #include "core/NoteNames.h"
 #include "ui/ChannelSettings.h"
+#include "core/EditorScale.h"
+#include "core/FlControlMenus.h"
+#include "core/FlmDwSampler.h"
+#include "core/SamplerPage.h"
+#include "ui/NewtoneEditor.h"
+#include "ui/EditorTools.h"
 #include "ui/FileChoosers.h"
+#include "ui/Icons.h"
+#include "ui/WrapperMenu.h"
 #include "ui/LayerEditor.h"
 #include "ui/DanceView.h"
 #include "ui/Controllers164.h"
@@ -13,6 +21,9 @@
 #include "core/MixerOps.h"
 #include "core/ClipOps.h"
 #include "core/TempoDetect.h"
+#include "ui/AudioClipboard.h"
+#include "ui/AudioEditor.h"
+#include "ui/TempoDetectionDialog.h"
 
 #include <cstring>
 #include <functional>
@@ -38,6 +49,7 @@
 #include "core/PoiZone.h"
 #include "core/LynxBanks.h"
 #include "core/ModelParams.h"
+#include "core/SynthParams.h"
 #include "core/BassDrum.h"
 #include "core/FruitKick.h"
 #include "core/Toxic.h"
@@ -54,6 +66,8 @@
 #include "core/RackOps.h"
 #include "core/NativeEngines.h"
 #include "core/PresetCycle.h"
+#include "core/GeneratorPresets.h"
+#include "ui/GeneratorPresetMenu.h"
 #include "ui/ControllerEditors.h"
 #include "ui/HintBar.h"
 #include "ui/ValueControl.h"
@@ -65,11 +79,15 @@
 #include "ui/VfxEditors.h"
 #include "ui/VideoPlayerView.h"
 #include "ui/WaveTravellerEditor.h"
+#include "ui/DirectWaveEditor.h"
 #include "ui/FpcEditor.h"
+#include "ui/TetraEditor.h"
+#include "ui/HelixEditor.h"
 #include "ui/FruitySlicerEditor.h"
 #include "ui/FlVoicePanel.h"
 #include "core/FruitySlicer.h"
 #include "ui/SlicexEditor.h"
+#include "platform/FileTypes.h"
 #include "ui/BrowserComponent.h"
 #include "engine/SampleLibrary.h"
 #include "core/SampleFiles.h"
@@ -415,7 +433,11 @@ private:
 
         // only its own window: as a tab of the channel's window it left that window titled "Modulation - ..." while the
         // Sampler page showed (issue #12)
-        if (auto* w = findParentComponentOfClass<juce::DocumentWindow>(); w != nullptr && w->getContentComponent() == this)
+        // (round 190he: the window's content is the scaled holder around this page)
+        if (auto* w = findParentComponentOfClass<juce::DocumentWindow>();
+            w != nullptr && (w->getContentComponent() == this
+                             || (getParentComponent() == w->getContentComponent() && getParentComponent() != nullptr
+                                 && (bool) getParentComponent()->getProperties().getWithDefault ("lynxScaledContent", false))))
             w->setName (tr ("Modulation - {0}", { juce::String::fromUTF8 (c->name.c_str()) }));
     }
 
@@ -489,6 +511,7 @@ class ModelPanel final : public juce::Component,
                          public juce::TooltipClient,
                          public juce::DragAndDropTarget,
                          public juce::FileDragAndDropTarget,
+                         private juce::ChangeListener,
                          private juce::Timer
 {
 public:
@@ -529,6 +552,7 @@ public:
         drumaxx = def.instrument == InstrumentKind::drumaxx;
         slayer = def.instrument == InstrumentKind::slayer;
         fruityDance = def.instrument == InstrumentKind::fruitydance;
+        pocketSuperSaw = def.instrument == InstrumentKind::pocketSuperSaw; // round 190by
         // round 168q: the engines that run FL's own files say so when this computer lacks them
         engineFilesMissing = ((kepler || keplerExo) && ! keplerDllUsable (def.samplePath))
                           || (transistorBass && ! transistorBassIsFlm (def) && ! transistorBassDllUsable (def.samplePath)) // (FLM's build needs no file)
@@ -1191,16 +1215,129 @@ public:
             updateConditional();
             // FL's size × 1.25, at most about 1200 × 760 (big pages such as Harmor's fit a laptop screen)
             const auto f = juce::jmin (layoutScale, 1200.0f / (float) layout->width, 720.0f / (float) layout->height);
-            setSize ((int) std::ceil (f * (float) layout->width) + 16, (int) std::ceil (f * (float) layout->height) + layoutTop + 8);
+            setSize ((int) std::ceil (f * (float) layout->width) + 16, (int) std::ceil (f * (float) layout->height) + layoutTop() + 8);
         }
+        // issue #152 (round 190he): the knobs follow the channel's state (a MIDI link, Init song values, undo) and play
+        // their automation, as FL's editors do; the timer also follows Transistor Bass's program (round 169g2)
+        rememberState();
+        engine.addChangeListener (this);
+        if (ref.index >= 0 && (! modelKnobs.empty() || ! partKnobs.empty() || transistorBass))
+            startTimerHz (30);
+        // round 190mc (discussion #202): a page opened on a Transistor Bass whose notes moved its program while no page
+        // showed it starts on that program (no jump a moment after the window opens)
         if (transistorBass && ref.index >= 0)
-            startTimerHz (10); // the page follows the program a note selects (round 169g2)
+            followTransistorBassProgram();
+    }
+
+    ~ModelPanel() override
+    {
+        stopTimer();
+        engine.removeChangeListener (this);
+    }
+
+    // issue #152: a change of the channel's state that this page did not make (a linked controller, an Init song value,
+    // undo / redo, a preset loaded elsewhere) moves the knobs; nothing is redrawn when the state is the same
+    void changeListenerCallback (juce::ChangeBroadcaster*) override
+    {
+        const auto* c = channelNow();
+        if (c == nullptr || (c->pluginState == seenState && c->modelParams == seenParams))
+            return;
+        rememberState();
+        auto moved = false;
+        for (const auto& [k, index] : modelKnobs)
+            if (! k->isMouseButtonDown() && ! isAutomatedShown (k))
+                if (const auto v = modelparams::rawValue (*c, index); v && std::abs (*v - (float) k->getValue()) > 1.0e-6f)
+                {
+                    k->setValue (*v, juce::dontSendNotification);
+                    moved = true;
+                }
+        for (const auto& [k, control] : partKnobs)
+            if (! k->isMouseButtonDown() && ! isAutomatedShown (k))
+                if (const auto v = drumcontrols::value (*c, *control, drumPart); v && std::abs (*v - (float) k->getValue()) > 1.0e-6f)
+                {
+                    k->setValue (*v, juce::dontSendNotification);
+                    moved = true;
+                }
+        if (moved && layout != nullptr)
+            updateConditional();
+        if (moved)
+            repaint();
+    }
+
+    void rememberState()
+    {
+        if (const auto* c = channelNow())
+        {
+            seenState = c->pluginState;
+            seenParams = c->modelParams;
+        }
+    }
+
+    bool isAutomatedShown (const juce::Slider* k) const
+    {
+        return std::find (automatedShown.begin(), automatedShown.end(), k) != automatedShown.end();
+    }
+
+    // issue #152: while the song plays, an automated knob shows its automation's value (AutomationDisplay, as the
+    // Sampler's and the effects' knobs); when the automation stops driving it, it shows the channel's value again
+    void showAutomation()
+    {
+        if (ref.index < 0 || (modelKnobs.empty() && partKnobs.empty()))
+            return;
+        const auto& shown = engine.getAutomationDisplay();
+        if (shown.getGeneration() == shownGeneration)
+            return;
+        shownGeneration = shown.getGeneration();
+        if (automatedShown.empty() && ! shown.any())
+            return;
+        const auto* c = channelNow();
+        if (c == nullptr)
+            return;
+        std::vector<const juce::Slider*> now;
+        auto moved = false;
+        const auto show = [&] (juce::Slider* k, int index, std::optional<float> songRaw) {
+            if (k->isMouseButtonDown())
+                return;
+            const auto* p = modelparams::find (instrumentKind, index);
+            const auto v = shown.valueOf ({ AutomationTargetKind::channelParam, ref.index, 0, index });
+            if (v && p != nullptr)
+            {
+                k->setValue (p->raw (*v), juce::dontSendNotification);
+                now.push_back (k);
+                moved = true;
+            }
+            else if (isAutomatedShown (k) && songRaw)
+            {
+                k->setValue (*songRaw, juce::dontSendNotification);
+                moved = true;
+            }
+        };
+        for (const auto& [k, index] : modelKnobs)
+            show (k, index, modelparams::rawValue (*c, index));
+        for (const auto& [k, control] : partKnobs)
+            show (k, drumcontrols::absoluteIndex (instrumentKind, *control, drumPart), drumcontrols::value (*c, *control, drumPart));
+        automatedShown = std::move (now);
+        if (moved && layout != nullptr)
+            updateConditional();
+        if (moved)
+            repaint();
+    }
+
+    void timerCallback() override
+    {
+        if (isShowing())
+            showAutomation();
+        if (transistorBass && ref.index >= 0 && ++programTicks >= 3) // (10 times a second, as before)
+        {
+            programTicks = 0;
+            followTransistorBassProgram();
+        }
     }
 
     // Transistor Bass with its sequencer on: a note selects program = key (REA_rodada57 §2.10) and FL's editor shows
     // that program, so its knobs edit what plays. The channel's state takes the playing program (not an undo step)
     // and every knob reads it again (round 169g2)
-    void timerCallback() override
+    void followTransistorBassProgram()
     {
         const auto* c = channelNow();
         const auto instrument = engine.getChannelInstrument (ref.index);
@@ -1234,7 +1371,9 @@ public:
                 modelparams::setRawValue (c, index, v);
                 natives::followControl (c, index, flStudioAccess()); // (Harmless' compression type loads its preset)
             });
-            if (instrumentKind == InstrumentKind::transistorbass && index >= tbseq::length) // (a step's note moves its octave)
+            if (instrumentKind == InstrumentKind::transistorbass && (index == tbprog::program || index == tbprog::patch))
+                syncKnobs (true); // (round 190mc: another program or patch: every knob shows its values)
+            else if (instrumentKind == InstrumentKind::transistorbass && index >= tbseq::length) // (a step's note moves its octave)
                 syncKnobs();
             if (layout != nullptr)
             {
@@ -1247,9 +1386,12 @@ public:
             const auto target = [this, index] { return AutomationTarget { AutomationTargetKind::channelParam, ref.index, 0, index }; };
             ui::setOwnMenu (*knob);
             knob->onMenu = [this, k = knob.get(), target] { ui::showSliderMenu (*k, &engine, target()); };
-            knob->onDragStart = [this, target] { engine.noteTweaked (target(), true); };
+            if (instrumentKind == InstrumentKind::transistorbass && (index == tbprog::sequence || index == tbprog::patch))
+                knob->onMenu = [this, k = knob.get(), index] { showTransistorBassList (index == tbprog::patch, *k); }; // (FL: right-click to browse)
+            knob->onDragStart = [this, target] { engine.noteTweaked (target(), true); engine.controlTweakedForUndo(); };
             knob->onDragEnd = [this, target] { engine.tweakReleased (target()); };
         }
+        modelKnobs.push_back ({ knob.get(), index });
         addAndMakeVisible (*knob);
         knobs.push_back (std::move (knob));
     }
@@ -1278,7 +1420,7 @@ public:
             };
             ui::setOwnMenu (*knob);
             knob->onMenu = [this, k = knob.get(), target] { ui::showSliderMenu (*k, &engine, target()); };
-            knob->onDragStart = [this, target] { engine.noteTweaked (target(), true); };
+            knob->onDragStart = [this, target] { engine.noteTweaked (target(), true); engine.controlTweakedForUndo(); };
             knob->onDragEnd = [this, target] { engine.tweakReleased (target()); };
         }
         partKnobs.push_back ({ knob.get(), control });
@@ -1366,7 +1508,10 @@ public:
     // --- FL's arrangement ------------------------------------------------------------------------------
 
     static constexpr float layoutScale = 1.25f;
-    static constexpr int layoutTop = 34;
+    // round 190in (design190ia FW-6): a designed page no longer carries the "<Name> — FL's engine…" line over its art
+    // (FL draws nothing there; the line is the page's and its tab's tooltip): the art starts at the top unless the
+    // sample button or the missing-files band needs the strip
+    int layoutTop() const { return sampleButton.isVisible() || engineFilesMissing ? 34 : 8; }
 
     const plugui::LayoutItem* itemFor (const juce::String& name) const
     {
@@ -1396,13 +1541,13 @@ public:
     {
         if (layout == nullptr)
             return 1.0f;
-        return juce::jmax (0.4f, juce::jmin ((float) (getWidth() - 16) / (float) layout->width, (float) (getHeight() - layoutTop - 8) / (float) layout->height));
+        return juce::jmax (0.4f, juce::jmin ((float) (getWidth() - 16) / (float) layout->width, (float) (getHeight() - layoutTop() - 8) / (float) layout->height));
     }
 
     juce::Rectangle<float> layoutRect (const plugui::LayoutItem& item) const
     {
         const auto f = layoutFactor();
-        return { 8.0f + item.x * f, (float) layoutTop + item.y * f, item.w * f, item.h * f };
+        return { 8.0f + item.x * f, (float) layoutTop() + item.y * f, item.w * f, item.h * f };
     }
 
     static float normalised (const juce::Slider& k)
@@ -1673,6 +1818,9 @@ public:
                         const auto text = units != nullptr ? juce::String (units->unitString (units->unitOf ((float) k->getValue())))
                                         : juce::String (item.param).containsIgnoreCase ("oversampling") ? juce::String (1 << juce::jlimit (0, 8, (int) k->getValue())) + "x"
                                         : juce::String (item.param).endsWith (" note") ? juce::String (noteNames[((whole % 12) + 12) % 12]) + juce::String (whole / 12)
+                                        // Transistor Bass's PROGRAM reads as its key, SEQUENCE and PATCH count from 1 (FL's wheels; round 190mc)
+                                        : transistorBass && juce::String (item.param) == "Program" ? juce::String (noteNames[((whole % 12) + 12) % 12]) + juce::String (whole / 12)
+                                        : transistorBass && (juce::String (item.param) == "Sequence number" || juce::String (item.param) == "Patch number") ? juce::String (whole + 1)
                                                                                        : juce::String (whole);
                         g.drawFittedText (text, box.withTrimmedRight (8.0f * f).toNearestInt(), juce::Justification::centred, 1, 0.7f);
                         g.setColour (colour::textSecondary);
@@ -1698,6 +1846,8 @@ public:
                         paintTransistorBassSteps (g, r, f);
                     if (juce::String (item.display) == "tbseqtools")
                         paintTransistorBassTools (g, r, f);
+                    if (juce::String (item.display).startsWith ("tbrow"))
+                        paintTransistorBassRow (g, juce::String (item.display), r, f);
                     if (juce::String (item.display) == "xy")
                         if (auto* kx = knobFor (item.param); kx != nullptr)
                             if (auto* ky = knobFor (item.param2); ky != nullptr)
@@ -2029,6 +2179,12 @@ public:
                         showPage (o);
                 return;
             }
+        for (const auto& item : layout->items) // round 190mc: Transistor Bass's name fields and READ / WRITE
+            if (item.type == plugui::Item::display && juce::String (item.display).startsWith ("tbrow") && layoutRect (item).contains (e.position))
+            {
+                transistorBassRowClick (juce::String (item.display), layoutRect (item), e);
+                return;
+            }
         for (const auto& item : layout->items) // round 168q2: Transistor Bass's CLEAR / octave up / octave down
             if (item.type == plugui::Item::display && juce::String (item.display) == "tbseqtools" && layoutRect (item).contains (e.position))
             {
@@ -2050,6 +2206,11 @@ public:
                 || item.type == plugui::Item::knob || item.type == plugui::Item::vslider || item.type == plugui::Item::hslider
                 || item.type == plugui::Item::section || item.type == plugui::Item::label)
                 continue;
+            if (e.mods.isPopupMenu() && transistorBass && (k->getName() == "Sequence number" || k->getName() == "Patch number"))
+            {
+                showTransistorBassList (k->getName() == "Patch number", *k); // (FL: right-click the number to browse; round 190mc)
+                return;
+            }
             if (e.mods.isPopupMenu() && ref.index >= 0 && modelTable != nullptr) // a switch / tabs: FL's parameter menu
             {
                 if (const auto* p = modelparams::findByName (instrumentKind, k->getName().toStdString()))
@@ -2121,7 +2282,7 @@ public:
         }
         g.setColour (theme::colour::textPrimary);
         g.setFont (theme::font (layout != nullptr ? theme::type::body : theme::type::title));
-        if (! engineFilesMissing)
+        if (! engineFilesMissing && layout == nullptr) // (round 190in, FW-6: a designed page shows it as its tooltip)
             g.drawFittedText (shownDescription(), descriptionArea(), juce::Justification::centredLeft, layout != nullptr ? 1 : 2, 0.8f);
         if (engineFilesMissing) // round 168q: an engine that runs FL's own DLL / data file, which this computer lacks
         {
@@ -2178,6 +2339,7 @@ public:
                : drumaxx ? tr ("Drumaxx — FL's physical drum engine (pads on their keys; patterns not played)")
                : slayer ? tr ("FL Slayer — FL's engine with its effects, amp and cabinet (picks read from your FL installation; new settings restart the voices)")
                : sytrus ? tr ("Sytrus — FL's engine, main settings (operators, filters and effects keep the saved patch)")
+               : pocketSuperSaw ? tr ("Pocket SuperSaw — LYNX's engine for FL Studio Mobile's SuperSaw")
                : fruityDance ? tr ("Fruity Dance — a visual plugin: it makes no sound, the channel keeps its settings")
                : boobass ? tr ("BooBass — FL's engine, its sound read from your FL installation (knobs: 3-band EQ)")
                : sakura ? tr ("Sakura — physical strings (FL's engine; new parameters apply to the next note)")
@@ -2200,6 +2362,8 @@ public:
     juce::String getTooltip() override
     {
         const auto full = description();
+        if (layout != nullptr && ! engineFilesMissing) // round 190in (FW-6): the line left the page; the page says it
+            return full;
         if (! engineFilesMissing && descriptionArea().contains (getMouseXYRelative()) && shownDescription() != full)
             return full;
         return {};
@@ -2489,6 +2653,154 @@ private:
         g.drawFittedText (text, r.reduced (6.0f * f, 0.0f).toNearestInt(), juce::Justification::centredLeft, 1, 0.7f);
     }
 
+    // FL's program row (round 190mc, discussion #202; TSynthEditorForm): the sequence's and the patch's names (a click
+    // renames, as FL's name fields; a right-click lists the 128 to choose from, as FL's number wheels), their "shared"
+    // indicators (lit when more than one program uses it) and READ / WRITE (WRITE lit while the working patch differs
+    // from the stored one)
+    void paintTransistorBassRow (juce::Graphics& g, const juce::String& which, juce::Rectangle<float> r, float f)
+    {
+        using namespace theme;
+        const auto* bank = transistorBassBankNow();
+        if (bank == nullptr)
+            return;
+        g.setFont (font (juce::jmax (9.0f, 11.0f * f), false));
+        if (which == "tbrowseqname" || which == "tbrowpatchname")
+        {
+            const auto patch = which == "tbrowpatchname";
+            const auto& name = patch ? bank->patches[(std::size_t) bank->patch] : bank->sequences[(std::size_t) bank->sequence];
+            g.setColour (name.empty() ? colour::textDisabled : colour::textPrimary);
+            g.drawFittedText (name.empty() ? tr ("(no name)") : juce::String::fromUTF8 (name.c_str()), r.reduced (5.0f * f, 0.0f).withTrimmedRight (10.0f * f).toNearestInt(),
+                              juce::Justification::centredLeft, 1, 0.8f);
+            // FL's share glyph at the field's right end (three linked dots: "used by other programs" sits next to it)
+            const auto c = juce::Point<float> (r.getRight() - 7.0f * f, r.getCentreY());
+            const juce::Point<float> dots[] { { c.x - 2.5f * f, c.y }, { c.x + 2.5f * f, c.y - 3.5f * f }, { c.x + 2.5f * f, c.y + 3.5f * f } };
+            g.setColour (colour::textSecondary);
+            g.drawLine ({ dots[0], dots[1] }, 0.9f * f);
+            g.drawLine ({ dots[0], dots[2] }, 0.9f * f);
+            for (const auto& d : dots)
+                g.fillEllipse (juce::Rectangle<float> (2.6f * f, 2.6f * f).withCentre (d));
+        }
+        else if (which == "tbrowseqshared" || which == "tbrowpatchshared")
+        {
+            const auto users = which == "tbrowpatchshared" ? bank->patchUsers[(std::size_t) bank->patch] : bank->sequenceUsers[(std::size_t) bank->sequence];
+            const auto lit = users > 1;
+            const auto bar = r.reduced (2.0f * f, 3.0f * f);
+            g.setColour (lit ? accent : colour::bg4);
+            g.fillRoundedRectangle (bar, radius::sm * f);
+        }
+        else if (which == "tbrowreadwrite")
+        {
+            for (int i = 0; i < 2; ++i)
+            {
+                const auto cell = transistorBassRowButton (r, i);
+                skin::button (g, cell, i == 1 && bank->edited, false, accent, radius::sm * f);
+                g.setColour (colour::textPrimary);
+                g.setFont (font (juce::jmax (8.0f, 10.0f * f), true));
+                g.drawFittedText ((i == 0 ? tr ("Read") : tr ("Write")).toUpperCase(), cell.toNearestInt(), juce::Justification::centred, 1, 0.6f); // (FL: READ / WRITE)
+            }
+        }
+    }
+
+    // the page's five row parts read one parse of the state per change, not one each per paint (round 190mc)
+    const TransistorBassBank* transistorBassBankNow()
+    {
+        const auto* c = channelNow();
+        if (c == nullptr)
+            return nullptr;
+        if (c->pluginState != bankState)
+        {
+            bankState = c->pluginState;
+            bankCache = transistorBassBank (bankState);
+        }
+        return bankCache ? &*bankCache : nullptr;
+    }
+    std::vector<std::uint8_t> bankState;
+    std::optional<TransistorBassBank> bankCache;
+
+    static juce::Rectangle<float> transistorBassRowButton (juce::Rectangle<float> r, int i)
+    {
+        const auto w = r.getWidth() * 0.5f;
+        return juce::Rectangle<float> (r.getX() + w * (float) i, r.getY(), w, r.getHeight()).reduced (1.5f, 0.0f);
+    }
+
+    void transistorBassRowClick (const juce::String& which, juce::Rectangle<float> r, const juce::MouseEvent& e)
+    {
+        const auto* c = channelNow();
+        if (c == nullptr || ! transistorBassBank (c->pluginState))
+            return;
+        if (which == "tbrowreadwrite")
+        {
+            const auto read = transistorBassRowButton (r, 0).contains (e.position);
+            auto next = c->pluginState;
+            if (! (read ? transistorBassReadPatch (next) : transistorBassWritePatch (next)) || next == c->pluginState)
+                return;
+            ref.edit (engine, [next = std::move (next)] (ChannelDef& d) { d.pluginState = next; });
+            syncKnobs (true);
+            repaint();
+            return;
+        }
+        if (which != "tbrowseqname" && which != "tbrowpatchname")
+            return;
+        const auto patch = which == "tbrowpatchname";
+        if (e.mods.isPopupMenu())
+        {
+            if (auto* k = knobFor (patch ? "Patch number" : "Sequence number"))
+                showTransistorBassList (patch, *k);
+            return;
+        }
+        renameTransistorBass (patch);
+    }
+
+    // FL's right-click list on the SEQUENCE / PATCH wheels: the 128 with their names, the shown one ticked
+    void showTransistorBassList (bool patch, juce::Slider& knob)
+    {
+        const auto* c = channelNow();
+        const auto bank = c != nullptr ? transistorBassBank (c->pluginState) : std::nullopt;
+        if (! bank)
+            return;
+        juce::PopupMenu menu, more;
+        const auto current = patch ? bank->patch : bank->sequence;
+        for (int i = 0; i < 128; ++i)
+        {
+            const auto& name = patch ? bank->patches[(std::size_t) i] : bank->sequences[(std::size_t) i];
+            const auto text = juce::String (i + 1) + "  " + (name.empty() ? tr ("(no name)") : juce::String::fromUTF8 (name.c_str()));
+            auto& into = i < 64 ? menu : more;
+            into.addItem (text, true, i == current, [safe = juce::Component::SafePointer<juce::Slider> (&knob), i] {
+                if (safe != nullptr)
+                    safe->setValue ((double) i, juce::sendNotificationSync);
+            });
+        }
+        menu.addSeparator();
+        menu.addSubMenu ("65 - 128", more);
+        menu.showMenuAsync (juce::PopupMenu::Options().withMousePosition()); // (the page draws the number; its slider is hidden)
+    }
+
+    void renameTransistorBass (bool patch)
+    {
+        const auto* c = channelNow();
+        const auto bank = c != nullptr ? transistorBassBank (c->pluginState) : std::nullopt;
+        if (! bank)
+            return;
+        const auto index = patch ? bank->patch : bank->sequence;
+        const auto& old = patch ? bank->patches[(std::size_t) index] : bank->sequences[(std::size_t) index];
+        auto* box = new juce::AlertWindow (patch ? tr ("Patch name") : tr ("Sequence name"), {}, juce::MessageBoxIconType::NoIcon, this);
+        box->addTextEditor ("name", juce::String::fromUTF8 (old.c_str()));
+        box->addButton (tr ("OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+        box->addButton (tr ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        box->enterModalState (true, juce::ModalCallbackFunction::create ([safe = juce::Component::SafePointer<ModelPanel> (this), box, patch, index] (int result) {
+            if (safe == nullptr || result != 1)
+                return;
+            const auto* ch = safe->channelNow();
+            if (ch == nullptr)
+                return;
+            auto next = ch->pluginState;
+            if (! transistorBassRename (next, patch, index, box->getTextEditorContents ("name").toStdString()) || next == ch->pluginState)
+                return;
+            safe->ref.edit (safe->engine, [next = std::move (next)] (ChannelDef& d) { d.pluginState = next; });
+            safe->repaint();
+        }), true);
+    }
+
     // the step numbers under the sequence, lit up to its length (round 168q2)
     void paintTransistorBassSteps (juce::Graphics& g, juce::Rectangle<float> r, float f)
     {
@@ -2653,11 +2965,17 @@ private:
     std::unique_ptr<skin::ArtLayer> artLayer;      // the art's moving part (petals, a glowing trefoil...)
     bool sakura = true, boobass = false, drumsynth = false, harmless = false, harmor = false, gms = false, morphine = false, ogun = false, autogun = false, transistorBass = false, transistorBassMobile = false, miniSynth = false, dx10 = false, kepler = false, keplerExo = false, poizone = false,
          fruitkick = false, bassdrum = false, toxic = false, threeOsc = false, simSynth = false, wasp = false, plucked = false, beepMap = false,
-         sawer = false, flKeys = false, granulizer = false, drumaxx = false, slayer = false, fruityDance = false, sytrus = false, wavesFound = false,
+         sawer = false, flKeys = false, granulizer = false, drumaxx = false, slayer = false, fruityDance = false, pocketSuperSaw = false, sytrus = false, wavesFound = false,
          engineFilesMissing = false;
     int editorKey = 60;
     int drumPart = 0; // round 168p: the Drumaxx pad / DrumSynth Live key the per-part knobs edit
     std::vector<std::pair<juce::Slider*, const drumcontrols::Control*>> partKnobs;
+    std::vector<std::pair<juce::Slider*, int>> modelKnobs; // a listed parameter's knob -> its index (issue #152)
+    std::vector<const juce::Slider*> automatedShown;      // the knobs showing their automation now
+    std::uint32_t shownGeneration = 0;
+    std::vector<std::uint8_t> seenState;                   // the channel's state the knobs show (issue #152)
+    std::vector<float> seenParams;
+    int programTicks = 0;
     std::vector<std::unique_ptr<juce::Slider>> knobs;
     const plugui::Layout* layout = nullptr;
     plugui::Layout hostedLayout;
@@ -2722,7 +3040,8 @@ public:
         trim.setTooltip (tr ("Cuts the silence below this level at the sample's start and end"));
         declickLabel.setText (tr ("Declicking mode"), juce::dontSendNotification);
         addAndMakeVisible (declickLabel);
-        declick.addItemList ({ tr ("Out only"), tr ("Transient (no bleeding)"), tr ("Transient"), tr ("Generic"), tr ("Smooth"), tr ("Crossfade") }, 1);
+        for (const auto* name : samplerpage::declickModeNames) // (FL's items, round 190dh)
+            declick.addItem (tr (name), declick.getNumItems() + 1);
         declick.setTooltip (tr ("How fast a cut note fades out: 10 ms (out only, transient no bleeding), 20 ms (transient, generic), 100 ms (smooth), 200 ms (crossfade)"));
         declick.onChange = [this] { apply(); };
         addAndMakeVisible (declick);
@@ -2896,131 +3215,348 @@ private:
     juce::ToggleButton clip;
 };
 
+// FL's Load button of the sampler's File row (round 190df): an icon button that also takes the mouse wheel (FL steps
+// through the sample history with it [OpenBtnMouseWheel 0xf68f50])
+class WheelIconButton final : public IconButton
+{
+public:
+    using IconButton::IconButton;
+    std::function<void (int)> onWheel; // +1 up, -1 down
+    void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override
+    {
+        if (onWheel != nullptr && w.deltaY != 0.0f)
+            onWheel (w.deltaY > 0.0f ? 1 : -1);
+        else
+            IconButton::mouseWheelMove (e, w);
+    }
+};
+
+// FL's "effects target" selector at the head of the Precomputed effects box (round 190dh; form TPluginForm
+// FXPanel.EffectsTargetSelect, 46 x 19, two cells; EffectsTargetSelectChange 0xf616d0 shows FXLegacyPanel for cell 1):
+// a wrench (the effects) and the legacy effects
+class EffectsTargetSelect final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    std::function<void (int)> onChange;
+    int getIndex() const noexcept { return index; }
+    void setIndex (int i)
+    {
+        if (i != index)
+        {
+            index = i;
+            repaint();
+        }
+    }
+    void paint (juce::Graphics& g) override
+    {
+        const auto b = getLocalBounds().toFloat();
+        for (int i = 0; i < 2; ++i)
+        {
+            auto cell = b.withWidth (b.getWidth() / 2.0f).translated ((float) i * b.getWidth() / 2.0f, 0.0f).reduced (1.0f);
+            g.setColour (i == index ? theme::colour::bg6 : theme::colour::bg3);
+            g.fillRoundedRectangle (cell, 2.0f);
+            const auto colour = i == index ? theme::colour::warning : theme::colour::textSecondary;
+            const auto icon = cell.withSizeKeepingCentre (cell.getHeight() - 3.0f, cell.getHeight() - 3.0f);
+            if (i == 1)
+                icons::draw (g, Icon::mic, icon, colour);
+            else
+            {
+                // a wrench: a handle and an open jaw
+                const auto u = icon.getWidth() / 24.0f;
+                juce::Path p;
+                p.startNewSubPath (icon.getX() + 5.0f * u, icon.getBottom() - 5.0f * u);
+                p.lineTo (icon.getX() + 14.0f * u, icon.getY() + 10.0f * u);
+                g.setColour (colour);
+                g.strokePath (p, juce::PathStrokeType (3.2f * u, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                juce::Path jaw;
+                jaw.addCentredArc (icon.getX() + 16.5f * u, icon.getY() + 7.5f * u, 5.0f * u, 5.0f * u, 0.0f, 0.9f, 5.4f, true);
+                g.strokePath (jaw, juce::PathStrokeType (2.6f * u, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            }
+        }
+    }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const auto i = e.x < getWidth() / 2 ? 0 : 1;
+        if (i != index)
+        {
+            index = i;
+            repaint();
+            if (onChange != nullptr)
+                onChange (index);
+        }
+    }
+
+private:
+    int index = 0;
+};
+
+// The Sampler page (round 190dh: FL's Sampler page, form TPluginForm.SmpSheet, 561 x 399, and the FL 2026 shot
+// dock188a): File row, Content, Playback | Time stretching, Precomputed effects; the waveform; then "LYNX extras", the
+// sampler controls FL's page has no place for (Gain, the envelope, the filter, Cut itself, Porta, Modulation).
 class SettingsPanel final : public juce::Component,
                             public juce::DragAndDropTarget,
                             public juce::FileDragAndDropTarget,
                             private juce::ChangeListener,
+                            private juce::ScrollBar::Listener,
                             private juce::Timer
 {
 public:
+    // the page in FL's form units (FL's 561 x 399 sheet, then LYNX's extras below it)
+    static constexpr int designWidth = 558, designHeight = 524;
+    static constexpr int clipDesignHeight = 390; // an audio clip's page: FL's sheet without LYNX's extras under it
+    static constexpr float defaultScale = 1.25f;
+
     SettingsPanel (AudioEngine& e, ChannelRef c)
         : engine (e),
           ref (std::move (c))
     {
-        setup (pitch, pitchLabel, TR_NOOP ("Pitch"), -24.0, 24.0, 0.01, " st");
-        pitch.setTooltip (tr ("The sample's pitch in semitones (0.5 = 50 cents). The Piano Roll's keys play it chromatically around its root note (Misc › Root note, C5 by default); right-click the channel › Pitch... for semitones + cents"));
-        setup (gain, gainLabel, TR_NOOP ("Gain"), -24.0, 24.0, 0.1, " dB");
+        if (const auto* def = ref.get (engine))
+            clipChannel = def->instrument == InstrumentKind::audioClip;
+        // ---- File row (round 190df; form GrooveBox, shot dock188a fl-05) ----
+        fileLabel.setText (tr ("File"), juce::dontSendNotification);
+        fileLabel.setJustificationType (juce::Justification::centredRight);
+        addAndMakeVisible (fileLabel);
+        fileName.setMinimumHorizontalScale (1.0f);
+        addAndMakeVisible (fileName);
+        loadButton.setTooltip (tr ("Load sample file... / Sample history"));
+        loadButton.onClick = [this] { chooseSample(); };
+        loadButton.onRightClick = [this] { showSampleHistory(); };
+        loadButton.onWheel = [this] (int delta) {
+            if (const auto* c = current())
+                if (const auto next = samplehistory::step (c->samplePath, delta))
+                    replaceSample (juce::File (juce::String::fromUTF8 (next->c_str())));
+        };
+        locateButton.setTooltip (tr ("Locate sample in browser"));
+        locateButton.onClick = [this] {
+            if (const auto* c = current(); c != nullptr && ! c->samplePath.empty() && locateInBrowserHandler())
+                locateInBrowserHandler() (juce::File (juce::String::fromUTF8 (c->samplePath.c_str())));
+        };
+        removeButton.setTooltip (tr ("Remove sample"));
+        removeButton.onClick = [this] { removeSample(); };
+        for (auto* b : { &loadButton, &locateButton, &removeButton })
+        {
+            b->setFlat (false);
+            addAndMakeVisible (b);
+        }
+
+        // ---- Content (form WavePanel) ----
+        toggle (keepOnDisk, TR_NOOP ("Keep on disk"), TR_NOOP ("Stream sample from hard disk when possible"));
+        keepOnDisk.setTooltip (tr ("Stream sample from hard disk when possible") + " - "
+                               + tr ("FL's option, kept for FL projects: LYNX streams samples longer than 30 s from its disk cache by itself"));
+        toggle (resampleBox, TR_NOOP ("Resample"), TR_NOOP ("Upsample to mixing frequency"));
+        resampleBox.setTooltip (tr ("Upsample to mixing frequency") + " - " + tr ("FL's option, kept for FL projects: LYNX resamples in real time"));
+        toggle (loadRegionsBox, TR_NOOP ("Load regions"), nullptr);
+        loadRegionsBox.setTooltip (tr ("Load sample regions and REX / ZGR beat markers") + " - " + tr ("FL's option, kept for FL projects"));
+        toggle (loadMarkersBox, TR_NOOP ("Load slice markers"), nullptr);
+        loadMarkersBox.setTooltip (tr ("Load ACID and Apple Loops beat markers") + " - " + tr ("FL's option, kept for FL projects"));
+        declickLabel.setText (tr ("Declicking mode"), juce::dontSendNotification);
+        addAndMakeVisible (declickLabel);
+        for (const auto* name : samplerpage::declickModeNames)
+            declick.addItem (tr (name), declick.getNumItems() + 1);
+        declick.setTooltip (tr ("Declicking method") + " - "
+                            + tr ("How fast a cut note fades out: 10 ms (out only, transient no bleeding), 20 ms (transient, generic), 100 ms (smooth), 200 ms (crossfade)"));
+        declick.onChange = [this] { apply (&declick); };
+        addAndMakeVisible (declick);
+
+        // ---- Playback (form LoopPanel) ----
+        knob (startOffsetKnob, startOffsetLabel, TR_NOOP ("Start offset"), TR_NOOP ("Sample start offset"), 0.0, 1.0, 1.0 / 16384.0, 0.0);
+        startOffsetKnob.textFromValueFunction = [] (double v) { return juce::String (v * 100.0, 1) + " %"; };
+        knob (loopStartKnob, loopStartLabel, TR_NOOP ("Start"), TR_NOOP ("Loop start position"), 0.0, 1.0, 1.0, 0.0);
+        knob (loopEndKnob, loopEndLabel, TR_NOOP ("End"), TR_NOOP ("Loop end position"), 0.0, 1.0, 1.0, 0.0);
+        for (auto* k : { &loopStartKnob, &loopEndKnob })
+            k->textFromValueFunction = [] (double v) { return juce::String ((juce::int64) std::llround (v)); }; // (frames)
+        toggle (useLoops, TR_NOOP ("Use loop points"), TR_NOOP ("Use sample loop points"));
+        toggle (pingPong, TR_NOOP ("Ping pong loop"), TR_NOOP ("Loop forward / backward"));
+
+        // ---- Time stretching (form StretchPanel) ----
+        knob (stretchPitchKnob, stretchPitchLabel, TR_NOOP ("Pitch"), TR_NOOP ("Pitch shift"), -1200.0, 1200.0, 1.0, 0.0);
+        stretchPitchKnob.textFromValueFunction = [] (double v) { return tr ("{0} cents", { (v > 0.5 ? "+" : "") + juce::String (juce::roundToInt (v)) }); };
+        knob (mulKnob, mulLabel, TR_NOOP ("Mul"), TR_NOOP ("Time stretch (multiplicator)"), -20000.0, 20000.0, 1.0, 0.0);
+        // (live check 190ew SMP-5: FL's hint reads "105.70%")
+        mulKnob.textFromValueFunction = [] (double v) { return juce::String (samplerpage::mulText ((int) v)); };
+        knob (stretch, stretchLabel, TR_NOOP ("Time"), TR_NOOP ("Time stretch (time)"), 0.0, 1024.0, 0.01, 0.0);
+        stretch.textFromValueFunction = [] (double v) { return v <= 0.0 ? tr ("(none)") : tr ("{0} beats", { juce::String (v, 2) }); };
+        // issue #32 #7: "Fit to tempo" sets exact lengths (16.45 beats for a loop with a tail, 128 for 32 bars)
+        stretch.setSkewFactorFromMidPoint (16.0);
+        stretch.addMouseListener (&stretchMenu, false);
+        modeLabel.setText (tr ("Mode"), juce::dontSendNotification);
+        addAndMakeVisible (modeLabel);
+        for (int i = 0; i < samplerpage::modeItemCount; ++i)
+        {
+            if (samplerpage::modeItems[i].header)
+                stretchMethod.addSectionHeading (tr (samplerpage::modeItems[i].name));
+            else
+                stretchMethod.addItem (tr (samplerpage::modeItems[i].name), i + 1);
+        }
+        stretchMethod.setTooltip (tr ("Stretching method") + " - " + tr ("Resample") + " / "
+                                  + tr ("How the stretch keeping pitch is computed: General for full mixes and chords, Drums for loops and percussive sounds (attacks kept sharp), Vocal for a single voice or instrument"));
+        stretchMethod.onChange = [this] { apply (&stretchMethod); };
+        addAndMakeVisible (stretchMethod);
+
+        // ---- Precomputed effects (form FXPanel) ----
+        toggle (removeDc, TR_NOOP ("Remove DC offset"), TR_NOOP ("Center vertically"));
+        toggle (normalize, TR_NOOP ("Normalize"), TR_NOOP ("Normalize to 0dB"));
+        toggle (reverse, TR_NOOP ("Reverse"), TR_NOOP ("Flip horizontally"));
+        toggle (polarity, TR_NOOP ("Reverse polarity"), TR_NOOP ("Flip vertically"));
+        toggle (fadeStereo, TR_NOOP ("Fade stereo"), TR_NOOP ("Fade from left channel to right channel"));
+        toggle (swapStereo, TR_NOOP ("Swap stereo"), TR_NOOP ("Swap left & right channels"));
+        knob (regionStart, regionStartLabel, TR_NOOP ("Smp start"), TR_NOOP ("Sample start offset"), 0.0, 1.0, 1.0 / 16384.0, 0.0);
+        knob (lengthKnob, lengthLabel, TR_NOOP ("Length"), TR_NOOP ("Sample end offset"), 0.0, 1.0, 1.0 / 16384.0, 1.0);
+        for (auto* k : { &regionStart, &lengthKnob })
+            k->textFromValueFunction = [] (double v) { return juce::String (v * 100.0, 1) + " %"; };
+        knob (fadeIn, fadeInLabel, TR_NOOP ("In"), TR_NOOP ("Quick fade in"), 0.0, 1024.0, 1.0, 0.0);
+        knob (fadeOut, fadeOutLabel, TR_NOOP ("Out"), TR_NOOP ("Quick fade out"), 0.0, 1024.0, 1.0, 0.0);
+        knob (crossfade, crossfadeLabel, TR_NOOP ("Crossfade"), TR_NOOP ("Crossfade loop"), 0.0, 1024.0, 1.0, 0.0);
+        knob (trim, trimLabel, TR_NOOP ("Trim"), TR_NOOP ("Silence trimming threshold"), 0.0, 256.0, 1.0, 0.0);
+        auto percent = [] (double hi) { return [hi] (double v) { return juce::String (v / hi * 100.0, 1) + " %"; }; };
+        fadeIn.textFromValueFunction = percent (1024.0);
+        fadeOut.textFromValueFunction = percent (1024.0);
+        crossfade.textFromValueFunction = percent (2048.0); // (of the loop: FL's knob reaches half of it)
+        trim.textFromValueFunction = [] (double v) { return v <= 0.0 ? tr ("Off") : juce::String (20.0 * std::log10 (v / 32768.0), 1) + " dB"; };
+        effectsTarget.setTooltip (tr ("effects target"));
+        effectsTarget.onChange = [this] (int) { showLegacy(); };
+        addAndMakeVisible (effectsTarget);
+        // the legacy effects (form FXLegacyPanel; REA round 167l §1: FL's ranges and defaults)
+        const std::tuple<MenuSlider*, juce::Label*, const char*, const char*, double, double, double> legacy[] = {
+            { &boost, &boostLabel, TR_NOOP ("Boost"), TR_NOOP ("Boosts the gain"), 0.0, 256.0, 0.0 },
+            { &eq, &eqLabel, TR_NOOP ("EQ"), TR_NOOP ("Shifts the frequency balance"), 0.0, 256.0, 128.0 },
+            { &ringMix, &ringMixLabel, TR_NOOP ("RM mix"), TR_NOOP ("Ring modulation mix"), 0.0, 256.0, 0.0 },
+            { &ringFreq, &ringFreqLabel, TR_NOOP ("RM freq"), TR_NOOP ("Ring modulation frequency"), 0.0, 256.0, 128.0 },
+            { &legacyCut, &legacyCutLabel, TR_NOOP ("Cut"), TR_NOOP ("Filter cutoff"), 16.0, 1024.0, 1024.0 },
+            { &legacyRes, &legacyResLabel, TR_NOOP ("Res"), TR_NOOP ("Filter resonance"), 0.0, 640.0, 0.0 },
+            { &reverbAmount, &reverbLabel, TR_NOOP ("Reverb"), TR_NOOP ("Reverb amount"), 0.0, 256.0, 0.0 },
+            { &stereoDelay, &stereoDelayLabel, TR_NOOP ("Stereo delay"), TR_NOOP ("Stereo delay"), 0.0, 4096.0, 2048.0 },
+            { &pogo, &pogoLabel, TR_NOOP ("Pogo"), TR_NOOP ("Pogo effect"), 0.0, 512.0, 256.0 } };
+        for (auto [k, label, text, hint, lo, hi, def] : legacy)
+            knob (*k, *label, text, hint, lo, hi, 1.0, def);
+        reverbType.addItemList ({ "A", "B" }, 1);
+        reverbType.setTooltip (tr ("Reverb type"));
+        reverbType.onChange = [this] { apply (&reverbType); };
+        addChildComponent (reverbType);
+        toggle (clip, TR_NOOP ("Clip"), TR_NOOP ("Add clipping at 0dB"));
+
+        // ---- the waveform ----
+        wave.setEmptyText (tr ("No sample loaded"));
+        wave.setTooltip (tr ("Waveform") + " - " + tr ("click: preview the sample; mouse wheel: zoom"));
+        wave.setWatermark (clipChannel ? tr ("Audio clip") : tr ("Sampler")); // (FL's audio clip page: "Audio Clip")
+        wave.setCaptionVisible (false);
+        wave.setZoomable (true);
+        wave.setFollowsSamplerViews (true); // (round 190gw: the waveform menu's Spectrum / Multichannel views)
+        wave.onViewChanged = [this] { waveScroll.setCurrentRange (wave.getViewStart(), wave.getViewEnd() - wave.getViewStart(), juce::dontSendNotification); };
+        // round 190w: FL 2026 previews the sample when its display is clicked (from the start offset, to its end) and shows
+        // the playback locator over it (What's New 21138; [SHOT] flgap190w burst n2 / o3)
+        wave.onClick = [this] { previewFromDisplay(); };
+        // round 190ey (live check 190ew SMP-7): FL's waveform menu on a right-click
+        wave.onRightClick = [this] {
+            auto menu = waveMenu();
+            if (menu.getNumItems() > 0)
+                menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&wave).withMousePosition());
+        };
+        // round 190im (R11, DF-113): FL's handles dragged on the waveform — the "Start" marker turns the Start offset knob,
+        // the loop lines the loop Start / End knobs (Shift: the whole loop moves, as Shift on the knobs; FL)
+        wave.setHandlesEditable (true);
+        wave.onHandleDrag = [this] (ui::WaveformDisplay::Handle h, double v, bool shift) {
+            using H = ui::WaveformDisplay::Handle;
+            if (h == H::start)
+            {
+                startOffsetKnob.setValue (v, juce::sendNotificationSync);
+                return;
+            }
+            if (shownFrames <= 1 || ! loopStartKnob.isEnabled())
+                return;
+            const juce::ScopedValueSetter<bool> shiftNow (shiftHeld, shift);
+            auto& knob = h == H::loopStart ? loopStartKnob : loopEndKnob;
+            knob.setValue (std::round (v * (double) (shownFrames - 1)), juce::sendNotificationSync);
+        };
+        addAndMakeVisible (wave);
+        // round 190ih (PLAN R11 part, DF-115), FL's manual (Sampler › Drag and Drop): the sample is dragged out of the
+        // waveform onto the Playlist, a channel, the Browser's targets... (as a Browser file drag; an OS file drag from
+        // a window outside the main one)
+        waveDrag.path = [this] { return wavePath; };
+        waveDrag.handleDragged = [this] { return wave.isDraggingHandle(); };
+        wave.addMouseListener (&waveDrag, false);
+        waveScroll.setRangeLimits (0.0, 1.0, juce::dontSendNotification);
+        waveScroll.setCurrentRange (0.0, 1.0, juce::dontSendNotification);
+        waveScroll.setAutoHide (false);
+        waveScroll.addListener (this);
+        addAndMakeVisible (waveScroll);
+
+        // ---- LYNX extras ----
+        knob (gain, gainLabel, TR_NOOP ("Gain"), nullptr, -24.0, 24.0, 0.1, 0.0);
         gain.textFromValueFunction = [] (double v) { return (v > 0.04 ? "+" : "") + juce::String (std::abs (v) < 0.05 ? 0.0 : v, 1) + " dB"; };
         gain.valueFromTextFunction = [] (const juce::String& t) { return t.retainCharacters ("+-0123456789.,").replaceCharacter (',', '.').getDoubleValue(); };
         gain.setTooltip (tr ("Sample gain: boosts or cuts the sample's level before the channel volume (-24 to +24 dB, double-click = 0 dB)"));
-        gain.setValue (0.0, juce::dontSendNotification);
-        setup (attack, attackLabel, TR_NOOP ("Attack"), 0.0, 2.0, 0.001, " s");
-        setup (release, releaseLabel, TR_NOOP ("Release"), 0.0, 4.0, 0.001, " s");
-        setup (decay, decayLabel, TR_NOOP ("Decay"), 0.0, 10.0, 0.001, " s");
-        setup (sustain, sustainLabel, TR_NOOP ("Sustain"), 0.0, 1.0, 0.01, "");
-        setup (stretch, stretchLabel, TR_NOOP ("Stretch"), 0.0, 1024.0, 0.01, " beats");
-        // issue #32 #7: "Fit to tempo" sets exact lengths (16.45 beats for a loop with a tail, 128 for 32 bars); the knob used
-        // to round them to 0.25 and cap them at 64, and every other edit in this panel wrote the rounded value back
-        stretch.setSkewFactorFromMidPoint (16.0);
-        stretch.addMouseListener (&stretchMenu, false);
-        // round 190w: FL's Playback › START OFFSET ([DFM] SmpStartOfsWheel, Max 16384, default 0; hint "Sample start
-        // offset"): where notes start, a fraction of the region (.flp 0xD7 0x90, SamplerSettings::startOffset)
-        setup (startOffsetKnob, startOffsetLabel, TR_NOOP ("Start offset"), 0.0, 1.0, 1.0 / 16384.0, "");
-        startOffsetKnob.setNumDecimalPlacesToDisplay (3);
-        startOffsetKnob.setTooltip (tr ("Sample start offset"));
-        setup (regionStart, regionStartLabel, TR_NOOP ("Start"), 0.0, 1.0, 0.001, "");
-        setup (regionEnd, regionEndLabel, TR_NOOP ("End"), 0.0, 1.0, 0.001, "");
-        setup (cutoff, cutoffLabel, TR_NOOP ("Cutoff"), 20.0, 20000.0, 1.0, " Hz");
-        setup (resonance, resonanceLabel, TR_NOOP ("Resonance"), 0.0, 1.0, 0.01, "");
+        knob (attack, attackLabel, TR_NOOP ("Attack"), nullptr, 0.0, 2.0, 0.001, 0.0);
+        knob (decay, decayLabel, TR_NOOP ("Decay"), nullptr, 0.0, 10.0, 0.001, 0.0);
+        knob (sustain, sustainLabel, TR_NOOP ("Sustain"), nullptr, 0.0, 1.0, 0.01, 1.0);
+        knob (release, releaseLabel, TR_NOOP ("Release"), nullptr, 0.0, 4.0, 0.001, 0.0);
+        for (auto* k : { &attack, &decay, &release })
+            k->textFromValueFunction = [] (double v) { return juce::String (v, 3) + " s"; };
+        knob (cutoff, cutoffLabel, TR_NOOP ("Cutoff"), nullptr, 20.0, 20000.0, 1.0, 20000.0);
+        cutoff.textFromValueFunction = [] (double v) { return juce::String (juce::roundToInt (v)) + " Hz"; };
+        knob (resonance, resonanceLabel, TR_NOOP ("Resonance"), nullptr, 0.0, 1.0, 0.01, 0.0);
         cutoff.setSkewFactorFromMidPoint (1000.0);
-        cutoff.setDoubleClickReturnValue (true, 20000.0);
         cutoff.setTooltip (tr ("Channel filter cutoff (low-pass at maximum with no resonance = off)"));
-        filterType.addItemList ({ tr ("Low-pass"), tr ("Band-pass"), tr ("High-pass"), tr ("Notch") }, 1);
-        filterType.onChange = [this] { apply(); };
-        addAndMakeVisible (filterType);
-        modulationButton.setButtonText (tr ("Modulation (envelopes and LFOs)..."));
-        modulationButton.onClick = [this] { showModulationFor (*this, engine, ref.index); };
-        addAndMakeVisible (modulationButton);
-        precomputeButton.setButtonText (tr ("Precomputed effects..."));
-        precomputeButton.setTooltip (tr ("FL's precomputed effects: remove DC, normalize, reverse polarity, fades, swap / fade stereo, trim, loop crossfade, loop points and the declicking mode"));
-        precomputeButton.onClick = [this] {
-            juce::CallOutBox::launchAsynchronously (std::make_unique<PrecomputePanel> (engine, ref), precomputeButton.getScreenBounds(), nullptr);
-        };
-        addAndMakeVisible (precomputeButton);
-        regionEnd.setDoubleClickReturnValue (true, 1.0);
-        regionStart.setTooltip (tr ("Where the sample starts playing (fraction of the file)"));
-        sustain.setDoubleClickReturnValue (true, 1.0);
         decay.setSkewFactorFromMidPoint (0.5);
-        stretch.setTooltip (tr ("0 = off. Otherwise the whole sample lasts this many beats and follows the BPM (by resampling, like FL's Resample mode)"));
         attack.setSkewFactorFromMidPoint (0.2);
         release.setSkewFactorFromMidPoint (0.4);
         release.setTooltip (tr ("0 = the whole sample plays (one-shot), like FL's steps"));
-
-        keepPitch.setButtonText (tr ("Keep length (stretch engine)"));
-        keepPitch.setTooltip (tr ("On: the pitch, the fine tune and the keys change the pitch without changing the length, and \"Stretch\" changes the length without changing the pitch (like FL's Stretch modes). Off: resample, pitch and speed change together"));
-        keepPitch.onClick = [this] { apply(); };
-        addAndMakeVisible (keepPitch);
-
-        stretchMethod.addItem (tr ("General"), 1);
-        stretchMethod.addItem (tr ("Drums / transients"), 2);
-        stretchMethod.addItem (tr ("Vocal / mono"), 3);
-        // LYNX's warp modes modelled on Ableton Live's (round 175a, N4)
-        stretchMethod.addSeparator();
-        stretchMethod.addItem (tr ("Warp: Beats"), 4);
-        stretchMethod.addItem (tr ("Warp: Tones"), 5);
-        stretchMethod.addItem (tr ("Warp: Texture"), 6);
-        stretchMethod.addItem (tr ("Warp: Complex"), 7);
-        stretchMethod.setTooltip (tr ("How the stretch keeping pitch is computed: General for full mixes and chords, Drums for loops and percussive sounds (attacks kept sharp), Vocal for a single voice or instrument"));
-        stretchMethod.onChange = [this] { apply(); };
-        addAndMakeVisible (stretchMethod);
-
-        reverse.setButtonText (tr ("Reverse"));
-        cut.setButtonText (tr ("Cut itself"));
+        filterType.addItemList ({ tr ("Low-pass"), tr ("Band-pass"), tr ("High-pass"), tr ("Notch") }, 1);
+        filterType.onChange = [this] { apply (&filterType); };
+        addAndMakeVisible (filterType);
+        toggle (cut, TR_NOOP ("Cut itself"), nullptr);
+        cut.setTooltip (tr ("A new note cuts the previous one (good for hi-hats and 808s)"));
         porta.setButtonText ("Porta");
         porta.setTooltip (tr ("Portamento: the note starts from the previous note's pitch (with Cut itself, the 808 glide)"));
-        cut.setTooltip (tr ("A new note cuts the previous one (good for hi-hats and 808s)"));
-
-        for (auto* b : { &reverse, &cut, &porta })
-        {
-            addAndMakeVisible (b);
-            b->onClick = [this] { apply(); };
-        }
+        porta.onClick = [this] { apply (&porta); };
+        addAndMakeVisible (porta);
+        modulationButton.setButtonText (tr ("Modulation (envelopes and LFOs)..."));
+        modulationButton.onClick = [this] { showModulationFor (*this, engine, ref.index); };
+        addAndMakeVisible (modulationButton);
+        extrasLabel.setText (tr ("LYNX extras"), juce::dontSendNotification);
 
         // the knobs an automation clip can drive (samplerparam, issue #12): right-click = FL's parameter menu; a move
         // is a tweak (Last tweaked, automation recording)
         for (auto [slider, param] : { std::pair { &attack, (int) samplerparam::attack }, { &decay, (int) samplerparam::decay },
                                       { &sustain, (int) samplerparam::sustain }, { &release, (int) samplerparam::release },
                                       { &cutoff, (int) samplerparam::cutoff }, { &resonance, (int) samplerparam::resonance },
-                                      { &regionStart, (int) samplerparam::start }, { &regionEnd, (int) samplerparam::end } })
+                                      { &regionStart, (int) samplerparam::start }, { &lengthKnob, (int) samplerparam::end } })
         {
             if (ref.index < 0) // (a Patcher node: no automation target)
                 break;
             const auto target = [this, param] { return AutomationTarget { AutomationTargetKind::channelParam, ref.index, 0, param }; };
-            // one menu, FL's parameter menu (the slider contract's plain value menu used to open beside it)
             ui::setOwnMenu (*slider);
             slider->onMenu = [this, slider, target] { ui::showSliderMenu (*slider, &engine, target()); };
-            slider->onDragStart = [this, target] { engine.noteTweaked (target(), true); };
+            slider->onDragStart = [this, target] { engine.noteTweaked (target(), true); engine.controlTweakedForUndo(); };
             slider->onDragEnd = [this, target] { engine.tweakReleased (target()); };
             tweakTargets.push_back ({ slider, param });
         }
 
-        wave.setEmptyText (tr ("No sample loaded"));
-        wave.setTooltip (tr ("The sample: colours show where it is bass-heavy (warm) or bright (cool); outside Start/End is dimmed"));
-        // round 190w: FL 2026 previews the sample when its display is clicked (from the start offset, to its end) and shows
-        // the playback locator over it (What's New 21138; [SHOT] flgap190w burst n2 / o3)
-        wave.onClick = [this] { previewFromDisplay(); };
-        addAndMakeVisible (wave);
+        // An audio clip's channel (live check 190ew, shot PL-x-audio-clip-channel-page-variants): FL's page has no
+        // Playback box (start offset, loop points) and nothing under the waveform. A Playlist clip plays its whole
+        // sample in LYNX too (SamplerInstrument clip mode skips the start offset, the loop knobs and the envelope /
+        // filter / portamento of LYNX's extras), so those controls are left out of it.
+        if (clipChannel)
+            for (auto* hidden : std::initializer_list<juce::Component*> { &startOffsetKnob, &startOffsetLabel, &loopStartKnob, &loopStartLabel,
+                                                                         &loopEndKnob, &loopEndLabel, &useLoops, &pingPong, &gain, &gainLabel,
+                                                                         &attack, &attackLabel, &decay, &decayLabel, &sustain, &sustainLabel,
+                                                                         &release, &releaseLabel, &cutoff, &cutoffLabel, &resonance,
+                                                                         &resonanceLabel, &filterType, &cut, &porta, &modulationButton })
+                hidden->setVisible (false);
 
         refresh();
+        showLegacy();
         engine.addChangeListener (this);
-        setSize (420, 676);
+        setSize (juce::roundToInt (designWidth * defaultScale), juce::roundToInt (pageHeight() * defaultScale));
         if (ref.index >= 0)
             startTimerHz (30); // the knobs follow their automation while the song plays (issue #12)
     }
 
     ~SettingsPanel() override
     {
+        wave.removeMouseListener (&waveDrag);
         stopPreview();
+        waveScroll.removeListener (this);
         engine.removeChangeListener (this);
     }
 
@@ -3067,66 +3603,143 @@ public:
         wave.setLocator (at);
     }
 
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (theme::colour::bg2);
+        // FL's boxes: a rounded panel with its caption on a tab at the top left (the File row has none)
+        for (const auto& [area, caption, captionLeft] : groups)
+        {
+            const auto r = area.toFloat();
+            g.setColour (theme::colour::bg3);
+            g.fillRoundedRectangle (r, 3.0f);
+            g.setColour (theme::colour::border);
+            g.drawRoundedRectangle (r.reduced (0.5f), 3.0f, 1.0f);
+            if (caption.isEmpty())
+                continue;
+            const auto h = scaled (19.0f);
+            g.setFont (theme::font (juce::jlimit (10.0f, 18.0f, scaled (12.5f)), true));
+            const auto w = (float) juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), caption) + scaled (16.0f);
+            juce::Path tab;
+            const auto x0 = r.getX() + scaled ((float) captionLeft);
+            tab.startNewSubPath (x0, r.getY());
+            tab.lineTo (x0 + w, r.getY());
+            tab.lineTo (x0 + w - h * 0.45f, r.getY() + h);
+            tab.lineTo (x0, r.getY() + h);
+            tab.closeSubPath();
+            g.setColour (theme::colour::bg4);
+            g.fillPath (tab);
+            g.setColour (theme::colour::textPrimary);
+            g.drawText (caption, juce::Rectangle<float> (x0 + scaled (6.0f), r.getY(), w, h), juce::Justification::centredLeft, false);
+        }
+        // FL 2026's loop glyph between the loop START and END captions
+        if (! loopGlyph.isEmpty())
+            icons::draw (g, Icon::loop, loopGlyph.toFloat(), theme::colour::textSecondary);
+    }
+
     void resized() override
     {
-        auto area = getLocalBounds().reduced (12);
-        wave.setBounds (area.removeFromTop (92));
-        area.removeFromTop (8);
-        auto place = [] (juce::Rectangle<int> row, std::initializer_list<std::pair<juce::Slider*, juce::Label*>> items) {
-            const auto w = row.getWidth() / 3;
-
-            for (auto [slider, label] : items)
-            {
-                auto column = row.removeFromLeft (w);
-                label->setBounds (column.removeFromTop (18));
-                slider->setBounds (column);
-            }
+        // FL's layout in its own units, scaled to the page (the whole page fits; at 1.25 it is FL's at 125 %)
+        scale = juce::jmax (0.55f, juce::jmin ((float) getWidth() / (float) designWidth, (float) getHeight() / (float) pageHeight()));
+        offsetX = juce::jmax (0, (getWidth() - juce::roundToInt ((float) designWidth * scale)) / 2);
+        groups.clear();
+        const auto captionFont = theme::font (juce::jlimit (8.0f, 13.0f, scaled (8.6f)), true);
+        const auto textFont = juce::jlimit (9.0f, 17.0f, scaled (12.0f));
+        auto place = [this, captionFont] (juce::Slider& k, juce::Label& label, int x, int y, int labelX, int labelW, int size = 34) {
+            k.setBounds (R (x, y, size, size));
+            label.setFont (captionFont);
+            label.setBounds (R (labelX, y + size - 1, labelW, 13));
         };
 
-        auto top = area.removeFromTop (110);
+        // left column: File row, Content, Playback
+        groups.push_back ({ R (7, 7, 268, 35), juce::String(), 0 });
         {
-            // Gain, Pitch, Stretch and the keep-pitch switch (a third of the width: its text is long)
-            const auto w4 = top.getWidth() * 2 / 9;
-            for (auto [slider, label] : { std::pair { &gain, &gainLabel }, { &pitch, &pitchLabel }, { &stretch, &stretchLabel } })
+            removeButton.setBounds (R (243, 13, 19, 23));
+            locateButton.setBounds (R (224, 13, 19, 23));
+            loadButton.setBounds (R (192, 13, 32, 23));
+            fileLabel.setFont (theme::font (textFont, true));
+            fileLabel.setBounds (R (11, 15, 24, 15));
+            fileName.setFont (theme::font (textFont));
+            fileName.setBounds (R (38, 13, 152, 21));
+        }
+        groups.push_back ({ R (7, 50, 268, 110), tr ("Content"), 0 });
+        keepOnDisk.setBounds (R (12, 75, 126, 21));
+        resampleBox.setBounds (R (12, 96, 126, 21));
+        loadRegionsBox.setBounds (R (140, 75, 128, 21));
+        loadMarkersBox.setBounds (R (140, 96, 128, 21));
+        declickLabel.setFont (theme::font (textFont));
+        declickLabel.setBounds (R (14, 126, 100, 23));
+        declick.setBounds (R (116, 126, 152, 23));
+
+        if (! clipChannel)
+            groups.push_back ({ R (7, 168, 268, 79), tr ("Playback"), 0 });
+        place (startOffsetKnob, startOffsetLabel, 26, 194, 9, 68);
+        place (loopStartKnob, loopStartLabel, 80, 194, 66, 40);
+        place (loopEndKnob, loopEndLabel, 118, 194, 112, 30);
+        loopGlyph = clipChannel ? juce::Rectangle<int>() : R (105, 229, 10, 10);
+        useLoops.setBounds (R (150, 191, 122, 21));
+        pingPong.setBounds (R (150, 213, 122, 21));
+
+        // right column: Time stretching, Precomputed effects
+        groups.push_back ({ R (283, 7, 268, 76), tr ("Time stretching"), 0 });
+        place (stretchPitchKnob, stretchPitchLabel, 291, 33, 285, 44, 32);
+        place (mulKnob, mulLabel, 333, 33, 327, 44, 32);
+        place (stretch, stretchLabel, 373, 33, 367, 44, 32);
+        modeLabel.setFont (theme::font (textFont, true));
+        modeLabel.setBounds (R (410, 31, 40, 23));
+        stretchMethod.setBounds (R (450, 31, 96, 23));
+
+        groups.push_back ({ R (283, 91, 268, 156), tr ("Precomputed effects"), 49 });
+        effectsTarget.setBounds (R (284, 92, 46, 18));
+        removeDc.setBounds (R (288, 116, 126, 23));
+        normalize.setBounds (R (288, 138, 126, 23));
+        reverse.setBounds (R (288, 160, 126, 23));
+        polarity.setBounds (R (416, 116, 130, 23));
+        fadeStereo.setBounds (R (416, 138, 130, 23));
+        swapStereo.setBounds (R (416, 160, 130, 23));
+        place (regionStart, regionStartLabel, 290, 195, 280, 54);
+        place (lengthKnob, lengthLabel, 332, 195, 326, 46);
+        place (fadeIn, fadeInLabel, 386, 195, 383, 40);
+        place (fadeOut, fadeOutLabel, 425, 195, 422, 40);
+        place (crossfade, crossfadeLabel, 472, 195, 459, 60);
+        place (trim, trimLabel, 511, 195, 508, 40);
+        // the legacy panel over the same box (FXLegacyPanel at 284, 113)
+        place (boost, boostLabel, 291, 118, 285, 46);
+        place (eq, eqLabel, 333, 118, 327, 46);
+        place (ringMix, ringMixLabel, 381, 118, 375, 46);
+        place (ringFreq, ringFreqLabel, 421, 118, 415, 46);
+        place (legacyCut, legacyCutLabel, 472, 117, 466, 46);
+        place (legacyRes, legacyResLabel, 511, 117, 505, 46);
+        clip.setBounds (R (287, 167, 52, 16));
+        reverbType.setBounds (R (288, 199, 44, 22));
+        place (reverbAmount, reverbLabel, 333, 195, 324, 52);
+        place (stereoDelay, stereoDelayLabel, 381, 195, 362, 72);
+        place (pogo, pogoLabel, 511, 195, 505, 46);
+
+        // the waveform under both columns, with its scroll bar
+        wave.setBounds (R (7, 255, 544, 112));
+        waveScroll.setBounds (R (7, 368, 544, 14));
+
+        // LYNX extras (FL's page has no place for them)
+        if (! clipChannel)
+            groups.push_back ({ R (7, 390, 544, 128), extrasLabel.getText(), 0 });
+        {
+            int x = 18;
+            for (auto [k, label] : { std::pair { &gain, &gainLabel }, { &attack, &attackLabel }, { &decay, &decayLabel },
+                                     { &sustain, &sustainLabel }, { &release, &releaseLabel }, { &cutoff, &cutoffLabel },
+                                     { &resonance, &resonanceLabel } })
             {
-                auto column = top.removeFromLeft (w4);
-                label->setBounds (column.removeFromTop (18));
-                slider->setBounds (column);
+                place (*k, *label, x, 418, x - 12, 58, 36);
+                x += 58;
             }
-            auto column = top.withSizeKeepingCentre (juce::jmin (top.getWidth(), 140), juce::jmin (top.getHeight(), 64));
-            keepPitch.setBounds (column.removeFromTop (column.getHeight() / 2));
-            stretchMethod.setBounds (column.withSizeKeepingCentre (column.getWidth(), juce::jmin (column.getHeight(), 24)));
+            filterType.setBounds (R (432, 420, 110, 22));
+            cut.setBounds (R (432, 446, 110, 21));
+            porta.setBounds (R (432, 468, 110, 21));
+            modulationButton.setBounds (R (18, 488, 260, 22));
         }
-        area.removeFromTop (6);
-        auto envelope = area.removeFromTop (110);
-        const auto w = envelope.getWidth() / 4;
-
-        for (auto [slider, label] : { std::pair { &attack, &attackLabel }, { &decay, &decayLabel }, { &sustain, &sustainLabel }, { &release, &releaseLabel } })
-        {
-            auto column = envelope.removeFromLeft (w);
-            label->setBounds (column.removeFromTop (18));
-            slider->setBounds (column);
-        }
-
-        area.removeFromTop (8);
-        area.removeFromTop (6);
-        place (area.removeFromTop (110), { { &startOffsetKnob, &startOffsetLabel }, { &regionStart, &regionStartLabel }, { &regionEnd, &regionEndLabel } });
-        area.removeFromTop (6);
-        {
-            auto filterRow = area.removeFromTop (110);
-            filterType.setBounds (filterRow.removeFromRight (filterRow.getWidth() / 3).withSizeKeepingCentre (124, 24));
-            place (filterRow.withWidth (filterRow.getWidth() * 3 / 2), { { &cutoff, &cutoffLabel }, { &resonance, &resonanceLabel } });
-        }
-        {
-            auto buttons = area.removeFromBottom (26);
-            const auto half = buttons.getWidth() / 2;
-            modulationButton.setBounds (buttons.removeFromLeft (half).reduced (4, 0));
-            precomputeButton.setBounds (buttons.reduced (4, 0));
-        }
-        area.removeFromTop (6);
-        reverse.setBounds (area.removeFromLeft (150).removeFromTop (24));
-        cut.setBounds (area.removeFromLeft (130).removeFromTop (24));
-        porta.setBounds (area.removeFromLeft (100).removeFromTop (24));
+        for (auto* b : { &keepOnDisk, &resampleBox, &loadRegionsBox, &loadMarkersBox, &useLoops, &pingPong, &removeDc, &normalize, &reverse,
+                         &polarity, &fadeStereo, &swapStereo, &clip, &cut, &porta })
+            b->setSize (b->getWidth(), b->getHeight()); // (their text follows the LookAndFeel's toggle font, sized by height)
+        repaint();
     }
 
     int getChannel() const noexcept { return ref.index; }
@@ -3163,7 +3776,135 @@ public:
         }
     }
 
+    // (the shot route, round 190dh: turn a control as a user would — `what`: a knob's name or a toggle's — and read the
+    // channel back; true when the control exists)
+    bool shotTurn (const juce::String& what, double value, bool shift = false)
+    {
+        refresh(); // (the engine's change message is asynchronous: the page shows the channel as a user would see it)
+        shiftHeld = shift;
+        const juce::ScopedValueSetter<bool> nofocus (shotDriven, true);
+        auto turn = [&] (juce::Slider& s) { s.setValue (value, juce::sendNotificationSync); return true; };
+        auto click = [&] (juce::Button& b) { b.setToggleState (value != 0.0, juce::dontSendNotification); b.onClick(); return true; };
+        bool done = false;
+        if (what == "pitch") done = turn (stretchPitchKnob);
+        else if (what == "mul") done = turn (mulKnob);
+        else if (what == "time") done = turn (stretch);
+        else if (what == "loopStart") done = turn (loopStartKnob);
+        else if (what == "loopEnd") done = turn (loopEndKnob);
+        else if (what == "crossfade") done = turn (crossfade);
+        else if (what == "smpStart") done = turn (regionStart);
+        else if (what == "length") done = turn (lengthKnob);
+        else if (what == "useLoops") done = click (useLoops);
+        else if (what == "pingPong") done = click (pingPong);
+        else if (what == "keepOnDisk") done = click (keepOnDisk);
+        else if (what == "mode") { stretchMethod.setSelectedId ((int) value + 1, juce::sendNotificationSync); done = true; }
+        else if (what == "declick") { declick.setSelectedId ((int) value + 1, juce::sendNotificationSync); done = true; }
+        else if (what == "legacy") { effectsTarget.setIndex ((int) value); showLegacy(); done = true; }
+        else if (what == "zoom") { wave.setView (0.25, 0.25 + value); done = true; }
+        // round 190im (R11): a handle dragged on the waveform to `value` (start: region fraction; loop: file fraction)
+        else if (what.startsWith ("drag") && wave.onHandleDrag != nullptr)
+        {
+            using H = ui::WaveformDisplay::Handle;
+            const auto h = what == "dragStart" ? H::start : what == "dragLoopStart" ? H::loopStart : H::loopEnd;
+            wave.onHandleDrag (h, value, shift);
+            done = true;
+        }
+        shiftHeld = false;
+        refresh();
+        return done;
+    }
+    bool shotLegacyShown() const { return boost.isVisible() && ! removeDc.isVisible(); }
+    juce::String handleProbeForShot (const juce::String& name) const
+    {
+        using H = ui::WaveformDisplay::Handle;
+        const auto h = name == "Start" ? H::start : name == "LoopStart" ? H::loopStart : H::loopEnd;
+        const auto x = wave.handleXForSnapshot (h);
+        if (x < 0.0f)
+            return "none";
+        const auto got = wave.handleAt ({ x + 1.0f, (float) wave.getHeight() * 0.25f });
+        return got == H::start ? "start" : got == H::loopStart ? "loopStart" : got == H::loopEnd ? "loopEnd" : "none";
+    }
+    bool shotEnabled (const juce::String& what) const
+    {
+        return what == "keepOnDisk"    ? keepOnDisk.isEnabled()
+               : what == "loopStart"   ? loopStartKnob.isEnabled()
+               : what == "resample"    ? resampleBox.isEnabled()
+               : what == "loadRegions" ? loadRegionsBox.isEnabled()
+               : what == "loadMarkers" ? loadMarkersBox.isEnabled()
+                                       : false;
+    }
+    juce::String shotText (const juce::String& what)
+    {
+        if (what == "mulText")
+            return mulKnob.getTextFromValue (mulKnob.getValue());
+        if (what == "corner")
+            return wave.getCornerText();
+        if (what == "waveHint")
+            return wave.getTooltip();
+        return {};
+    }
+    double shotScrollStart() const { return waveScroll.getCurrentRangeStart(); }
+    juce::String shotModeText() const { return stretchMethod.getText(); }
+
 private:
+    int pageHeight() const noexcept { return clipChannel ? clipDesignHeight : designHeight; }
+
+    juce::Rectangle<int> R (int x, int y, int w, int h) const
+    {
+        return { offsetX + juce::roundToInt ((float) x * scale), juce::roundToInt ((float) y * scale), juce::roundToInt ((float) w * scale),
+                 juce::roundToInt ((float) h * scale) };
+    }
+    float scaled (float v) const noexcept { return v * scale; }
+
+    void toggle (juce::ToggleButton& b, const char* text, const char* hint)
+    {
+        b.setButtonText (tr (text));
+        if (hint != nullptr)
+            b.setTooltip (tr (hint));
+        b.onClick = [this, &b] { apply (&b); };
+        addAndMakeVisible (b);
+    }
+
+    void knob (juce::Slider& s, juce::Label& label, const char* name, const char* hint, double lo, double hi, double step, double def)
+    {
+        s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        s.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        s.setPopupDisplayEnabled (true, true, this);
+        s.setRange (lo, hi, step);
+        s.setValue (def, juce::dontSendNotification);
+        s.setDoubleClickReturnValue (true, def);
+        if (hint != nullptr)
+            s.setTooltip (tr (hint));
+        s.onValueChange = [this, &s] { apply (&s); };
+        label.setText (tr (name).toUpperCase(), juce::dontSendNotification);
+        label.setJustificationType (juce::Justification::centredTop);
+        label.setColour (juce::Label::textColourId, theme::colour::textSecondary);
+        label.setInterceptsMouseClicks (false, false);
+        label.setBorderSize ({});
+        addAndMakeVisible (s);
+        addAndMakeVisible (label);
+    }
+
+    // FL's EffectsTargetSelect: cell 1 shows the legacy panel over the effects (FUN_0060a270 on FXLegacyPanel)
+    void showLegacy()
+    {
+        const auto legacy = effectsTarget.getIndex() == 1;
+        for (juce::Component* c : std::initializer_list<juce::Component*> { &removeDc, &normalize, &reverse, &polarity, &fadeStereo, &swapStereo, &regionStart,
+                                                                           &regionStartLabel, &lengthKnob, &lengthLabel, &fadeIn, &fadeInLabel, &fadeOut,
+                                                                           &fadeOutLabel, &crossfade, &crossfadeLabel, &trim, &trimLabel })
+            c->setVisible (! legacy);
+        for (juce::Component* c : std::initializer_list<juce::Component*> { &boost, &boostLabel, &eq, &eqLabel, &ringMix, &ringMixLabel, &ringFreq, &ringFreqLabel,
+                                                                           &legacyCut, &legacyCutLabel, &legacyRes, &legacyResLabel, &reverbAmount, &reverbLabel,
+                                                                           &stereoDelay, &stereoDelayLabel, &pogo, &pogoLabel, &reverbType, &clip })
+            c->setVisible (legacy);
+    }
+
+    void scrollBarMoved (juce::ScrollBar*, double start) override
+    {
+        const auto width = wave.getViewEnd() - wave.getViewStart();
+        wave.setView (start, start + width);
+    }
+
     void setDropHighlight (bool on)
     {
         if (dropHighlight != on)
@@ -3173,7 +3914,8 @@ private:
         }
     }
 
-    // the new sample plays with the same settings; slices of the old one no longer apply, the channel takes its name
+    // the new sample plays with the same settings; slices of the old one no longer apply, the channel takes its name;
+    // loop points set on the old one go with it
     void replaceSample (const juce::File& file)
     {
         if (current() == nullptr || ! file.existsAsFile())
@@ -3187,67 +3929,356 @@ private:
             d.samplePath = path;
             d.zones.clear();
             d.sampler.slices.clear();
+            d.sampler.loopStart = d.sampler.loopEnd = -1;
             d.name = name;
         });
+        samplehistory::add (file.getFullPathName().toStdString()); // (FL: every sample a sampler loads)
     }
 
-    void setup (juce::Slider& s, juce::Label& label, const char* name, double lo, double hi, double step, const char* suffix)
+    // FL's Load button [OpenBtnClick 0xf68f20]: the sample file dialog
+    void chooseSample()
     {
-        s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-        s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 18);
-        s.setRange (lo, hi, step);
-        s.setTextValueSuffix (suffix);
-        s.setDoubleClickReturnValue (true, 0.0);
-        s.onValueChange = [this, &s] { apply (&s); };
-        label.setText (tr (name), juce::dontSendNotification);
-        label.setJustificationType (juce::Justification::centred);
-        addAndMakeVisible (s);
-        addAndMakeVisible (label);
+        const auto* c = current();
+        const juce::File now (c != nullptr ? juce::String::fromUTF8 (c->samplePath.c_str()) : juce::String());
+        sampleChooser = lynx::ui::makeFileChooser (tr ("Load sample file..."), now.existsAsFile() ? now : juce::File(),
+                                                   "*.wav;*.aif;*.aiff;*.flac;*.ogg;*.mp3");
+        lynx::ui::launchChooser (sampleChooser, juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                 [safe = juce::Component::SafePointer<SettingsPanel> (this)] (const juce::FileChooser& fc) {
+                                     if (safe != nullptr && fc.getResult() != juce::File())
+                                         safe->replaceSample (fc.getResult());
+                                 });
     }
 
+    // FL's right-click on Load [WAVFileNameListMenuPopup 0x121afb0]: caption "Sample history", then the samples loaded
+    // (newest first, by name); a click loads one into this channel
+    juce::PopupMenu sampleHistoryMenu()
+    {
+        juce::PopupMenu menu;
+        const auto& paths = samplehistory::list();
+        if (paths.empty())
+            return menu;
+        menu.addSectionHeader (tr ("Sample history"));
+        for (const auto& p : paths)
+        {
+            const juce::File file (juce::String::fromUTF8 (p.c_str()));
+            menu.addItem (file.getFileName(), [safe = juce::Component::SafePointer<SettingsPanel> (this), file] {
+                if (safe != nullptr)
+                    if (const auto* c = safe->current(); c != nullptr && c->samplePath != file.getFullPathName().toStdString())
+                        safe->replaceSample (file);
+            });
+        }
+        return menu;
+    }
+    void showSampleHistory()
+    {
+        auto menu = sampleHistoryMenu();
+        if (menu.getNumItems() > 0)
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&loadButton));
+    }
+
+    // FL's Remove sample [RemoveBtnClick 0xf667a0]: one undo step "remove channel sample", only with a sample
+    void removeSample()
+    {
+        const auto* c = current();
+        if (c == nullptr || (c->samplePath.empty() && c->zones.empty()))
+            return;
+        stopPreview();
+        // (live check 190ew CTL-4: FL also renames the channel "Sampler", without asking)
+        ref.edit (engine, [] (ChannelDef& d) { samplerpage::removeSample (d); });
+    }
+
+    // FL's waveform menu (live check 190ew SMP-7, samplerpage::waveMenu): the items LYNX performs, in FL's order and groups
+    juce::PopupMenu waveMenu()
+    {
+        juce::PopupMenu menu;
+        const auto* c = current();
+        if (c == nullptr)
+            return menu;
+        const auto sample = sampleOf (*c);
+        const juce::File file (juce::String::fromUTF8 (c->samplePath.c_str()));
+        const auto has = sample != nullptr && sample->frames() > 0;
+        auto pendingLine = false;
+        for (const auto& e : samplerpage::waveMenu())
+        {
+            if (e.text == nullptr)
+            {
+                pendingLine = menu.getNumItems() > 0;
+                continue;
+            }
+            if (! e.have)
+                continue;
+            if (pendingLine)
+                menu.addSeparator();
+            pendingLine = false;
+            const juce::String key (e.text);
+            const auto text = tr (e.text) + (juce::String (e.shortcut).isNotEmpty() ? "\t" + juce::String (e.shortcut) : juce::String());
+            auto safe = juce::Component::SafePointer<SettingsPanel> (this);
+            if (key == "Reload")
+                menu.addItem (text, file.existsAsFile(), false, [safe, file] {
+                    if (safe == nullptr)
+                        return;
+                    // (the file may have changed on disk: the library reads it again)
+                    safe->engine.getSampleLibrary().forget (file.getFullPathName());
+                    safe->ref.edit (safe->engine, [path = file.getFullPathName().toStdString()] (ChannelDef& d) { d.samplePath = path; });
+                    safe->refresh();
+                });
+            else if (key == "Save as...")
+                menu.addItem (text, has, false, [safe] { if (safe != nullptr) safe->saveSampleAs(); });
+            else if (key == "Locate file")
+                menu.addItem (text, file.existsAsFile(), false, [file] { file.revealToUser(); });
+            else if (key == "Copy audio to clipboard")
+                menu.addItem (text, has, false, [sample] {
+                    audioedit::Audio a;
+                    a.sampleRate = sample->sampleRate;
+                    a.channels.emplace_back (sample->leftData(), sample->leftData() + sample->frames());
+                    if (sample->isStereo())
+                        a.channels.emplace_back (sample->rightData(), sample->rightData() + sample->frames());
+                    audioclipboard::editor() = std::move (a);
+                });
+            else if (key == "Paste audio from clipboard")
+                menu.addItem (text, audioclipboard::hasAudio(), false, [safe] {
+                    const auto wav = audioclipboard::wav();
+                    if (safe == nullptr || wav.empty())
+                        return;
+                    // (FL loads the clipboard's audio as the channel's sample: LYNX writes it to the clipboard files first)
+                    const auto saved = audioclipboard::save ("Audio clipboard", ".wav", wav.data(), wav.size());
+                    if (saved.existsAsFile())
+                        safe->replaceSample (saved);
+                });
+            else if (key == "Edit in audio editor")
+                menu.addItem (text, has && ref.index >= 0, false, [safe] {
+                    if (safe != nullptr)
+                        openAudioEditorForChannel (safe->engine, safe->ref.index);
+                });
+            else if (key == "Open in new sampler channel" || key == "Open in new Fruity Granulizer channel" || key == "Open in new Fruity Slicer channel"
+                     || key == "Open in new Slicex channel")
+            {
+                const auto kind = key == "Open in new sampler channel"            ? InstrumentKind::sampler
+                                  : key == "Open in new Fruity Granulizer channel" ? InstrumentKind::granulizer
+                                  : key == "Open in new Fruity Slicer channel"     ? InstrumentKind::fruityslicer
+                                                                                   : InstrumentKind::slicex;
+                menu.addItem (text, file.existsAsFile() && openInNewChannelHandler() != nullptr, false, [file, kind] {
+                    if (openInNewChannelHandler())
+                        openInNewChannelHandler() (file, kind);
+                });
+            }
+            else if (key == "Edit in pitch corrector" || key == "Edit in time warper") // (round 190gw)
+                menu.addItem (text, has && file.existsAsFile(), false, [safe, file, kind = key == "Edit in pitch corrector" ? EffectKind::newtone : EffectKind::newtime] {
+                    if (safe != nullptr)
+                        openSampleInMasterEditor (safe->engine, kind, file.getFullPathName().toStdString());
+                });
+            else if (key == "Spectrum view" || key == "Multichannel waveform view") // (round 190gw: FL's global view switches)
+            {
+                const auto spectrum = key == "Spectrum view";
+                auto& views = samplerpage::waveViews();
+                menu.addItem (text, true, spectrum ? views.spectrum : views.multichannel, [safe, spectrum] {
+                    auto& v = samplerpage::waveViews();
+                    (spectrum ? v.spectrum : v.multichannel) = ! (spectrum ? v.spectrum : v.multichannel);
+                    if (safe != nullptr)
+                        safe->wave.repaint();
+                    if (EditorGlobals::get().onOptionsChanged) // (kept in the UI settings)
+                        EditorGlobals::get().onOptionsChanged();
+                });
+            }
+            else if (key == "Get properties")
+            {
+                if (fileProperties) // (FL: Explorer's Properties of the sample's file; no such window on the other systems)
+                    menu.addItem (text, file.existsAsFile(), false, [file] { showFileProperties (file); });
+            }
+            else if (key == "Detect tempo")
+                menu.addItem (text, has, false, [safe, sample] {
+                    if (safe == nullptr)
+                        return;
+                    const auto* ch = safe->current();
+                    ui::TempoDetectionRequest r;
+                    r.name = ch != nullptr ? juce::String::fromUTF8 (ch->name.c_str()) : juce::String();
+                    r.sample = sample;
+                    r.projectBpm = safe->engine.getSong().bpm;
+                    r.hasTempoInfo = sample->acidBeats > 0.0f;
+                    // (the tempo picked: the sample lasts that many beats, TIME on the page; no tempo: TIME off)
+                    r.apply = [safe] (double beats) {
+                        if (safe != nullptr)
+                            safe->ref.edit (safe->engine, [beats] (ChannelDef& d) { samplerpage::setStretchTime (d.sampler, (float) beats); });
+                    };
+                    ui::showTempoDetectionDialog (std::move (r));
+                });
+        }
+        return menu;
+    }
+
+    void saveSampleAs()
+    {
+        const auto* c = current();
+        const auto sample = c != nullptr ? sampleOf (*c) : nullptr;
+        if (sample == nullptr)
+            return;
+        const juce::File now (juce::String::fromUTF8 (c->samplePath.c_str()));
+        sampleChooser = lynx::ui::makeFileChooser (tr ("Save as..."), now.getParentDirectory().getChildFile (now.getFileNameWithoutExtension() + ".wav"), "*.wav");
+        lynx::ui::launchChooser (sampleChooser, juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                                                    | juce::FileBrowserComponent::warnAboutOverwriting,
+                                 [sample] (const juce::FileChooser& fc) {
+                                     auto target = fc.getResult();
+                                     if (target == juce::File())
+                                         return;
+                                     audioedit::Document doc;
+                                     doc.audio.sampleRate = sample->sampleRate;
+                                     doc.audio.channels.emplace_back (sample->leftData(), sample->leftData() + sample->frames());
+                                     if (sample->isStereo())
+                                         doc.audio.channels.emplace_back (sample->rightData(), sample->rightData() + sample->frames());
+                                     doc.loopStart = sample->loopStart;
+                                     doc.loopEnd = sample->loopEnd;
+                                     const auto format = sample->floatData || sample->bitsPerSample > 24 ? audioedit::WavFormat::float32
+                                                         : sample->bitsPerSample > 16                    ? audioedit::WavFormat::int24
+                                                                                                         : audioedit::WavFormat::int16;
+                                     const auto bytes = audioedit::encodeWav (doc, format);
+                                     target.withFileExtension ("wav").replaceWithData (bytes.data(), bytes.size());
+                                 });
+    }
+
+public:
+    juce::PopupMenu waveMenuForShot() { return waveMenu(); }
+    // (the shot route: the history menu without showing it, and the row's buttons)
+    juce::PopupMenu sampleHistoryMenuForShot() { return sampleHistoryMenu(); }
+    void pressFileRow (int button)
+    {
+        if (button == 0 || button == 1)
+            loadButton.onWheel (button == 0 ? -1 : 1);
+        else if (button == 2)
+            locateButton.onClick();
+        else if (button == 3)
+            removeSample();
+    }
+
+private:
     const ChannelDef* current() const
     {
         return ref.get (engine);
     }
 
+    // the channel's sample as the loop knobs see it (frames and the file's own loop); none for a multi-sample channel
+    std::shared_ptr<const SampleData> sampleOf (const ChannelDef& c) const
+    {
+        if (c.samplePath.empty() || ! c.zones.empty())
+            return nullptr;
+        return engine.getSampleLibrary().load (juce::String::fromUTF8 (c.samplePath.c_str()));
+    }
+
     void refresh()
     {
-        if (const auto* c = current())
+        const auto* c = current();
+        if (c == nullptr)
+            return;
+        const auto& s = c->sampler;
+        const juce::ScopedValueSetter<bool> guard (updating, true);
+        const auto sample = sampleOf (*c);
+        const auto frames = sample != nullptr ? (std::int64_t) sample->frames() : 0;
+        // Content (live check 190ew SMP-1 / SMP-2: all greyed without a sample; Resample at the project's rate, Load
+        // regions / Load slice markers without regions / slice markers in the file)
+        const auto hasSample = sample != nullptr;
+        keepOnDisk.setToggleState (s.keepOnDisk, juce::dontSendNotification);
+        keepOnDisk.setEnabled (hasSample && samplerpage::keepOnDiskAvailable (s, sample->loopStart >= 0 && sample->loopEnd > sample->loopStart));
+        resampleBox.setEnabled (samplerpage::resampleAvailable (hasSample, hasSample ? sample->sampleRate : 0.0, engine.getTransport().sampleRate.load()));
+        loadRegionsBox.setEnabled (samplerpage::loadRegionsAvailable (hasSample, hasSample && ! sample->markerStarts.empty()));
+        loadMarkersBox.setEnabled (samplerpage::loadSliceMarkersAvailable (hasSample, hasSample && sample->sliceMarkers > 0));
+        resampleBox.setToggleState (s.resampleOnLoad, juce::dontSendNotification);
+        loadRegionsBox.setToggleState (s.loadRegions, juce::dontSendNotification);
+        loadMarkersBox.setToggleState (s.loadSliceMarkers, juce::dontSendNotification);
+        declick.setSelectedId (juce::jlimit (0, 5, s.declickMode) + 1, juce::dontSendNotification);
+        // Playback
+        startOffsetKnob.setValue (s.startOffset, juce::dontSendNotification);
+        useLoops.setToggleState (s.useLoopPoints, juce::dontSendNotification);
+        pingPong.setToggleState (s.precompute.pingPong, juce::dontSendNotification);
+        loopStartKnob.setEnabled (frames > 1);
+        loopEndKnob.setEnabled (frames > 1);
+        shownFileLoop = { sample != nullptr ? sample->loopStart : -1, sample != nullptr ? sample->loopEnd : -1 };
+        shownFrames = frames;
+        if (frames > 1)
         {
-            updating = true;
-            pitch.setValue (c->sampler.pitch, juce::dontSendNotification);
-            gain.setValue (c->sampler.gainDb, juce::dontSendNotification);
-            attack.setValue (c->sampler.attack, juce::dontSendNotification);
-            decay.setValue (c->sampler.decay, juce::dontSendNotification);
-            sustain.setValue (c->sampler.sustain, juce::dontSendNotification);
-            stretch.setValue (c->sampler.stretchBeats, juce::dontSendNotification);
-            shownStretch = stretch.getValue();
-            keepPitch.setToggleState (c->sampler.keepPitch, juce::dontSendNotification);
-            stretchMethod.setSelectedId ((int) c->sampler.stretchMethod + 1, juce::dontSendNotification);
-            stretchMethod.setEnabled (c->sampler.keepPitch);
-            regionStart.setValue (c->sampler.regionStart, juce::dontSendNotification);
-            startOffsetKnob.setValue (c->sampler.startOffset, juce::dontSendNotification);
-            regionEnd.setValue (c->sampler.regionEnd, juce::dontSendNotification);
-            cutoff.setValue (c->sampler.cutoff, juce::dontSendNotification);
-            resonance.setValue (c->sampler.resonance, juce::dontSendNotification);
-            filterType.setSelectedId (c->sampler.filterType + 1, juce::dontSendNotification);
-            release.setValue (c->sampler.release, juce::dontSendNotification);
-            reverse.setToggleState (c->sampler.reverse, juce::dontSendNotification);
-            cut.setToggleState (channelCutsItself (*c), juce::dontSendNotification); // (issue #68: the rack menu's state too)
-            porta.setToggleState (c->sampler.porta, juce::dontSendNotification);
-            updating = false;
-            showAutomation (true);
-
-            const auto path = juce::String::fromUTF8 ((c->samplePath.empty() && ! c->zones.empty() ? c->zones.front().path : c->samplePath).c_str());
-            wave.setFile (path, [&e = engine, path] { return e.getSampleLibrary().load (path); });
-            wave.setRegion (c->sampler.regionStart, c->sampler.regionEnd);
-            wave.setReversed (c->sampler.reverse);
-            wave.setStartOffset (c->sampler.startOffset); // round 190w (FL dims the region before it)
-
-            if (auto* w = findParentComponentOfClass<juce::DocumentWindow>())
-                w->setName (tr ("Sampler settings - {0}", { juce::String::fromUTF8 (c->name.c_str()) })
-                            + (c->zones.empty() ? juce::String() : tr (" (multi-sample: {0} zones)", { juce::String ((int) c->zones.size()) })));
+            loopStartKnob.setRange (0.0, (double) (frames - 1), 1.0);
+            loopEndKnob.setRange (0.0, (double) (frames - 1), 1.0);
+            const auto [a, b] = samplerpage::shownLoop (s, shownFileLoop.first, shownFileLoop.second);
+            loopStartKnob.setValue ((double) juce::jmax<std::int64_t> (0, a), juce::dontSendNotification);
+            loopEndKnob.setValue ((double) (b >= 0 ? b : frames - 1), juce::dontSendNotification);
+            loopStartKnob.setDoubleClickReturnValue (false, 0.0);
+            loopEndKnob.setDoubleClickReturnValue (false, 0.0);
+            wave.setLoop (a >= 0 && s.useLoopPoints ? (float) a / (float) (frames - 1) : -1.0f, b >= 0 && s.useLoopPoints ? (float) b / (float) (frames - 1) : -1.0f);
         }
+        else
+            wave.setLoop (-1.0f, -1.0f);
+        // round 190ey (live check 190ew SMP-7 / SMP-7b): FL's bit-depth box, and its summary as the waveform's hint
+        if (hasSample)
+        {
+            const auto bits = samplerpage::bitDepthShown (sample->bitsPerSample, s.precompute.any());
+            wave.setCornerText (bits > 0 ? juce::String (bits) : juce::String());
+            wave.setTooltip (juce::String (samplerpage::sampleSummary (sample->sampleRate, sample->floatData && ! s.precompute.any() ? sample->bitsPerSample : bits,
+                                                                       sample->floatData || s.precompute.any(), sample->isStereo(),
+                                                                       (double) frames / juce::jmax (1.0, sample->sampleRate), sample->isMapped())));
+        }
+        else
+        {
+            wave.setCornerText ({});
+            wave.setTooltip (tr ("Waveform") + " - " + tr ("click: preview the sample; mouse wheel: zoom"));
+        }
+        // Time stretching
+        stretchPitchKnob.setValue (s.flStretchPitch, juce::dontSendNotification);
+        mulKnob.setValue (s.stretchMul, juce::dontSendNotification);
+        stretch.setValue (samplerpage::stretchTime (s), juce::dontSendNotification);
+        stretchMethod.setSelectedId (samplerpage::modeIndex (s) + 1, juce::dontSendNotification);
+        // Precomputed effects
+        const auto& p = s.precompute;
+        removeDc.setToggleState (p.removeDc, juce::dontSendNotification);
+        normalize.setToggleState (p.normalize, juce::dontSendNotification);
+        reverse.setToggleState (s.reverse, juce::dontSendNotification);
+        polarity.setToggleState (p.reversePolarity, juce::dontSendNotification);
+        fadeStereo.setToggleState (p.fadeStereo, juce::dontSendNotification);
+        swapStereo.setToggleState (p.swapStereo, juce::dontSendNotification);
+        regionStart.setValue (s.regionStart, juce::dontSendNotification);
+        lengthKnob.setValue (samplerpage::lengthOf (s), juce::dontSendNotification);
+        fadeIn.setValue (p.fadeIn, juce::dontSendNotification);
+        fadeOut.setValue (p.fadeOut, juce::dontSendNotification);
+        // (a value over FL's knob range from an old project shows at the end of a range that holds it)
+        crossfade.setRange (0.0, juce::jmax (1024.0, (double) p.crossfade), 1.0);
+        crossfade.setValue (p.crossfade, juce::dontSendNotification);
+        trim.setRange (0.0, juce::jmax (256.0, (double) p.trim), 1.0);
+        trim.setValue (p.trim, juce::dontSendNotification);
+        boost.setValue (p.boost, juce::dontSendNotification);
+        eq.setValue (p.eq, juce::dontSendNotification);
+        ringMix.setValue (p.ringMix, juce::dontSendNotification);
+        ringFreq.setValue (p.ringFreq, juce::dontSendNotification);
+        legacyCut.setValue (p.cutoff, juce::dontSendNotification);
+        legacyRes.setValue (p.resonance, juce::dontSendNotification);
+        reverbAmount.setValue (p.reverb, juce::dontSendNotification);
+        reverbType.setSelectedId (p.reverbType == 0 ? 1 : 2, juce::dontSendNotification);
+        stereoDelay.setValue (p.stereoDelay, juce::dontSendNotification);
+        pogo.setValue (p.pogo, juce::dontSendNotification);
+        clip.setToggleState (p.clip, juce::dontSendNotification);
+        // LYNX extras
+        gain.setValue (s.gainDb, juce::dontSendNotification);
+        attack.setValue (s.attack, juce::dontSendNotification);
+        decay.setValue (s.decay, juce::dontSendNotification);
+        sustain.setValue (s.sustain, juce::dontSendNotification);
+        release.setValue (s.release, juce::dontSendNotification);
+        cutoff.setValue (s.cutoff, juce::dontSendNotification);
+        resonance.setValue (s.resonance, juce::dontSendNotification);
+        filterType.setSelectedId (s.filterType + 1, juce::dontSendNotification);
+        cut.setToggleState (channelCutsItself (*c), juce::dontSendNotification); // (issue #68: the rack menu's state too)
+        porta.setToggleState (s.porta, juce::dontSendNotification);
+        showAutomation (true);
+
+        const auto path = juce::String::fromUTF8 ((c->samplePath.empty() && ! c->zones.empty() ? c->zones.front().path : c->samplePath).c_str());
+        fileName.setText (juce::File (path).getFileName(), juce::dontSendNotification); // (FL: the name, the path's end)
+        fileName.setTooltip (path);
+        locateButton.setEnabled (! c->samplePath.empty());
+        removeButton.setEnabled (! c->samplePath.empty() || ! c->zones.empty());
+        wave.setFile (path, [&e = engine, path] { return e.getSampleLibrary().load (path); });
+        wavePath = path;
+        wave.setRegion (s.regionStart, s.regionEnd);
+        wave.setReversed (s.reverse);
+        wave.setStartOffset (s.startOffset); // round 190w (FL dims the region before it)
+
+        if (auto* w = findParentComponentOfClass<juce::DocumentWindow>())
+            w->setName (tr ("Sampler settings - {0}", { juce::String::fromUTF8 (c->name.c_str()) })
+                        + (c->zones.empty() ? juce::String() : tr (" (multi-sample: {0} zones)", { juce::String ((int) c->zones.size()) })));
     }
 
     // The knobs an automation drives show its value while the song plays, as in FL (issue #12); a knob held by the
@@ -3265,24 +4296,30 @@ private:
             return;
 
         std::vector<juce::Slider*> now;
-        updating = true;
+        const juce::ScopedValueSetter<bool> guard (updating, true);
+        auto shownSettings = c->sampler; // (the region as the automation has it: LENGTH is relative to SMP START)
+        for (const auto& [slider, param] : tweakTargets)
+            if (const auto v = shown.valueOf ({ AutomationTargetKind::channelParam, ref.index, 0, param }))
+                samplerparam::set (shownSettings, param, *v);
         for (const auto& [slider, param] : tweakTargets)
         {
             if (slider->isMouseButtonDown())
                 continue;
             const auto v = shown.valueOf ({ AutomationTargetKind::channelParam, ref.index, 0, param });
             const auto was = std::find (automatedShown.begin(), automatedShown.end(), slider) != automatedShown.end();
+            const auto value = [&] (const SamplerSettings& s) {
+                return param == samplerparam::end ? (double) samplerpage::lengthOf (s) : (double) samplerparam::toNatural (param, samplerparam::get (s, param));
+            };
             if (v)
             {
-                slider->setValue (samplerparam::toNatural (param, *v), juce::dontSendNotification);
+                slider->setValue (value (shownSettings), juce::dontSendNotification);
                 now.push_back (slider);
             }
             else if (was && ! force)
-                slider->setValue (samplerparam::toNatural (param, samplerparam::get (c->sampler, param)), juce::dontSendNotification);
+                slider->setValue (value (c->sampler), juce::dontSendNotification);
         }
-        updating = false;
         automatedShown = std::move (now);
-        wave.setRegion ((float) regionStart.getValue(), (float) regionEnd.getValue());
+        wave.setRegion (shownSettings.regionStart, shownSettings.regionEnd);
     }
 
     void timerCallback() override
@@ -3292,81 +4329,136 @@ private:
         followPreview();
     }
 
-    // the Song's value of `param` (a knob that shows its automation must not write the automated value back)
-    static void keepSongValue (SamplerSettings& s, const SamplerSettings& song, int param) noexcept
+    // One control changed (`changed`): its law applied to the channel's sampler settings (core/SamplerPage.h), one edit
+    void apply (juce::Component* changed)
     {
-        switch (param)
-        {
-            case samplerparam::attack: s.attack = song.attack; break;
-            case samplerparam::decay: s.decay = song.decay; break;
-            case samplerparam::sustain: s.sustain = song.sustain; break;
-            case samplerparam::release: s.release = song.release; break;
-            case samplerparam::cutoff: s.cutoff = song.cutoff; break;
-            case samplerparam::resonance: s.resonance = song.resonance; break;
-            case samplerparam::start: s.regionStart = song.regionStart; break;
-            case samplerparam::end: s.regionEnd = song.regionEnd; break;
-            default: break;
-        }
-    }
+        const auto* c = current();
+        if (updating || c == nullptr)
+            return;
+        auto s = c->sampler;
+        const auto& old = c->sampler;
+        bool cutOn = channelCutsItself (*c), cutChanged = false;
+        auto value = [] (juce::Component* k) { return static_cast<juce::Slider*> (k)->getValue(); };
+        auto on = [] (juce::Component* b) { return static_cast<juce::Button*> (b)->getToggleState(); };
+        auto& p = s.precompute;
 
-    void apply (juce::Slider* changed = nullptr)
-    {
-        if (updating || current() == nullptr)
+        if (changed == &keepOnDisk) s.keepOnDisk = on (changed);
+        else if (changed == &resampleBox) s.resampleOnLoad = on (changed);
+        else if (changed == &loadRegionsBox) s.loadRegions = on (changed);
+        else if (changed == &loadMarkersBox) s.loadSliceMarkers = on (changed);
+        else if (changed == &declick) s.declickMode = juce::jlimit (0, 5, declick.getSelectedId() - 1);
+        else if (changed == &startOffsetKnob) s.startOffset = (float) value (changed);
+        else if (changed == &loopStartKnob || changed == &loopEndKnob)
+        {
+            const auto keep = shiftHeld || (! shotDriven && juce::ModifierKeys::currentModifiers.isShiftDown()); // (FL: Shift moves the loop)
+            if (changed == &loopStartKnob)
+                samplerpage::setLoopStart (s, (std::int64_t) std::llround (value (changed)), shownFrames, shownFileLoop.first, shownFileLoop.second, keep);
+            else
+                samplerpage::setLoopEnd (s, (std::int64_t) std::llround (value (changed)), shownFrames, shownFileLoop.first, shownFileLoop.second, keep);
+        }
+        else if (changed == &useLoops)
+        {
+            s.useLoopPoints = on (changed);
+            // FL's LoopBoxClick 0xf67f70: switching loop points on makes the channel cut itself (FUN_00feaaf0)
+            if (s.useLoopPoints && ! cutOn && ref.index >= 0)
+                cutOn = cutChanged = true;
+        }
+        else if (changed == &pingPong) p.pingPong = on (changed);
+        else if (changed == &stretchPitchKnob) samplerpage::turnStretchPitch (s, juce::roundToInt (value (changed)));
+        else if (changed == &mulKnob)
+        {
+            const auto sample = sampleOf (*c);
+            const auto beats = sample != nullptr && sample->sampleRate > 0.0
+                                   ? (double) sample->frames() / sample->sampleRate * engine.getSong().bpm / 60.0 : 0.0;
+            samplerpage::setStretchMul (s, juce::roundToInt (value (changed)), beats);
+        }
+        else if (changed == &stretch) samplerpage::setStretchTime (s, (float) value (changed));
+        else if (changed == &stretchMethod) samplerpage::selectMode (s, stretchMethod.getSelectedId() - 1);
+        else if (changed == &removeDc) p.removeDc = on (changed);
+        else if (changed == &normalize) p.normalize = on (changed);
+        else if (changed == &reverse) s.reverse = on (changed);
+        else if (changed == &polarity) p.reversePolarity = on (changed);
+        else if (changed == &fadeStereo) p.fadeStereo = on (changed);
+        else if (changed == &swapStereo) p.swapStereo = on (changed);
+        else if (changed == &regionStart) samplerpage::setSmpStart (s, (float) value (changed));
+        else if (changed == &lengthKnob) samplerpage::setLength (s, (float) value (changed));
+        else if (changed == &fadeIn) p.fadeIn = juce::roundToInt (value (changed));
+        else if (changed == &fadeOut) p.fadeOut = juce::roundToInt (value (changed));
+        else if (changed == &crossfade)
+        {
+            const auto loopsBefore = s.useLoopPoints;
+            // (live check 190ew SMP-4: on a loopless sample FL also sets END to the sample's end)
+            samplerpage::turnCrossfade (s, juce::roundToInt (value (changed)), shownFrames, shownFileLoop.first, shownFileLoop.second);
+            // (FL ticks "Use loop points" the way a click does, so the channel cuts itself as with the click)
+            if (s.useLoopPoints && ! loopsBefore && ! cutOn && ref.index >= 0)
+                cutOn = cutChanged = true;
+        }
+        else if (changed == &trim) p.trim = juce::roundToInt (value (changed));
+        else if (changed == &boost) p.boost = juce::roundToInt (value (changed));
+        else if (changed == &eq) p.eq = juce::roundToInt (value (changed));
+        else if (changed == &ringMix) p.ringMix = juce::roundToInt (value (changed));
+        else if (changed == &ringFreq) p.ringFreq = juce::roundToInt (value (changed));
+        else if (changed == &legacyCut) p.cutoff = juce::roundToInt (value (changed));
+        else if (changed == &legacyRes) p.resonance = juce::roundToInt (value (changed));
+        else if (changed == &reverbAmount) p.reverb = juce::roundToInt (value (changed));
+        else if (changed == &reverbType) p.reverbType = reverbType.getSelectedId() == 1 ? 0 : 1;
+        else if (changed == &stereoDelay) p.stereoDelay = juce::roundToInt (value (changed));
+        else if (changed == &pogo) p.pogo = juce::roundToInt (value (changed));
+        else if (changed == &clip) p.clip = on (changed);
+        else if (changed == &gain) s.gainDb = std::abs (value (changed)) < 0.05 ? 0.0f : (float) value (changed);
+        else if (changed == &attack) s.attack = (float) value (changed);
+        else if (changed == &decay) s.decay = (float) value (changed);
+        else if (changed == &sustain) s.sustain = (float) value (changed);
+        else if (changed == &release) s.release = (float) value (changed);
+        else if (changed == &cutoff) s.cutoff = (float) value (changed);
+        else if (changed == &resonance) s.resonance = (float) value (changed);
+        else if (changed == &filterType) s.filterType = juce::jlimit (0, 3, filterType.getSelectedId() - 1);
+        else if (changed == &cut)
+        {
+            cutOn = on (changed);
+            cutChanged = cutOn != channelCutsItself (*c); // (issue #68: the rack menu's cut-itself too)
+        }
+        else if (changed == &porta) s.porta = on (changed);
+        else
             return;
 
-        auto s = current()->sampler; // keeps what the panel does not show (slices)
-        s.pitch = (float) pitch.getValue();
-        s.gainDb = std::abs (gain.getValue()) < 0.05 ? 0.0f : (float) gain.getValue();
-        s.attack = (float) attack.getValue();
-        s.decay = (float) decay.getValue();
-        s.sustain = (float) sustain.getValue();
-        if (changed == &stretch || stretch.getValue() != shownStretch) // (unmoved: keep the exact value, not the knob's)
-            s.stretchBeats = (float) (shownStretch = stretch.getValue());
-        s.keepPitch = keepPitch.getToggleState();
-        s.stretchMethod = (StretchMethod) juce::jlimit (0, stretchMethodCount - 1, stretchMethod.getSelectedId() - 1);
-        stretchMethod.setEnabled (s.keepPitch);
-        // leaving Beats (or Keep length): an imported clip's offline transposition moves to the Pitch knob, which the other
+        // leaving Beats (or Resample): an imported clip's offline transposition moves to the Pitch knob, which the other
         // modes apply in real time, so the sample stays at its pitch
-        if (s.moveBakedPitchToKnob())
-            pitch.setValue (s.pitch, juce::dontSendNotification);
-        s.regionStart = (float) regionStart.getValue();
-        s.regionEnd = (float) regionEnd.getValue();
-        s.startOffset = (float) startOffsetKnob.getValue();
-        wave.setStartOffset (s.startOffset);
-        s.release = (float) release.getValue();
-        s.reverse = reverse.getToggleState();
-        s.cut = cut.getToggleState();
-        const auto cutChanged = s.cut != channelCutsItself (*current()); // (issue #68: the rack menu's cut-itself too)
-        s.porta = porta.getToggleState();
-        s.cutoff = (float) cutoff.getValue();
-        s.resonance = (float) resonance.getValue();
-        s.filterType = juce::jlimit (0, 3, filterType.getSelectedId() - 1);
-        for (const auto& [slider, param] : tweakTargets)
-            if (slider != changed && std::find (automatedShown.begin(), automatedShown.end(), slider) != automatedShown.end())
-                keepSongValue (s, current()->sampler, param);
+        s.moveBakedPitchToKnob();
+        bool dropFlmVoice = false;
         {
-            // an ADSR edited by hand replaces FL's imported volume envelope
-            const auto& old = current()->sampler;
+            // an ADSR edited by hand replaces FL's imported volume envelope (and FL Studio Mobile's pad envelope, round
+            // 190bs); so does an edited envelope or filter for FL's whole sampler voice (REA_rodada76)
             auto moved = [] (float a, float b) { return std::abs (a - b) > 1.0e-4f; };
             const auto adsr = moved (s.attack, old.attack) || moved (s.decay, old.decay) || moved (s.sustain, old.sustain) || moved (s.release, old.release);
             if (adsr)
+            {
                 s.flVolumeEnvelope.clear();
-            // so does an edited envelope or filter for FL's whole sampler voice (REA_rodada76)
+                s.flmPad.clear();
+                dropFlmVoice = flmdw::isChannel (*c); // and FL Studio Mobile's DW Sampler voice (round 190de)
+            }
             if (adsr || moved (s.cutoff, old.cutoff) || moved (s.resonance, old.resonance) || s.filterType != old.filterType)
                 s.flChannel.clear();
         }
-        if (s == current()->sampler && ! cutChanged)
+        if (cutChanged)
+            s.cut = cutOn;
+        if (s == old && ! cutChanged)
             return;
 
-        const auto before = current()->sampler;
-        ref.edit (engine, [s, cutChanged, index = ref.index] (ChannelDef& channelDef) {
+        const auto before = old;
+        ref.edit (engine, [s, cutChanged, cutOn, dropFlmVoice, index = ref.index] (ChannelDef& channelDef) {
             channelDef.sampler = s;
+            if (dropFlmVoice) // (the Sampler's own voice from now on: the module's values go, its zones stay)
+                channelDef.modelParams.clear();
             if (cutChanged)
-                setChannelCutsItself (channelDef, index, s.cut);
+                setChannelCutsItself (channelDef, index, cutOn);
         });
         for (const auto& [slider, param] : tweakTargets)
             if (std::abs (samplerparam::get (before, param) - samplerparam::get (s, param)) > 1.0e-6f)
+            {
                 engine.noteTweaked ({ AutomationTargetKind::channelParam, ref.index, 0, param });
+                engine.controlTweakedForUndo(); // (round 190mv, DF-134)
+            }
     }
 
     void changeListenerCallback (juce::ChangeBroadcaster*) override
@@ -3386,9 +4478,18 @@ private:
 
     AudioEngine& engine;
     ChannelRef ref;
-    bool updating = false;
-    juce::Slider pitch, gain, stretch;
-    double shownStretch = 0.0;
+    bool updating = false, shiftHeld = false, shotDriven = false;
+    float scale = 1.0f;
+    int offsetX = 0;
+    struct Group
+    {
+        juce::Rectangle<int> area;
+        juce::String caption;
+        int captionLeft;
+    };
+    std::vector<Group> groups;
+    juce::Rectangle<int> loopGlyph;
+    bool clipChannel = false; // an audio clip's channel: FL's audio clip page (no Playback box, no LYNX extras)
 
     // FL's TIME knob menu (r168s c_f20): (none), Autodetect, Project tempo, 1 beat, 2 beats, 1 bar, 2 bars, 3 bars, 4 bars
     struct StretchMenu final : juce::MouseListener
@@ -3409,40 +4510,95 @@ private:
             return;
         const auto& song = engine.getSong();
         const auto sample = engine.getSampleLibrary().load (juce::String::fromUTF8 (c->samplePath.c_str()));
-        const auto now = c->sampler.stretchBeats;
-        auto set = [this] (float beats) { ref.edit (engine, [beats] (ChannelDef& d) { d.sampler.stretchBeats = beats; }); };
+        const auto now = samplerpage::stretchTime (c->sampler);
+        auto set = [this] (float beats) { ref.edit (engine, [beats] (ChannelDef& d) { samplerpage::setStretchTime (d.sampler, beats); }); };
         juce::PopupMenu m;
         m.addItem (tr ("(none)"), true, now <= 0.0f, [set] { set (0.0f); });
         m.addItem (tr ("Autodetect"), sample != nullptr, false, [set, sample, bpm = song.bpm] { set (tempodetect::fitBeatsOf (sample.get(), bpm)); });
         const auto atTempo = sample != nullptr && sample->sampleRate > 0.0 ? (float) ((double) sample->frames() / sample->sampleRate * song.bpm / 60.0) : 0.0f;
         m.addItem (tr ("Project tempo"), atTempo > 0.0f, false, [set, atTempo] { set (atTempo); });
-        for (const auto preset : clipops::timePresetBeats (song.beatsPerBar))
+        const auto barBeats = (float) song.barTicks() / (float) ppq; // (round 190fg: a bar in quarter notes)
+        for (const auto preset : clipops::timePresetBeats (song.meter()))
         {
-            const auto bars = song.beatsPerBar > 0 && preset >= (float) song.beatsPerBar ? preset / (float) song.beatsPerBar : 0.0f;
+            const auto bars = preset >= barBeats - 1.0e-4f ? preset / barBeats : 0.0f;
             const auto label = bars > 0.0f ? (bars == 1.0f ? tr ("1 bar") : tr ("{0} bars", { juce::String (bars, 0) }))
                                            : (preset == 1.0f ? tr ("1 beat") : tr ("{0} beats", { juce::String (preset, 0) }));
             m.addItem (label, true, now == preset, [set, preset] { set (preset); });
         }
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&stretch));
     }
-    MenuSlider attack, release, decay, sustain, regionStart, regionEnd, cutoff, resonance, startOffsetKnob;
+
+    // File row
+    static constexpr int fileRowHeight = 34; // FL's File row (round 190df)
+    juce::Label fileLabel, fileName;
+    WheelIconButton loadButton { "load", Icon::open }, locateButton { "locate", Icon::browser }, removeButton { "remove", Icon::close };
+    std::unique_ptr<juce::FileChooser> sampleChooser;
+    // Content
+    juce::ToggleButton keepOnDisk, resampleBox, loadRegionsBox, loadMarkersBox;
+    juce::Label declickLabel;
+    juce::ComboBox declick;
+    // Playback
+    MenuSlider startOffsetKnob, loopStartKnob, loopEndKnob;
+    juce::Label startOffsetLabel, loopStartLabel, loopEndLabel;
+    juce::ToggleButton useLoops, pingPong;
+    std::pair<std::int64_t, std::int64_t> shownFileLoop { -1, -1 };
+    std::int64_t shownFrames = 0;
+    // Time stretching
+    MenuSlider stretchPitchKnob, mulKnob, stretch;
+    juce::Label stretchPitchLabel, mulLabel, stretchLabel, modeLabel;
+    juce::ComboBox stretchMethod;
+    // Precomputed effects (and FL's legacy panel)
+    juce::ToggleButton removeDc, normalize, reverse, polarity, fadeStereo, swapStereo, clip;
+    MenuSlider regionStart, lengthKnob, fadeIn, fadeOut, crossfade, trim;
+    juce::Label regionStartLabel, lengthLabel, fadeInLabel, fadeOutLabel, crossfadeLabel, trimLabel;
+    EffectsTargetSelect effectsTarget;
+    MenuSlider boost, eq, ringMix, ringFreq, legacyCut, legacyRes, reverbAmount, stereoDelay, pogo;
+    juce::Label boostLabel, eqLabel, ringMixLabel, ringFreqLabel, legacyCutLabel, legacyResLabel, reverbLabel, stereoDelayLabel, pogoLabel;
+    juce::ComboBox reverbType;
+    // the waveform
+    ui::WaveformDisplay wave;
+    struct SampleDragOut final : juce::MouseListener // (round 190ih: drag the sample out)
+    {
+        std::function<juce::String()> path;
+        std::function<bool()> handleDragged; // (rollup 0.1.30: round 190im's Start / loop handles take the press)
+        bool started = false;
+        void mouseDown (const juce::MouseEvent&) override { started = false; }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            if (started || e.mods.isPopupMenu() || e.getDistanceFromDragStart() < 8 || path == nullptr || (handleDragged != nullptr && handleDragged()))
+                return;
+            const juce::File file (path());
+            if (! file.existsAsFile())
+                return;
+            started = true;
+            if (auto* container = juce::DragAndDropContainer::findParentDragContainerFor (e.eventComponent))
+                container->startDragging (juce::String (BrowserComponent::dragDescription) + "|" + file.getFullPathName(), e.eventComponent);
+            else
+                juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, e.eventComponent);
+        }
+    };
+    SampleDragOut waveDrag;
+    juce::String wavePath;
+    juce::ScrollBar waveScroll { false };
+    // LYNX extras
+    MenuSlider gain, attack, decay, sustain, release, cutoff, resonance;
+    juce::Label gainLabel, attackLabel, decayLabel, sustainLabel, releaseLabel, cutoffLabel, resonanceLabel, extrasLabel;
+    juce::ComboBox filterType;
+    juce::ToggleButton cut, porta;
+    juce::TextButton modulationButton;
+
     std::vector<std::pair<MenuSlider*, int>> tweakTargets; // knob -> samplerparam
     std::vector<juce::Slider*> automatedShown;             // knobs showing their automation's value now
     std::uint32_t shownGeneration = 0;
     bool dropHighlight = false;
-    juce::Label pitchLabel, gainLabel, attackLabel, releaseLabel, decayLabel, sustainLabel, stretchLabel, regionStartLabel, regionEndLabel,
-        cutoffLabel, resonanceLabel, startOffsetLabel;
-    juce::ToggleButton reverse, cut, keepPitch, porta;
-    juce::ComboBox filterType, stretchMethod;
-    juce::TextButton modulationButton, precomputeButton;
-    ui::WaveformDisplay wave;
     int previewKey = -1, previewFrames = 0; // round 190w: the display's preview note (-1 = none)
     bool previewSeen = false;
 };
 
 // Built-in synth page: 3 oscillators, envelope and filter.
 class SynthPanel final : public juce::Component,
-                         private juce::ChangeListener
+                         private juce::ChangeListener,
+                         private juce::Timer
 {
 public:
     SynthPanel (AudioEngine& e, ChannelRef c)
@@ -3515,17 +4671,27 @@ public:
         }
 
         presetBox.setTextWhenNothingSelected (tr ("Presets..."));
-        const auto presets = synthPresets();
-        for (int i = 0; i < (int) presets.size(); ++i)
-            presetBox.addItem (juce::String::fromUTF8 (presets[(std::size_t) i].first.c_str()), i + 1);
+        fillPresetBox();
+        presetBox.beforePopup = [this] { fillPresetBox(); }; // (round 190fs: the user's presets as they are on disk now)
         presetBox.onChange = [this] {
             const auto presets = synthPresets();
-            const auto index = presetBox.getSelectedId() - 1;
+            const auto id = presetBox.getSelectedId();
+            const auto index = id - 1;
+            presetBox.setSelectedId (0, juce::dontSendNotification);
 
             if (juce::isPositiveAndBelow (index, (int) presets.size()) && current() != nullptr)
                 ref.edit (engine, [s = presets[(std::size_t) index].second] (ChannelDef& channelDef) { channelDef.synth = s; });
-
-            presetBox.setSelectedId (0, juce::dontSendNotification);
+            else if (id >= userPresetId && id - userPresetId < userFiles.size())
+                loadUserPreset (userFiles[id - userPresetId]);
+            else if (id == savePresetId)
+                saveUserPreset();
+            else if (id == deletePresetId && lastUserPreset.existsAsFile())
+            {
+                lastUserPreset.deleteFile();
+                lastUserPreset = juce::File();
+            }
+            else if (id == showFolderId)
+                genpresetui::reveal (genpresetui::folderFor (InstrumentKind::synth));
         };
         addAndMakeVisible (presetBox);
 
@@ -3557,12 +4723,42 @@ public:
         mono.onClick = [this] { apply(); };
         addAndMakeVisible (mono);
 
+        // issue #152 (round 190he): every knob is one of the synth's parameters (core/SynthParams.h), as FL's plugin
+        // parameters are: right-click = FL's parameter menu (Link to controller, automation clip, Init song value); a
+        // move is a tweak; the knobs follow MIDI links (refresh) and play their automation (timer)
+        if (ref.index >= 0) // (a Patcher node: no automation target)
+        {
+            for (int o = 0; o < 3; ++o)
+            {
+                auto& row = rows[(std::size_t) o];
+                wire (row.octave, synthparam::oscParam (o, synthparam::octave));
+                wire (row.semitones, synthparam::oscParam (o, synthparam::semitones));
+                wire (row.detune, synthparam::oscParam (o, synthparam::detune));
+                wire (row.pan, synthparam::oscParam (o, synthparam::pan));
+                wire (row.level, synthparam::oscParam (o, synthparam::level));
+            }
+            for (auto [slider, k] : { std::pair { &attack, (int) synthparam::attack }, { &decay, (int) synthparam::decay },
+                                      { &sustain, (int) synthparam::sustain }, { &release, (int) synthparam::release },
+                                      { &cutoff, (int) synthparam::cutoff }, { &resonance, (int) synthparam::resonance },
+                                      { &porta, (int) synthparam::porta }, { &fm, (int) synthparam::fm }, { &fmDecay, (int) synthparam::fmDecay },
+                                      { &keyTrack, (int) synthparam::keyTrack }, { &sweep, (int) synthparam::sweep },
+                                      { &sweepTime, (int) synthparam::sweepTime }, { &bandLow, (int) synthparam::bandLow },
+                                      { &bandMid, (int) synthparam::bandMid }, { &bandHigh, (int) synthparam::bandHigh } })
+                wire (*slider, k);
+        }
+
         refresh();
         engine.addChangeListener (this);
         setSize (720, 510);
+        if (ref.index >= 0)
+            startTimerHz (30); // the knobs follow their automation while the song plays (cheap while nothing moves)
     }
 
-    ~SynthPanel() override { engine.removeChangeListener (this); }
+    ~SynthPanel() override
+    {
+        stopTimer();
+        engine.removeChangeListener (this);
+    }
 
     int getChannel() const noexcept { return ref.index; }
 
@@ -3627,7 +4823,7 @@ private:
     {
         juce::Label title;
         juce::ComboBox wave;
-        juce::Slider octave, semitones, detune, pan, level;
+        MenuSlider octave, semitones, detune, pan, level;
     };
 
     static constexpr int oscKnobs = 5; // oscillator knob labels come first
@@ -3715,8 +4911,63 @@ private:
             juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("FL presets"),
                                                     tr ("This preset is not for a synth LYNX SHARE converts, or it could not be read."));
     }
-    juce::Slider porta;
+    MenuSlider porta;
     juce::ComboBox filterTypeBox;
+
+    // a knob as the synth parameter k (issue #152)
+    AutomationTarget targetOf (int k) const { return { AutomationTargetKind::channelParam, ref.index, 0, synthparam::target (k) }; }
+    void wire (MenuSlider& slider, int k)
+    {
+        ui::setOwnMenu (slider);
+        slider.onMenu = [this, &slider, k] { ui::showSliderMenu (slider, &engine, targetOf (k)); };
+        slider.onDragStart = [this, k] { engine.noteTweaked (targetOf (k), true); engine.controlTweakedForUndo(); };
+        slider.onDragEnd = [this, k] { engine.tweakReleased (targetOf (k)); };
+        wired.push_back ({ &slider, k });
+    }
+
+    // the knobs an automation drives show its value while the song plays; when it stops they show the Song's again
+    void timerCallback() override
+    {
+        if (isShowing())
+            showAutomation (false);
+    }
+
+    // `force`: after refresh() put the Song's values back (the automated ones go on the automation's value again)
+    void showAutomation (bool force)
+    {
+        if (wired.empty())
+            return;
+        const auto& shown = engine.getAutomationDisplay();
+        if (! force && shown.getGeneration() == shownGeneration)
+            return;
+        shownGeneration = shown.getGeneration();
+        if (automatedShown.empty() && ! shown.any())
+            return;
+        const auto* c = current();
+        if (c == nullptr)
+            return;
+        const juce::ScopedValueSetter<bool> guard (updating, true);
+        std::vector<juce::Slider*> now;
+        for (const auto& [slider, k] : wired)
+        {
+            if (slider->isMouseButtonDown())
+                continue;
+            const auto v = shown.valueOf (targetOf (k));
+            const auto was = std::find (automatedShown.begin(), automatedShown.end(), slider) != automatedShown.end();
+            if (v)
+            {
+                slider->setValue (synthparam::toNatural (k, *v), juce::dontSendNotification);
+                now.push_back (slider);
+            }
+            else if (was && ! force)
+                slider->setValue (synthparam::natural (c->synth, k), juce::dontSendNotification);
+        }
+        automatedShown = std::move (now);
+    }
+
+    std::vector<std::pair<MenuSlider*, int>> wired; // knob -> synth parameter
+    std::vector<juce::Slider*> automatedShown;
+    std::uint32_t shownGeneration = 0;
 
     void knob (juce::Slider& s, double lo, double hi, double step, const char* suffix)
     {
@@ -3778,6 +5029,7 @@ private:
         ring.setToggleState (s.ring, juce::dontSendNotification);
 
         updating = false;
+        showAutomation (true); // (issue #152: an automated knob keeps showing its automation)
 
         if (auto* w = findParentComponentOfClass<juce::DocumentWindow>())
             w->setName (tr ("Synth settings - {0}", { juce::String::fromUTF8 (c->name.c_str()) }));
@@ -3841,10 +5093,100 @@ private:
     ChannelRef ref;
     bool updating = false;
     std::array<Row, 3> rows;
-    juce::Slider attack, decay, sustain, release, cutoff, resonance, fm, fmDecay, keyTrack, sweep, sweepTime, bandLow, bandMid, bandHigh;
+    MenuSlider attack, decay, sustain, release, cutoff, resonance, fm, fmDecay, keyTrack, sweep, sweepTime, bandLow, bandMid, bandHigh;
     juce::ToggleButton ring;
     std::array<juce::Label, 20> labels;
-    juce::ComboBox presetBox;
+    // round 190fs: the box lists LYNX's synth presets, then the user's own ("Your presets") and the preset items of
+    // LYNX's other preset menus (Save preset..., Delete preset, Show the presets folder)
+    struct PresetBox final : public juce::ComboBox
+    {
+        std::function<void()> beforePopup;
+        void showPopup() override
+        {
+            if (beforePopup)
+                beforePopup();
+            juce::ComboBox::showPopup();
+        }
+    };
+    static constexpr int userPresetId = 1001, savePresetId = 3001, deletePresetId = 3002, showFolderId = 3003;
+    PresetBox presetBox;
+    juce::Array<juce::File> userFiles;
+    juce::File lastUserPreset; // the user's preset loaded or saved last (Delete preset)
+
+    void fillPresetBox()
+    {
+        presetBox.clear (juce::dontSendNotification);
+        const auto presets = synthPresets();
+        for (int i = 0; i < (int) presets.size(); ++i)
+            presetBox.addItem (juce::String::fromUTF8 (presets[(std::size_t) i].first.c_str()), i + 1);
+        userFiles = genpresetui::userPresets (InstrumentKind::synth);
+        if (! userFiles.isEmpty())
+        {
+            presetBox.addSectionHeading (tr ("Your presets"));
+            for (int i = 0; i < userFiles.size(); ++i)
+                presetBox.addItem (userFiles[i].getFileNameWithoutExtension(), userPresetId + i);
+        }
+        presetBox.addSeparator();
+        presetBox.addItem (tr ("Save preset..."), savePresetId);
+        if (lastUserPreset.existsAsFile())
+            presetBox.addItem (tr ("Delete preset \"{0}\"", { lastUserPreset.getFileNameWithoutExtension() }), deletePresetId);
+        presetBox.addItem (tr ("Show the presets folder"), showFolderId);
+    }
+
+    void loadUserPreset (const juce::File& file)
+    {
+        const auto preset = genpresetui::read (file);
+        const auto* d = current();
+        if (! preset || d == nullptr)
+            return;
+        if (auto changed = genpresets::withPreset (*d, *preset))
+        {
+            ref.edit (engine, [c = std::move (*changed)] (ChannelDef& channelDef) {
+                if (channelDef.instrument == c.instrument)
+                    channelDef = c;
+            });
+            lastUserPreset = file;
+        }
+        else
+            ui::postHint ({ tr ("This preset is for {0}.", { juce::String::fromUTF8 (genpresets::engineName (preset->kind).c_str()) }), {} }, 2500);
+    }
+
+    void saveUserPreset()
+    {
+        const auto* d = current();
+        if (d == nullptr)
+            return;
+        genpresetui::askName (*this, juce::String::fromUTF8 (d->name.c_str()), [safe = juce::Component::SafePointer<SynthPanel> (this)] (const juce::String& name) {
+            if (safe != nullptr)
+                safe->saveNamed (name);
+        });
+    }
+
+public:
+    bool saveNamed (const juce::String& name)
+    {
+        const auto* now = current();
+        if (now == nullptr)
+            return false;
+        juce::File written;
+        juce::String error;
+        if (! genpresetui::save (*now, name, written, error))
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Save preset"), error);
+            return false;
+        }
+        lastUserPreset = written;
+        return true;
+    }
+
+    // the box's list as it opens (shots)
+    juce::PopupMenu presetBoxMenu()
+    {
+        fillPresetBox();
+        return *presetBox.getRootMenu();
+    }
+
+private:
 };
 
 // --- FL's channel window frame (REA round 143b) --------------------------------------------------------------
@@ -3877,7 +5219,9 @@ public:
             if (const auto v = engine.getAutomationDisplay().valueOf (*spec.target))
                 return spec.target->kind == AutomationTargetKind::channelPan || spec.target->kind == AutomationTargetKind::mixerPan
                            ? (double) *v * 2.0 - 1.0
-                           : (double) *v;
+                       // the Levels adjustment (round 190dz): automation's 0..1 over the knob's own range
+                       : spec.target->kind == AutomationTargetKind::channelAdjust ? spec.minimum + (double) *v * (spec.maximum - spec.minimum)
+                                                                                  : (double) *v;
         return getter();
     }
 
@@ -3904,10 +5248,73 @@ public:
     bool digitBox = false;
     std::function<void()> doubleClicked;
     std::function<void (juce::PopupMenu&)> extraMenuItems;
+    // Round 190in (design190ia FW-3 / FW-4): FL's header look — a 30 px knob with no value line (the value shows in the
+    // hint bar and the drag tip), a bold caption under it; a number wheel as FL's red digit badge (`joinLeft`: RANGE,
+    // attached to the PITCH knob at its left). `restArc`: the arc's colour at rest (VOL: FL's green ring).
+    bool headerLook = false, joinLeft = false;
+    juce::Colour restArc;
+    static constexpr float headerKnob = 30.0f, headerCaptionTop = 34.0f;
+
+    juce::Rectangle<float> badgeArea() const
+    {
+        const auto b = getLocalBounds().toFloat();
+        const auto w = joinLeft ? 28.0f : 40.0f;
+        return { joinLeft ? 0.0f : b.getCentreX() - w * 0.5f, 5.0f, w, 26.0f };
+    }
+
+    void paintHeaderLook (juce::Graphics& g, const ui::ValueSpec& spec)
+    {
+        using namespace theme;
+        const auto b = getLocalBounds().toFloat();
+        const auto hot = isMouseOverOrDragging() || drag.isActive();
+        auto caption = juce::Rectangle<float> (b.getX(), headerCaptionTop, b.getWidth(), 10.0f);
+        if (digitBox)
+        {
+            const auto badge = badgeArea();
+            juce::Path p;
+            p.addRoundedRectangle (badge.getX(), badge.getY(), badge.getWidth(), badge.getHeight(), 4.0f, 4.0f, ! joinLeft, true, ! joinLeft, true);
+            g.setColour (hot ? juce::Colour (0xff6e252b) : colour::accentMuted);
+            g.fillPath (p);
+            g.setColour (drag.isActive() ? colour::accent : juce::Colour (0xff8a2d33));
+            g.strokePath (p, juce::PathStrokeType (1.0f));
+            // FL's ‹ › marks at the badge's right edge (the wheel)
+            g.setColour (colour::textSecondary.withAlpha (0.8f));
+            const auto mx = badge.getRight() - 5.0f, my = badge.getCentreY();
+            for (const auto dy : { -4.0f, 4.0f })
+            {
+                juce::Path m;
+                m.startNewSubPath (mx - 1.5f, my + dy - 2.0f);
+                m.lineTo (mx + 1.0f, my + dy);
+                m.lineTo (mx - 1.5f, my + dy + 2.0f);
+                g.strokePath (m, juce::PathStrokeType (1.0f));
+            }
+            g.setColour (colour::textPrimary);
+            g.setFont (font (18.0f, true));
+            g.drawFittedText (spec.text (getter()), badge.withTrimmedRight (9.0f).reduced (2.0f, 0.0f).toNearestInt(), juce::Justification::centredRight, 1, 0.6f);
+            if (joinLeft)
+                caption = caption.withX (badge.getX()).withWidth (badge.getWidth());
+        }
+        else
+        {
+            const auto shown = shownValue (spec);
+            const auto v = (float) juce::jlimit (0.0, 1.0, (shown - spec.minimum) / juce::jmax (1e-9, spec.maximum - spec.minimum));
+            const auto knob = juce::Rectangle<float> (headerKnob, headerKnob).withCentre ({ b.getCentreX(), 3.0f + headerKnob * 0.5f });
+            drawKnob (g, knob, v, spec.minimum < 0.0, hot ? colour::accent : restArc.isTransparent() ? colour::knobArc : restArc, isMouseOver());
+        }
+        // (FL's RANGE caption is the dim one of the strip)
+        g.setColour (hot ? colour::textPrimary : joinLeft ? colour::textDisabled : colour::textSecondary);
+        g.setFont (font (type::caption, true));
+        g.drawFittedText (caps (label), caption.toNearestInt(), juce::Justification::centred, 1, 0.6f);
+    }
 
     void paint (juce::Graphics& g) override
     {
         const auto spec = specOf();
+        if (headerLook)
+        {
+            paintHeaderLook (g, spec);
+            return;
+        }
         auto area = getLocalBounds().toFloat();
         const auto caption = area.removeFromBottom (13.0f);
         if (digitBox)
@@ -4249,20 +5656,24 @@ public:
             return knobs.back().get();
         };
 
-        // Levels adjustment
+        // FL's "Levels adjustment" (round 190dz; TPluginForm OfsLevelsPanel, channel parameters 0x10 / 0x11): the offsets on
+        // top of the channel's own Pan / Volume (those stay on the header), which Automate on an audio clip moves
         pan = knob ([this, name] {
-                        auto s = ui::panSpec (name() + " - " + tr ("Pan"));
-                        s.target = AutomationTarget { AutomationTargetKind::channelPan, channel };
+                        auto s = ui::panSpec (name() + " - " + tr ("Panning offset"));
+                        s.target = AutomationTarget { AutomationTargetKind::channelAdjust, channel, 0, leveladjust::pan };
                         return s;
                     },
-                    [] (const ChannelDef& d) { return (double) d.pan; }, [] (ChannelDef& d, double v) { d.pan = (float) v; }, TR_NOOP ("Pan"));
+                    [] (const ChannelDef& d) { return (double) d.misc.levels.pan; }, [] (ChannelDef& d, double v) { d.misc.levels.pan = (float) v; },
+                    TR_NOOP ("Pan"));
         volume = knob ([this, name] {
-                           auto s = ui::percentSpec (name() + " - " + tr ("Volume"), 0.78);
-                           s.target = AutomationTarget { AutomationTargetKind::channelVolume, channel };
+                           auto s = ui::percentSpec (name() + " - " + tr ("Volume multiplier"), 1.0);
+                           s.maximum = 2.0; // FL: 0…25600, 12800 = 100 % (FL's volume curve, up to +21.6 dB)
+                           s.toText = [] (double v) { return juce::String (levelVolumeText ((float) v)); }; // (live check 190ew PL-6)
+                           s.target = AutomationTarget { AutomationTargetKind::channelAdjust, channel, 0, leveladjust::volume };
                            return s;
                        },
-                       [] (const ChannelDef& d) { return (double) d.volume; }, [] (ChannelDef& d, double v) { d.volume = (float) v; },
-                       TR_NOOP ("Vol"));
+                       [] (const ChannelDef& d) { return (double) d.misc.levels.volume; },
+                       [] (ChannelDef& d, double v) { d.misc.levels.volume = (float) v; }, TR_NOOP ("Vol"));
         // Polyphony
         maxPoly = knob ([name] { return countSpec (name() + " - " + tr ("Maximum polyphony (-- = no limit)"), 64, 0); },
                         [] (const ChannelDef& d) { return (double) d.maxPolyphony; },
@@ -4289,40 +5700,28 @@ public:
         swing = knob ([name] { return ui::percentSpec (name() + " - " + tr ("Swing mix"), 1.0); },
                       [] (const ChannelDef& d) { return (double) d.swingMix; }, [] (ChannelDef& d, double v) { d.swingMix = (float) v; },
                       TR_NOOP ("Swing"));
-        // Levels adjustment: Mod X / Mod Y = the channel filter's cutoff / resonance (sampler, synth)
-        modX = knob ([name] {
-                         ui::ValueSpec s;
-                         s.name = name() + " - " + tr ("Mod X (filter cutoff)");
-                         s.defaultValue = 1.0;
-                         s.toText = [] (double v) { const auto hz = 20.0 * std::pow (1000.0, v); return hz >= 1000.0 ? juce::String (hz / 1000.0, 1) + " kHz" : juce::String (juce::roundToInt (hz)) + " Hz"; };
-                         return s;
-                     },
-                     [] (const ChannelDef& d) {
-                         const auto hz = d.instrument == InstrumentKind::synth ? d.synth.cutoff : d.sampler.cutoff;
-                         return juce::jlimit (0.0, 1.0, std::log ((double) hz / 20.0) / std::log (1000.0));
-                     },
-                     [] (ChannelDef& d, double v) {
-                         const auto hz = (float) (20.0 * std::pow (1000.0, v));
-                         if (d.instrument == InstrumentKind::synth)
-                             d.synth.cutoff = hz;
-                         else if (d.instrument == InstrumentKind::sampler)
-                         {
-                             d.sampler.cutoff = hz;
-                             d.sampler.flChannel.clear(); // an edited filter replaces FL's whole sampler voice (REA_rodada76)
-                         }
-                     },
+        // Levels adjustment: Mod X / Mod Y offsets (FL 0x13 / 0x14, ±256) on the channel filter's cutoff / resonance knobs'
+        // travel (sampler, synth); the knobs themselves are on the Sampler / Synth pages
+        auto offsetSpec = [name] (const char* what) {
+            ui::ValueSpec s;
+            s.name = name() + " - " + tr (what);
+            s.minimum = -1.0;
+            s.maximum = 1.0;
+            s.defaultValue = 0.0;
+            s.toText = [] (double v) { return juce::String (juce::roundToInt (v * 100.0)) + "%"; };
+            s.fromText = [] (const juce::String& t) -> std::optional<double> {
+                const auto digits = t.retainCharacters ("-0123456789.,").replaceCharacter (',', '.');
+                if (digits.isEmpty())
+                    return std::nullopt;
+                return digits.getDoubleValue() / 100.0;
+            };
+            return s;
+        };
+        modX = knob ([offsetSpec] { return offsetSpec (TR_NOOP ("Modulation X offset")); },
+                     [] (const ChannelDef& d) { return (double) d.misc.levels.modX; }, [] (ChannelDef& d, double v) { d.misc.levels.modX = (float) v; },
                      TR_NOOP ("Mod X"));
-        modY = knob ([name] { return ui::percentSpec (name() + " - " + tr ("Mod Y (filter resonance)"), 0.0); },
-                     [] (const ChannelDef& d) { return (double) (d.instrument == InstrumentKind::synth ? d.synth.resonance : d.sampler.resonance); },
-                     [] (ChannelDef& d, double v) {
-                         if (d.instrument == InstrumentKind::synth)
-                             d.synth.resonance = (float) v;
-                         else if (d.instrument == InstrumentKind::sampler)
-                         {
-                             d.sampler.resonance = (float) v;
-                             d.sampler.flChannel.clear();
-                         }
-                     },
+        modY = knob ([offsetSpec] { return offsetSpec (TR_NOOP ("Modulation Y offset")); },
+                     [] (const ChannelDef& d) { return (double) d.misc.levels.modY; }, [] (ChannelDef& d, double v) { d.misc.levels.modY = (float) v; },
                      TR_NOOP ("Mod Y"));
         // Time: Gate and Shift on FL's time-knob scale (REA round 146b)
         auto timeSpec = [name] (const char* what, int maximum, int defaultValue, bool offAtMax) {
@@ -4798,6 +6197,7 @@ public:
         prev.onClick = [this] { step (-1); };
         next.onClick = [this] { step (1); };
         ui::setHint (*this, tr ("Presets: [LMB] the list, the arrows load the previous / next one"));
+        list(); // (round 190mc: the window opens showing its channel's preset, not "Presets" until the first click)
     }
 
     // Whether this channel's instrument has an FL preset folder (the bar is shown only then)
@@ -4810,9 +6210,28 @@ public:
         return ! natives::presetFolderOf (kind).empty() || banks::hasBank (kind);
     }
 
+    // Round 190in (design190ia FW-5): in a window's title bar the bar is FL's — the preset's name, dim, then ◀ ▶ at the
+    // right, no box
+    void setTitleLook (bool shouldBe)
+    {
+        titleLook = shouldBe;
+        prev.setVisible (! titleLook);
+        next.setVisible (! titleLook);
+        setRepaintsOnMouseActivity (titleLook);
+        resized();
+        repaint();
+    }
+
     void resized() override
     {
         auto r = getLocalBounds();
+        if (titleLook)
+        {
+            nextArea = r.removeFromRight (16);
+            prevArea = r.removeFromRight (16);
+            nameArea = r.withTrimmedRight (4);
+            return;
+        }
         prev.setBounds (r.removeFromLeft (24));
         next.setBounds (r.removeFromRight (24));
         nameArea = r.reduced (4, 0);
@@ -4820,6 +6239,25 @@ public:
 
     void paint (juce::Graphics& g) override
     {
+        if (titleLook)
+        {
+            using namespace theme;
+            const auto mouse = getMouseXYRelative();
+            const auto over = isMouseOver();
+            g.setColour (over && nameArea.contains (mouse) ? colour::textPrimary : colour::textSecondary);
+            g.setFont (font (type::small));
+            g.drawText (current >= 0 ? currentName : tr ("Presets"), nameArea, juce::Justification::centredRight, true);
+            for (const auto left : { true, false })
+            {
+                const auto r = (left ? prevArea : nextArea).toFloat();
+                juce::Path p;
+                p.addTriangle (left ? 3.0f : -3.0f, -4.5f, left ? 3.0f : -3.0f, 4.5f, left ? -3.0f : 3.0f, 0.0f);
+                p.applyTransform (juce::AffineTransform::translation (r.getCentreX(), r.getCentreY()));
+                g.setColour (over && r.contains (mouse.toFloat()) ? colour::accent : colour::textPrimary);
+                g.fillPath (p);
+            }
+            return;
+        }
         g.setColour (theme::colour::bg2);
         g.fillRoundedRectangle (nameArea.toFloat(), theme::radius::sm);
         g.setColour (current >= 0 ? theme::colour::textPrimary : theme::colour::textSecondary);
@@ -4827,10 +6265,43 @@ public:
         g.drawText (current >= 0 ? currentName : tr ("Presets"), nameArea.reduced (6, 0), juce::Justification::centredLeft, true);
     }
 
+    void mouseMove (const juce::MouseEvent&) override
+    {
+        if (titleLook)
+            repaint(); // (the hovered part: the name, ◀ or ▶)
+    }
+
+    // Round 190mc (discussion #202: "it randomly changes mode when you swap between Transistor Bass instances"): a click
+    // that only brings another channel's window to the front (its title bar, where ◀ ▶ sit at the right) loads nothing;
+    // ◀ ▶ step only when the press and the release are on the same arrow
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        pressedPart = partAt (e.getPosition());
+        armed = true;
+        if (auto* window = findParentComponentOfClass<juce::DocumentWindow>())
+            if (const auto at = (juce::uint32) (juce::int64) window->getProperties().getWithDefault ("lynxFrontAt", 0); at != 0)
+                armed = juce::Time::getMillisecondCounter() - at > 300;
+    }
+
     void mouseUp (const juce::MouseEvent& e) override
     {
-        if (nameArea.contains (e.getPosition()) && ! e.mouseWasDraggedSinceMouseDown())
+        if (e.mouseWasDraggedSinceMouseDown() || ! armed || partAt (e.getPosition()) != pressedPart)
+            return;
+        if (pressedPart == 1)
+            step (-1);
+        else if (pressedPart == 2)
+            step (1);
+        else if (pressedPart == 3)
             showMenu();
+    }
+
+    int partAt (juce::Point<int> p) const
+    {
+        if (titleLook && prevArea.contains (p))
+            return 1;
+        if (titleLook && nextArea.contains (p))
+            return 2;
+        return nameArea.contains (p) ? 3 : 0;
     }
 
 private:
@@ -4853,6 +6324,10 @@ private:
             const auto& bank = banks::bankOf (kind);
             for (int i = 0; i < (int) bank.size(); ++i)
                 presets.push_back ({ banks::pathOf (i), banks::relativeOf (bank[(std::size_t) i]), bank[(std::size_t) i].name });
+            // the user's own presets last (round 190fs): "Your presets" in the menu, the arrows go through them too
+            userFrom = (int) presets.size();
+            for (const auto& f : genpresetui::userPresets (kind))
+                presets.push_back ({ f.getFullPathName().toStdString(), {}, f.getFileNameWithoutExtension().toStdString() });
             listedKind = kind;
             loaded = true;
             current = d != nullptr ? presetcycle::indexOfName (presets, d->name) : -1; // (a channel named after its preset)
@@ -4884,7 +6359,14 @@ private:
             return false;
         const auto& preset = all[(std::size_t) index];
         const auto bankIndex = banks::indexOfPath (preset.path);
-        auto changed = bankIndex >= 0 ? banks::withPreset (*d, bankIndex) : natives::withPreset (*d, preset.path, preset.name, flStudioAccess());
+        std::optional<ChannelDef> changed;
+        if (index >= userFrom) // one of the user's own presets (round 190fs)
+        {
+            if (const auto own = genpresetui::read (juce::File (juce::String::fromUTF8 (preset.path.c_str()))))
+                changed = genpresets::withPreset (*d, *own);
+        }
+        else
+            changed = bankIndex >= 0 ? banks::withPreset (*d, bankIndex) : natives::withPreset (*d, preset.path, preset.name, flStudioAccess());
         if (! changed)
         {
             if (reportFailure)
@@ -4909,11 +6391,18 @@ private:
 
     void showMenu()
     {
+        buildMenu().showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this));
+    }
+
+public:
+    juce::PopupMenu buildMenu()
+    {
+        refreshUserPresets(); // (another channel's window may have saved or deleted one)
         const auto& all = list();
         juce::PopupMenu menu;
         std::map<std::string, juce::PopupMenu> folders;
         std::vector<std::string> order;
-        for (int i = 0; i < (int) all.size(); ++i)
+        for (int i = 0; i < juce::jmin (userFrom, (int) all.size()); ++i)
         {
             const auto& rel = all[(std::size_t) i].relative;
             const auto slash = rel.find_last_of ('/');
@@ -4928,66 +6417,182 @@ private:
                     menu.addItem (it.getItem());
             else
                 menu.addSubMenu (juce::String::fromUTF8 (folder.c_str()), folders[folder]);
-        if (menu.getNumItems() == 0)
+        if (menu.getNumItems() == 0 && userFrom >= (int) all.size())
             menu.addItem (tr ("No presets found (they come with FL Studio)"), false, false, [] {});
-        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this));
+        addUserItems (menu);
+        return menu;
+    }
+
+    // Round 190fs: the user's own presets of this generator, with the items the hosted plugins' and the mixer effects'
+    // preset menus have (Save preset..., Your presets, Delete preset, Show the presets folder). FL's wrapper saves a
+    // generator's settings with "Save preset as..." (PluginMenu SaveStateMenu); LYNX's channel window has no wrapper
+    // menu, so the item is in the preset box, as in the other LYNX preset menus.
+    void addUserItems (juce::PopupMenu& menu)
+    {
+        const auto& all = list();
+        const auto* d = def();
+        if (d == nullptr || ! genpresets::canSave (d->instrument))
+            return;
+        if (userFrom < (int) all.size())
+        {
+            menu.addSectionHeader (tr ("Your presets"));
+            for (int i = userFrom; i < (int) all.size(); ++i)
+                menu.addItem (juce::String::fromUTF8 (all[(std::size_t) i].name.c_str()), true, i == current, [this, i] { load (i); });
+        }
+        menu.addSeparator();
+        menu.addItem (tr ("Save preset..."), [safe = juce::Component::SafePointer<ChannelPresetBar> (this)] {
+            if (safe != nullptr)
+                safe->saveAs();
+        });
+        if (current >= userFrom && current < (int) all.size())
+        {
+            const juce::File file (juce::String::fromUTF8 (all[(std::size_t) current].path.c_str()));
+            menu.addItem (tr ("Delete preset \"{0}\"", { file.getFileNameWithoutExtension() }),
+                          [safe = juce::Component::SafePointer<ChannelPresetBar> (this), file] {
+                              file.deleteFile();
+                              if (safe != nullptr)
+                                  safe->relist ({});
+                          });
+        }
+        const auto kind = d->instrument;
+        menu.addItem (tr ("Show the presets folder"), [kind] { genpresetui::reveal (genpresetui::folderFor (kind)); });
+    }
+
+    // "Save preset...": the name box, then the file; the box shows the new preset (the channel keeps its name)
+    void saveAs()
+    {
+        const auto* d = def();
+        if (d == nullptr)
+            return;
+        genpresetui::askName (*this, current >= 0 ? currentName : juce::String::fromUTF8 (d->name.c_str()),
+                              [safe = juce::Component::SafePointer<ChannelPresetBar> (this)] (const juce::String& name) {
+                                  if (safe != nullptr)
+                                      safe->saveNamed (name);
+                              });
+    }
+
+    bool saveNamed (const juce::String& name)
+    {
+        const auto* d = def();
+        if (d == nullptr)
+            return false;
+        juce::File written;
+        juce::String error;
+        if (! genpresetui::save (*d, name, written, error))
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Save preset"), error);
+            return false;
+        }
+        relist (written.getFullPathName());
+        return true;
+    }
+
+    juce::String shownName() const { return current >= 0 ? currentName : juce::String(); }
+    int presetCount() { return (int) list().size(); }
+    int userPresetCount() { return (int) list().size() - userFrom; }
+    bool loadAt (int index) { return load (index, false); }
+
+private:
+    // the user's presets as they are on disk now, the rest of the list kept; the current preset stays selected
+    void refreshUserPresets()
+    {
+        const auto* d = def();
+        if (! loaded || d == nullptr || d->instrument != listedKind)
+            return;
+        const auto was = current >= userFrom && current < (int) presets.size() ? presets[(std::size_t) current].path : std::string();
+        presets.resize ((std::size_t) userFrom);
+        for (const auto& f : genpresetui::userPresets (listedKind))
+            presets.push_back ({ f.getFullPathName().toStdString(), {}, f.getFileNameWithoutExtension().toStdString() });
+        if (! was.empty())
+        {
+            current = -1;
+            for (int i = userFrom; i < (int) presets.size(); ++i)
+                if (presets[(std::size_t) i].path == was)
+                    current = i;
+            if (current < 0)
+                currentName = {};
+        }
+    }
+
+    // the list again (a preset was saved or deleted); `select` (a file path) becomes the current preset
+    void relist (const juce::String& select)
+    {
+        loaded = false;
+        const auto& all = list();
+        current = -1;
+        currentName = {};
+        for (int i = userFrom; i < (int) all.size() && select.isNotEmpty(); ++i)
+            if (juce::File (juce::String::fromUTF8 (all[(std::size_t) i].path.c_str())) == juce::File (select))
+            {
+                current = i;
+                currentName = juce::String::fromUTF8 (all[(std::size_t) i].name.c_str());
+            }
+        repaint();
     }
 
     AudioEngine& engine;
     int channel;
     juce::TextButton prev { juce::String::fromUTF8 ("\xe2\x97\x80") }, next { juce::String::fromUTF8 ("\xe2\x96\xb6") };
-    juce::Rectangle<int> nameArea;
+    juce::Rectangle<int> nameArea, prevArea, nextArea;
+    bool titleLook = false;
+    bool armed = true; // (round 190mc: the press did not just bring the window to the front)
+    int pressedPart = 0;
     std::vector<presetcycle::Preset> presets;
     InstrumentKind listedKind = InstrumentKind::synth;
     bool loaded = false;
     int current = -1;
+    int userFrom = 0; // the first of the user's own presets in `presets`
     juce::String currentName;
 };
 
-// The frame: header strip (tabs on the left; ON, PAN, VOL, TRACK on the right) over the page of the selected tab.
-class ChannelFrame final : public juce::Component,
-                           private juce::ChangeListener
+// FL's ON switch of a channel (round 190in, design190ia FW-2): a round green LED (15 px) with its caption under it, as
+// FL's wrapper draws it; off = a dark LED. Clicking it mutes / unmutes the channel.
+class OnLed final : public juce::Button
 {
 public:
-    static constexpr int headerHeight = 62;
-
-    // c.index < 0 (a Patcher node, round 164f): the instrument's pages alone, without the channel's header and Misc tab
-    ChannelFrame (AudioEngine& e, ChannelRef c, std::unique_ptr<juce::Component> instrumentPage, std::unique_ptr<juce::Component> envelopePage)
-        : engine (e), channel (c.index), node (c.index < 0)
+    OnLed() : juce::Button (tr ("On"))
     {
-        auto addPage = [this] (std::unique_ptr<juce::Component> page, const juce::String& title, const juce::String& tip) {
-            auto button = std::make_unique<juce::TextButton> (title);
-            button->setTooltip (tip);
-            button->setClickingTogglesState (true);
-            button->setRadioGroupId (1);
-            const auto index = (int) pages.size();
-            button->onClick = [this, index] { showTab (index); };
-            addAndMakeVisible (*button);
-            addChildComponent (*page);
-            sizes.push_back ({ juce::jmax (1, page->getWidth()), juce::jmax (1, page->getHeight()) });
-            tabs.push_back (std::move (button));
-            pages.push_back (std::move (page));
-        };
-        instrumentPageFirst = instrumentPage != nullptr;
-        if (instrumentPage != nullptr) // (none: a channel whose instrument has its own window, e.g. a hosted plugin)
-            addPage (std::move (instrumentPage), tr ("Plugin"), tr ("The instrument's own settings"));
-        if (envelopePage != nullptr)
-            addPage (std::move (envelopePage), tr ("Envelope / instrument"), tr ("Envelope / instrument settings: the filter and pitch envelopes and the LFOs"));
-        if (node)
-        {
-            int width = 1, height = 1;
-            for (auto& p : pages)
-            {
-                width = juce::jmax (width, p->getWidth());
-                height = juce::jmax (height, p->getHeight());
-            }
-            setSize (width, headerHeight + height);
-            showTab (0);
-            return;
-        }
-        addPage (std::make_unique<MiscPanel> (engine, channel), tr ("Misc"), tr ("Miscellaneous functions: levels, polyphony, time, tracking, cut groups, arpeggiator, echo delay"));
+        setClickingTogglesState (true);
+        setWantsKeyboardFocus (false);
+        setMouseClickGrabsKeyboardFocus (false);
+    }
 
-        on.setButtonText (tr ("On"));
+    void paintButton (juce::Graphics& g, bool over, bool down) override
+    {
+        using namespace theme;
+        const auto b = getLocalBounds().toFloat();
+        const auto led = juce::Rectangle<float> (15.0f, 15.0f).withCentre ({ b.getCentreX(), 18.0f });
+        if (getToggleState())
+        {
+            g.setGradientFill (juce::ColourGradient (colour::ledOn.brighter (0.3f), led.getCentreX() - 2.0f, led.getCentreY() - 2.0f,
+                                                     juce::Colour (0xff2a9d5e), led.getRight(), led.getBottom(), true));
+            g.fillEllipse (led);
+            g.setColour (over ? colour::textSecondary : juce::Colour (0xff1e5e3a));
+        }
+        else
+        {
+            g.setColour (juce::Colour (0xff2a2d34));
+            g.fillEllipse (led);
+            g.setColour (over ? colour::textSecondary : colour::borderStrong);
+        }
+        g.drawEllipse (led.reduced (0.5f), 1.0f);
+        g.setColour (over || down ? colour::textPrimary : colour::textSecondary);
+        g.setFont (font (type::caption, true));
+        g.drawFittedText (caps (getButtonText()), juce::Rectangle<int> (0, (int) FrameKnob::headerCaptionTop, getWidth(), 10), juce::Justification::centred, 1, 0.6f);
+    }
+};
+
+// FL's channel controls at the right of a channel's window header (ON, PAN, VOL, PITCH, RANGE, TRACK; REA round 143b,
+// round 190in's FL look, design190ia FW-2..FW-4): the channel window's header and a hosted instrument's wrapper header
+// (FW-7) show the same strip. Its width is `preferredWidth`; the controls keep FL's places from its right edge.
+class ChannelHeaderControls final : public juce::Component,
+                                    private juce::ChangeListener
+{
+public:
+    static constexpr int preferredWidth = 232;
+
+    ChannelHeaderControls (AudioEngine& e, int c) : engine (e), channel (c)
+    {
         on.setTooltip (tr ("Channel on / off (mute)"));
         on.onClick = [this] {
             const auto muted = ! on.getToggleState();
@@ -4997,18 +6602,6 @@ public:
             });
         };
         addAndMakeVisible (on);
-        if (ChannelPresetBar::wanted (engine, channel))
-        {
-            presetBar = std::make_unique<ChannelPresetBar> (engine, channel);
-            presetBar->onLoaded = [this, hasPage = instrumentPageFirst] (const juce::String& oldName, const juce::String& newName) {
-                // the plugin page shows the new preset's settings, the window takes the channel's new name (as FL)
-                juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<ChannelFrame> (this), hasPage, oldName, newName] {
-                    if (safe != nullptr)
-                        safe->presetLoaded (hasPage, oldName, newName);
-                });
-            };
-            addAndMakeVisible (*presetBar);
-        }
         const auto name = [this] { return channelNameOf (engine.getSong(), channel); };
         auto headerKnob = [this] (std::function<ui::ValueSpec()> spec, std::function<double (const ChannelDef&)> get, std::function<void (Song&, int, double)> set,
                                   const char* caption) {
@@ -5085,22 +6678,140 @@ public:
             };
         }
 
+        for (auto& k : header)
+            k->headerLook = true;
+        header[1]->restArc = theme::colour::ledOn; // FL's green VOL ring
+        header[3]->joinLeft = true;                // RANGE, attached to the PITCH knob
+        refresh();
+        engine.addChangeListener (this);
+    }
+
+    ~ChannelHeaderControls() override { engine.removeChangeListener (this); }
+
+    void resized() override
+    {
+        // FL's places from the right edge (ref/fl-plugin-wrapper-flex.png: ON 214, PAN 180, VOL 145, PITCH 111 px to the
+        // centre; RANGE right of PITCH; TRACK 7 px in)
+        const auto w = getWidth(), h = getHeight();
+        on.setBounds (w - 229, 0, 30, h);
+        const int xs[] = { w - 197, w - 162, w - 128, w - 96, w - 52 };
+        const int ws[] = { 34, 34, 34, 32, 46 };
+        for (std::size_t i = 0; i < header.size() && i < 5; ++i)
+            header[i]->setBounds (xs[i], 0, ws[i], h);
+    }
+
+private:
+    void refresh()
+    {
+        if (channel < (int) engine.getSong().channels.size())
+            on.setToggleState (! engine.getSong().channels[(std::size_t) channel].muted, juce::dontSendNotification);
+        for (auto& k : header)
+            k->repaint();
+    }
+    void changeListenerCallback (juce::ChangeBroadcaster*) override { refresh(); }
+
+    AudioEngine& engine;
+    int channel;
+    OnLed on;
+    std::vector<std::unique_ptr<FrameKnob>> header;
+};
+
+// The frame: header strip (tabs on the left; ON, PAN, VOL, TRACK on the right) over the page of the selected tab.
+// Round 190in (design190ia FW-1, FW-5): FL's 46 px strip — the tabs are FL's 44 px icon tabs flush at the left (the
+// shown one raised, its icon green), the preset ◀ name ▶ and FL's ▸ menu go to the window's title bar when the window
+// has LYNX's own (docked), else they sit in the strip (▸ at the far left, the presets after the tabs).
+class ChannelFrame final : public juce::Component
+{
+public:
+    static constexpr int headerHeight = 46;
+
+    // c.index < 0 (a Patcher node, round 164f): the instrument's pages alone, without the channel's header and Misc tab
+    ChannelFrame (AudioEngine& e, ChannelRef c, std::unique_ptr<juce::Component> instrumentPage, std::unique_ptr<juce::Component> envelopePage)
+        : engine (e), channel (c.index), node (c.index < 0)
+    {
+        auto addPage = [this] (std::unique_ptr<juce::Component> page, const juce::String& title, const juce::String& tip, Icon icon) {
+            // FL's icon tab (FW-1): the caption is the tooltip and the hint
+            auto button = std::make_unique<IconButton> (title, icon);
+            button->setTooltip (title + ": " + tip);
+            button->setFlat (true);
+            button->setCorners (false, false);
+            button->setOnColour (theme::colour::bg5);
+            button->setIconColourWhenOn (theme::colour::ledOn);
+            button->setIconColour (theme::colour::textSecondary);
+            button->setIconSizing (0.5f, 22.0f);
+            button->setWantsKeyboardFocus (false);
+            button->setClickingTogglesState (true);
+            button->setRadioGroupId (1);
+            const auto index = (int) pages.size();
+            button->onClick = [this, index] { showTab (index); };
+            addAndMakeVisible (*button);
+            addChildComponent (*page);
+            sizes.push_back ({ juce::jmax (1, page->getWidth()), juce::jmax (1, page->getHeight()) });
+            tabs.push_back (std::move (button));
+            pages.push_back (std::move (page));
+        };
+        instrumentPageFirst = instrumentPage != nullptr;
+        if (instrumentPage != nullptr) // (none: a channel whose instrument has its own window, e.g. a hosted plugin)
+        {
+            // FL's channel window has one "Sample settings" sheet for the Sampler and for an audio clip's channel, and a
+            // "Plugin editor" sheet for every other generator (TPluginForm BtnHint "|Sample settings" / "|Plugin editor")
+            const auto kind = channel >= 0 && channel < (int) engine.getSong().channels.size()
+                                  ? engine.getSong().channels[(std::size_t) channel].instrument
+                                  : InstrumentKind::synth;
+            if (kind == InstrumentKind::sampler || kind == InstrumentKind::audioClip)
+                addPage (std::move (instrumentPage), tr ("Sample"), tr ("Sample settings"), Icon::audioFile);
+            else
+            {
+                // round 190in (FW-6): the engine's description ("Harmless — FL's additive engine…") is the tab's tooltip
+                auto tip = tr ("The instrument's own settings");
+                if (auto* model = dynamic_cast<ModelPanel*> (instrumentPage.get()))
+                    tip = model->description();
+                addPage (std::move (instrumentPage), tr ("Plugin"), tip, Icon::pluginPicker);
+            }
+        }
+        if (envelopePage != nullptr)
+            addPage (std::move (envelopePage), tr ("Envelope / instrument"), tr ("Envelope / instrument settings: the filter and pitch envelopes and the LFOs"),
+                     Icon::envelope);
+        if (node)
+        {
+            int width = 1, height = 1;
+            for (auto& p : pages)
+            {
+                width = juce::jmax (width, p->getWidth());
+                height = juce::jmax (height, p->getHeight());
+            }
+            setSize (width, headerHeight + height);
+            showTab (0);
+            return;
+        }
+        addPage (std::make_unique<MiscPanel> (engine, channel), tr ("Misc"), tr ("Miscellaneous functions: levels, polyphony, time, tracking, cut groups, arpeggiator, echo delay"),
+                 Icon::wrench);
+
+        controls = std::make_unique<ChannelHeaderControls> (engine, channel);
+        addAndMakeVisible (*controls);
+        // FL's ▸ wrapper menu (round 190in, R8): in the strip until the window takes it into its title bar
+        addAndMakeVisible (menuArrow);
+        menuArrow.onClick = [this] { showWrapperMenu (menuArrow); };
+        if (ChannelPresetBar::wanted (engine, channel))
+        {
+            presetBar = std::make_unique<ChannelPresetBar> (engine, channel);
+            presetBar->onLoaded = [this, hasPage = instrumentPageFirst] (const juce::String& oldName, const juce::String& newName) {
+                // the plugin page shows the new preset's settings, the window takes the channel's new name (as FL)
+                juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<ChannelFrame> (this), hasPage, oldName, newName] {
+                    if (safe != nullptr)
+                        safe->presetLoaded (hasPage, oldName, newName);
+                });
+            };
+            addAndMakeVisible (*presetBar);
+        }
         int width = MiscPanel::preferredWidth, height = MiscPanel::preferredHeight;
         for (auto& p : pages)
         {
             width = juce::jmax (width, p->getWidth());
             height = juce::jmax (height, p->getHeight());
         }
-        refresh();
-        engine.addChangeListener (this);
         setSize (width, headerHeight + height);
         showTab (0);
-    }
-
-    ~ChannelFrame() override
-    {
-        if (! node)
-            engine.removeChangeListener (this);
     }
 
     void showTab (int index)
@@ -5140,28 +6851,52 @@ public:
         g.fillRect (getLocalBounds().removeFromTop (headerHeight));
         g.setColour (theme::colour::border);
         g.drawHorizontalLine (headerHeight - 1, 0.0f, (float) getWidth());
+        for (auto& t : tabs) // FL's tabs sit side by side; a 1 px line closes each
+            g.fillRect (t->getRight(), 0, 1, headerHeight - 1);
     }
+
+    // Round 190in: the window's title bar shows the ▸ menu and the presets (docked: LYNX's own title bar); the strip
+    // gives them up. The window calls this once it knows.
+    void movePresetsToTitleBar (juce::Component& titleBarOwner)
+    {
+        presetsInTitle = true;
+        menuArrow.setVisible (false);
+        if (presetBar != nullptr)
+        {
+            presetBar->setTitleLook (true);
+            titleBarOwner.addAndMakeVisible (*presetBar);
+        }
+        resized();
+    }
+    juce::Component* presetComponent() const noexcept { return presetBar.get(); }
+    int channelIndex() const noexcept { return channel; }
+
+    // FL's ▸ wrapper menu of this channel (round 190in, details190if R8). `scaling` / `detached`: the window's items.
+    std::function<void (wrappermenu::Spec&)> windowItems;
+    void showWrapperMenu (juce::Component& anchor);
+    juce::PopupMenu buildWrapperMenu();
 
     void resized() override
     {
-        auto tabsArea = getLocalBounds().removeFromTop (headerHeight).reduced (8, 6);
-        if (presetBar != nullptr) // tabs on the upper row, the preset arrows under them
+        auto strip = getLocalBounds().removeFromTop (headerHeight - 1);
+        if (menuArrow.isVisible())
+            menuArrow.setBounds (strip.removeFromLeft (20).withSizeKeepingCentre (20, 24));
+        for (auto& t : tabs) // FL's 44 px icon tabs, side by side, the strip's whole height
         {
-            presetBar->setBounds (tabsArea.removeFromBottom (22).removeFromLeft (juce::jmin (300, tabsArea.getWidth())));
-            tabsArea.removeFromBottom (2);
+            t->setBounds (strip.removeFromLeft (44));
+            strip.removeFromLeft (1);
         }
-        for (auto& t : tabs)
+        if (controls != nullptr)
+            controls->setBounds (getWidth() - ChannelHeaderControls::preferredWidth, 0, ChannelHeaderControls::preferredWidth, headerHeight - 1);
+        if (presetBar != nullptr && ! presetsInTitle) // one row after the tabs (FW-5: where there is no title bar of LYNX's)
         {
-            const auto w = juce::jmax (64, (int) juce::GlyphArrangement::getStringWidth (juce::Font (theme::font (theme::type::body)), t->getButtonText()) + 24);
-            t->setBounds (tabsArea.removeFromLeft (w).withSizeKeepingCentre (w, juce::jmin (26, tabsArea.getHeight())));
-            tabsArea.removeFromLeft (4);
+            strip.removeFromLeft (8);
+            const auto room = (controls != nullptr ? controls->getX() : getWidth()) - 8 - strip.getX();
+            presetBar->setBounds (strip.withWidth (juce::jlimit (0, 280, room)).withSizeKeepingCentre (juce::jlimit (0, 280, room), 22));
         }
-        auto right = getLocalBounds().removeFromTop (headerHeight).reduced (6, 2);
-        for (auto it = header.rbegin(); it != header.rend(); ++it)
-            (*it)->setBounds (right.removeFromRight (48));
-        on.setBounds (right.removeFromRight (52).withSizeKeepingCentre (52, 24));
         // each page keeps its own size (some scale their drawing with it), centred under the header
         const auto body = getLocalBounds().withTrimmedTop (headerHeight);
+        const juce::ScopedValueSetter<bool> placing (laying, true);
         for (std::size_t i = 0; i < pages.size(); ++i)
         {
             const auto w = juce::jmin (body.getWidth(), sizes[i].x), h = juce::jmin (body.getHeight(), sizes[i].y);
@@ -5169,29 +6904,91 @@ public:
         }
     }
 
-private:
-    void refresh()
+    // A page that sizes itself (Slicex's display modes and keyboard button, round 190hg): the frame takes the new
+    // size and its window follows, as FL's plugin window does. Sizes set by resized() itself are not news.
+    void childBoundsChanged (juce::Component* child) override
     {
-        if (channel < (int) engine.getSong().channels.size())
-            on.setToggleState (! engine.getSong().channels[(std::size_t) channel].muted, juce::dontSendNotification);
-        for (auto& k : header)
-            k->repaint();
+        if (laying)
+            return;
+        for (std::size_t i = 0; i < pages.size(); ++i)
+            if (pages[i].get() == child)
+            {
+                const juce::Point<int> now { juce::jmax (1, child->getWidth()), juce::jmax (1, child->getHeight()) };
+                if (now == sizes[i])
+                    return;
+                sizes[i] = now;
+                int width = node ? 1 : MiscPanel::preferredWidth, height = node ? 1 : MiscPanel::preferredHeight;
+                for (const auto& size : sizes)
+                {
+                    width = juce::jmax (width, size.x);
+                    height = juce::jmax (height, size.y);
+                }
+                if (width != getWidth() || headerHeight + height != getHeight())
+                    setSize (width, headerHeight + height);
+                else
+                    resized();
+                return;
+            }
     }
 
-    void changeListenerCallback (juce::ChangeBroadcaster*) override { refresh(); }
-
+private:
     AudioEngine& engine;
     int channel;
     bool node = false;
     int current = 0;
-    std::vector<std::unique_ptr<juce::TextButton>> tabs;
+    std::vector<std::unique_ptr<IconButton>> tabs;
     std::vector<std::unique_ptr<juce::Component>> pages;
     std::vector<juce::Point<int>> sizes;
-    std::vector<std::unique_ptr<FrameKnob>> header;
-    juce::ToggleButton on;
+    bool laying = false; // (resized() is placing the pages)
+    std::unique_ptr<ChannelHeaderControls> controls;
+    wrappermenu::MenuArrow menuArrow;
     std::unique_ptr<ChannelPresetBar> presetBar;
-    bool instrumentPageFirst = false;
+    bool instrumentPageFirst = false, presetsInTitle = false;
 };
+
+void ChannelFrame::showWrapperMenu (juce::Component& anchor)
+{
+    buildWrapperMenu().showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&anchor));
+}
+
+juce::PopupMenu ChannelFrame::buildWrapperMenu()
+{
+    // FL's channel ▸ menu (FL manual, Channel Settings › Menu commands; Plugin wrapper › Plugin Menu; capture
+    // live190gu/genpreset/fl-wrapper-menu-slicex.png). The Channel rack's own items come from the main window.
+    wrappermenu::Spec spec;
+    spec.channel = true;
+    if (channelWrapperItemsHandler())
+        channelWrapperItemsHandler() (channel, spec);
+    if (auto* bar = presetBar.get())
+    {
+        const juce::Component::SafePointer<ChannelPresetBar> safe (bar);
+        spec.presets = [safe] (juce::PopupMenu& m) {
+            if (safe != nullptr)
+                m = safe->buildMenu();
+        };
+        spec.savePresetAs = [safe] {
+            if (safe != nullptr)
+                safe->saveAs();
+        };
+    }
+    if (const auto* d = channel >= 0 && channel < (int) engine.getSong().channels.size() ? &engine.getSong().channels[(std::size_t) channel] : nullptr;
+        d != nullptr && genpresets::canSave (d->instrument) && locateInBrowserHandler())
+        spec.browsePresets = [folder = genpresetui::folderFor (d->instrument)] {
+            folder.createDirectory();
+            if (locateInBrowserHandler())
+                locateInBrowserHandler() (folder);
+        };
+    // FL's Route to free mixer track (Ctrl+L): the channel to the first free insert
+    spec.routeToFreeMixerTrack = [this] {
+        engine.editSong ([ch = channel] (Song& s) {
+            if (ch >= 0 && ch < (int) s.channels.size())
+                s.channels[(std::size_t) ch].mixerTrack = s.claimFreeInsert();
+        });
+    };
+    if (windowItems)
+        windowItems (spec);
+    return wrappermenu::build (spec);
+}
 
 bool hasEnvelopeTab (InstrumentKind kind) noexcept
 {
@@ -5202,6 +6999,21 @@ bool hasEnvelopeTab (InstrumentKind kind) noexcept
 // processor's block in the generator's state) for Fruity Slicer (issue #129)
 std::unique_ptr<juce::Component> makeEnvelopePage (AudioEngine& engine, const ChannelRef& ref, InstrumentKind kind)
 {
+    // round 190df: a sampler that runs FL's voice (an FL project's sampler: SamplerSettings::flChannel) gets FL's own
+    // page, with the three tensions, the predelay and the envelope presets; its edits keep FL's voice (LYNX's page
+    // would replace it)
+    if (const auto* def = ref.get (engine); kind == InstrumentKind::sampler && def != nullptr && flsamplervoice::has (def->sampler))
+        return makeFlVoicePanel (
+            engine,
+            [&engine, ref] () -> std::optional<flvoice::Settings> {
+                const auto* d = ref.get (engine);
+                if (d == nullptr || d->instrument != InstrumentKind::sampler || ! flsamplervoice::has (d->sampler))
+                    return std::nullopt;
+                return flsamplervoice::read (d->sampler);
+            },
+            [&engine, ref] (const flvoice::Settings& settings) {
+                ref.edit (engine, [settings] (ChannelDef& d) { flsamplervoice::write (d.sampler, settings); });
+            });
     if (hasEnvelopeTab (kind))
         return std::make_unique<ModulationPanel> (engine, ref);
     if (kind != InstrumentKind::fruityslicer)
@@ -5247,7 +7059,8 @@ bool isModelKind (InstrumentKind kind) noexcept
            || kind == InstrumentKind::simsynth || kind == InstrumentKind::wasp || kind == InstrumentKind::plucked
            || kind == InstrumentKind::beepmap || kind == InstrumentKind::sawer || kind == InstrumentKind::flkeys
            || kind == InstrumentKind::granulizer || kind == InstrumentKind::drumaxx
-           || kind == InstrumentKind::slayer || kind == InstrumentKind::fruitydance || kind == InstrumentKind::sytrus;
+           || kind == InstrumentKind::slayer || kind == InstrumentKind::fruitydance || kind == InstrumentKind::sytrus || kind == InstrumentKind::pocketSuperSaw
+           || kind == InstrumentKind::braid; // (round 190ko: Braid's parameters as a knob list, Meld's units)
 }
 
 // The instrument page of a channel or a Patcher node (null: none of its own)
@@ -5269,6 +7082,12 @@ std::unique_ptr<juce::Component> makeInstrumentPage (AudioEngine& engine, const 
         return makeSlicexEditor (engine, ref.locate, ref.index); // round 190r
     if (kind == InstrumentKind::fpc)
         return makeFpcEditor (engine, ref.locate, ref.index); // round 190q
+    if (kind == InstrumentKind::tetra)
+        return makeTetraEditor (engine, ref.locate, ref.index); // round 190hs
+    if (kind == InstrumentKind::directwave)
+        return makeDirectWaveEditor (engine, ref.locate, ref.index); // round 190hz
+    if (kind == InstrumentKind::helix)
+        return makeHelixEditor (engine, ref.locate, ref.index); // round 190ja
     if (kind == InstrumentKind::synth)
         return std::make_unique<SynthPanel> (engine, ref);
     if (isModelKind (kind))
@@ -5286,15 +7105,139 @@ std::optional<juce::Point<int>>& alignedChannelEditorPosition()
     return at;
 }
 
-class SettingsWindow final : public juce::DocumentWindow
+// Round 190he (issue #152: "the FL-engine plugins can't be made smaller"): a settings window's content at a scale of
+// its own (FL's plugin menu › Scaling, core/EditorScale.h). The page keeps its own size and layout and is drawn through a
+// transform; this holder is the page's size times the factor, and follows the page when it changes its size (a tab
+// with another size). When the window is sized by its edge, the holder takes the new size and the factor follows.
+class ScaledContent final : public juce::Component
 {
 public:
-    SettingsWindow (AudioEngine& engine, int c, bool modulationWindow)
-        : juce::DocumentWindow (tr ("Channel settings"), theme::colour::bg2, DocumentWindow::closeButton),
-          channel (c),
-          modulation (modulationWindow)
+    ScaledContent (std::unique_ptr<juce::Component> page, int storedScale)
+        : inner (std::move (page)),
+          stored (storedScale)
     {
-        setUsingNativeTitleBar (true);
+        getProperties().set ("lynxScaledContent", true);
+        addAndMakeVisible (*inner);
+        fitToPage();
+    }
+
+    juce::Component& page() noexcept { return *inner; }
+    int storedScale() const noexcept { return stored; }
+    juce::Point<int> pageSize() const { return { juce::jmax (1, inner->getWidth()), juce::jmax (1, inner->getHeight()) }; }
+
+    void setStoredScale (int newStored)
+    {
+        stored = newStored <= 0 ? 0 : editorscale::storedFor (newStored);
+        fitToPage();
+    }
+
+    void resized() override
+    {
+        if (fitting)
+            return;
+        const auto size = pageSize();
+        const auto factor = juce::jmax (0.05, juce::jmin ((double) getWidth() / size.x, (double) getHeight() / size.y));
+        inner->setTransform (juce::AffineTransform::scale ((float) factor));
+        // (a pixel of rounding is not a new size: the window fitted to the page lands here too)
+        if (const auto percent = editorscale::percentForWidth (getWidth(), size.x); std::abs (percent - editorscale::percentOf (stored)) > 1)
+            stored = editorscale::storedFor (percent);
+    }
+
+    void childBoundsChanged (juce::Component* child) override
+    {
+        if (child == inner.get() && ! fitting)
+            fitToPage();
+    }
+
+private:
+    void fitToPage()
+    {
+        const juce::ScopedValueSetter<bool> busy (fitting, true);
+        const auto factor = editorscale::factorOf (stored);
+        inner->setTopLeftPosition (0, 0);
+        inner->setTransform (juce::AffineTransform::scale ((float) factor));
+        const auto size = pageSize();
+        setSize (juce::roundToInt (size.x * factor), juce::roundToInt (size.y * factor));
+    }
+
+    std::unique_ptr<juce::Component> inner;
+    int stored = 0;
+    bool fitting = false;
+};
+
+// Sizing a settings window by its edge keeps the page's proportions (the content area is the page times one factor),
+// between editorscale::minPercent and maxPercent.
+class PageAspectConstrainer final : public juce::ComponentBoundsConstrainer
+{
+public:
+    explicit PageAspectConstrainer (juce::ResizableWindow& w) : window (w)
+    {
+        setMinimumOnscreenAmounts (0x10000, 16, 24, 16); // (as ResizableWindow's own constrainer: the title stays reachable)
+    }
+    std::function<juce::Point<int>()> pageSize;
+    std::function<void()> onResizeEnd; // (the size is remembered once, when the drag ends)
+
+    void resizeEnd() override
+    {
+        if (onResizeEnd != nullptr)
+            onResizeEnd();
+    }
+
+    void checkBounds (juce::Rectangle<int>& bounds, const juce::Rectangle<int>& previous, const juce::Rectangle<int>& limits, bool top,
+                      bool left, bool bottom, bool right) override
+    {
+        const auto page = pageSize != nullptr ? pageSize() : juce::Point<int>();
+        // (only a drag of an edge keeps the proportions: a move, or the system placing the window, keeps its size)
+        if (page.x <= 0 || page.y <= 0 || ! (top || left || bottom || right))
+        {
+            juce::ComponentBoundsConstrainer::checkBounds (bounds, previous, limits, top, left, bottom, right);
+            return;
+        }
+        const auto border = window.getContentComponentBorder();
+        const auto w = (double) (bounds.getWidth() - border.getLeftAndRight()), h = (double) (bounds.getHeight() - border.getTopAndBottom());
+        const auto sideways = left || right, upDown = top || bottom;
+        auto factor = sideways && ! upDown ? w / page.x : upDown && ! sideways ? h / page.y : juce::jmax (w / page.x, h / page.y);
+        factor = juce::jlimit ((double) editorscale::minPercent / editorscale::defaultPercent,
+                               (double) editorscale::maxPercent / editorscale::defaultPercent, factor);
+        const auto newW = juce::roundToInt (page.x * factor) + border.getLeftAndRight();
+        const auto newH = juce::roundToInt (page.y * factor) + border.getTopAndBottom();
+        if (left)
+            bounds.setLeft (bounds.getRight() - newW);
+        else
+            bounds.setWidth (newW);
+        if (top)
+            bounds.setTop (bounds.getBottom() - newH);
+        else
+            bounds.setHeight (newH);
+        juce::ComponentBoundsConstrainer::checkBounds (bounds, previous, limits, top, left, bottom, right); // (on screen)
+    }
+
+private:
+    juce::ResizableWindow& window;
+};
+
+void openWindow (AudioEngine& engine, int channel, bool modulation);
+class SettingsWindow;
+std::vector<std::unique_ptr<SettingsWindow>>& windows();
+
+class SettingsWindow final : public juce::DocumentWindow, private juce::ChangeListener
+{
+public:
+    // `shot` (round 190in): off the desktop, in the docked look (LYNX's title bar), for the snapshot routes
+    SettingsWindow (AudioEngine& engine, int c, bool modulationWindow, bool shot = false)
+        : juce::DocumentWindow (tr ("Channel settings"), theme::colour::bg2, DocumentWindow::closeButton, ! shot),
+          channel (c),
+          modulation (modulationWindow),
+          engineRef (engine),
+          aspect (*this)
+    {
+        setUsingNativeTitleBar (! shot);
+        // round 190mc (discussion #202): the window belongs to its channel, not to a row of the rack — a clone, an insert
+        // or a move above it shifts the rows, and the window must not go on editing whatever lands on its old row
+        if (const auto& song = engine.getSong(); channel >= 0 && channel < (int) song.channels.size())
+            instanceId = song.channels[(std::size_t) channel].instance.id;
+        if (! shot)
+            engine.addChangeListener (this);
         // FL names the window after the channel and its mixer track (REA round 149 [EXEC]: "FL Studio VSTi (Master)",
         // "Synth Bass (Synth Bass)")
         if (const auto& song = engine.getSong(); channel >= 0 && channel < (int) song.channels.size())
@@ -5308,29 +7251,200 @@ public:
                      + (modulation ? " - " + tr ("Envelope / instrument") : juce::String()));
         }
 
+        std::unique_ptr<juce::Component> page;
         if (modulation)
-            setContentOwned (new ModulationPanel (engine, ChannelRef::rack (channel)), true);
+            page = std::make_unique<ModulationPanel> (engine, ChannelRef::rack (channel));
         else if (! hasChannelSettings (engine.getSong().channels[(std::size_t) channel].instrument))
-            setContentOwned (new ChannelFrame (engine, ChannelRef::rack (channel), nullptr, nullptr), true); // the Misc tab alone
+            page = std::make_unique<ChannelFrame> (engine, ChannelRef::rack (channel), nullptr, nullptr); // the Misc tab alone
         else
-            setContentOwned (makeChannelFrame (engine, channel).release(), true);
+            page = makeChannelFrame (engine, channel);
+        // FL's Scaling (round 190he): the channel's own size, remembered with the project (the modulation window too)
+        const auto& song = engine.getSong();
+        scaled = new ScaledContent (std::move (page), song.channels[(std::size_t) channel].editorScale);
+        setContentOwned (scaled, true);
+        aspect.pageSize = [this] { return scaled->pageSize(); };
+        aspect.onResizeEnd = [this] { remember (scaled->storedScale()); };
+        setConstrainer (&aspect);
+        setResizable (true, false);
 
-        centreWithSize (getWidth(), getHeight());
-        if (! modulation)
-            if (const auto& at = alignedChannelEditorPosition(); at.has_value())
-                setTopLeftPosition (*at); // "Align all channel editors" set every channel's place (round 169k)
-        setVisible (true);
-        markLinkedWindow (*this, channel, -1); // FL's Auto select linked modules (round 187a)
-        keepAboveMainWindow (*this);
+        auto docked = shot;
+        if (shot) // (as dockOrKeepAbove makes a docked window: LYNX's title bar, the close button alone)
+        {
+            setTitleBarButtonsRequired (juce::DocumentWindow::closeButton, false);
+            setTitleBarHeight (26);
+            setContentComponentSize (scaled->getWidth(), scaled->getHeight());
+        }
+        else
+        {
+            centreWithSize (getWidth(), getHeight());
+            if (! modulation)
+                if (const auto& at = alignedChannelEditorPosition(); at.has_value())
+                    setTopLeftPosition (*at); // "Align all channel editors" set every channel's place (round 169k)
+            setVisible (true);
+            markLinkedWindow (*this, channel, -1); // FL's Auto select linked modules (round 187a)
+            docked = dockOrKeepAbove (*this); // FL's docked plugin window (round 190ev)
+        }
+        // Round 190in (design190ia FW-5, details190if R8): FL's title bar — ▸ menu at the left, "Name (target)" in two
+        // tones, the preset ◀ name ▶ at the right. Only LYNX's own title bar (docked) can hold them; a system title bar
+        // leaves them in the frame's strip.
+        if (auto* frame = dynamic_cast<ChannelFrame*> (&scaled->page()))
+        {
+            frame->windowItems = [safe = juce::Component::SafePointer<SettingsWindow> (this), docked] (wrappermenu::Spec& spec) {
+                if (safe == nullptr)
+                    return;
+                spec.scaling = [safe] (juce::PopupMenu& m) {
+                    if (safe != nullptr)
+                        m = safe->scalingMenu();
+                };
+                spec.detached = ! docked; // (a window of the system's when docking is off: shown, not switched here)
+            };
+            if (docked)
+            {
+                setTitleBarTextCentred (false);
+                getProperties().set ("lynxTitleTwoTone", true);
+                getProperties().set ("lynxTitleLeft", 20);
+                titleMenu.onClick = [this, frame] { frame->showWrapperMenu (titleMenu); };
+                Component::addAndMakeVisible (titleMenu);
+                frame->movePresetsToTitleBar (*this);
+                titlePresets = frame->presetComponent();
+                getProperties().set ("lynxTitleRight", titlePresets != nullptr ? titlePresetsWidth + 6 : 0);
+                resized();
+            }
+        }
+    }
+
+    void resized() override
+    {
+        juce::DocumentWindow::resized();
+        const auto bar = getTitleBarArea();
+        if (titleMenu.isVisible())
+            titleMenu.setBounds (bar.getX() + 2, bar.getY(), 18, bar.getHeight());
+        if (titlePresets != nullptr && titlePresets->getParentComponent() == this)
+        {
+            auto right = bar.getRight();
+            if (auto* close = getCloseButton())
+                right = close->getX() - 6;
+            if (auto* min = getMinimiseButton(); min != nullptr && min->isVisible())
+                right = juce::jmin (right, min->getX() - 6);
+            titlePresets->setBounds (right - titlePresetsWidth, bar.getY() + 2, titlePresetsWidth, bar.getHeight() - 4);
+        }
+    }
+
+    ~SettingsWindow() override { engineRef.removeChangeListener (this); }
+
+    // the channel moved to another row (or went away): the window follows it to its new row, in the same place (a new
+    // window: every page of the old one was made for the old row), or closes
+    void changeListenerCallback (juce::ChangeBroadcaster*) override
+    {
+        const auto& song = engineRef.getSong();
+        if (instanceId == 0 || (channel >= 0 && channel < (int) song.channels.size() && song.channels[(std::size_t) channel].instance.id == instanceId))
+            return;
+        int now = -1;
+        for (int i = 0; i < (int) song.channels.size() && now < 0; ++i)
+            if (song.channels[(std::size_t) i].instance.id == instanceId)
+                now = i;
+        instanceId = 0; // (once)
+        auto* self = this;
+        juce::MessageManager::callAsync ([self, safe = juce::Component::SafePointer<SettingsWindow> (this), now, mod = modulation, engine = &engineRef,
+                                          at = getScreenPosition()] {
+            if (safe == nullptr)
+                return;
+            auto& open = windows();
+            open.erase (std::remove_if (open.begin(), open.end(), [self] (auto& w) { return w.get() == self; }), open.end());
+            if (now < 0)
+                return;
+            openWindow (*engine, now, mod);
+            for (auto& w : open)
+                if (w->getChannel() == now && w->isModulation() == mod)
+                    setWindowScreenPosition (*w, at);
+        });
+    }
+
+    // (round 190mc: when this window came to the front — the preset arrows in its title bar ignore that click)
+    void broughtToFront() override
+    {
+        getProperties().set ("lynxFrontAt", (juce::int64) juce::Time::getMillisecondCounter());
+        juce::DocumentWindow::broughtToFront();
     }
 
     int getChannel() const { return channel; }
     bool isModulation() const { return modulation; }
+    juce::Component* page() const { return scaled != nullptr ? &scaled->page() : nullptr; }
     void closeButtonPressed() override;
 
+    // FL's plugin menu › Scaling (PluginScalingMenu: 100 % … 400 % of the plugin's size): in the ▸ wrapper menu (round
+    // 190in, R8). A right-click on the title bar renames the channel, as in FL (DF-119: "the same can be done by
+    // Right-Clicking the title bar of the window"); without the Channel rack's rename (shots), it still shows Scaling.
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu() && e.eventComponent == this && ! isUsingNativeTitleBar() && e.y < getTitleBarHeight())
+        {
+            wrappermenu::Spec spec;
+            if (channelWrapperItemsHandler())
+                channelWrapperItemsHandler() (channel, spec);
+            if (spec.rename != nullptr)
+                spec.rename();
+            else
+                showScalingMenu();
+            return;
+        }
+        juce::DocumentWindow::mouseDown (e);
+    }
+
+    void showScalingMenu()
+    {
+        juce::PopupMenu menu;
+        menu.addSubMenu (tr ("Scaling"), scalingMenu());
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMousePosition());
+    }
+
+    juce::PopupMenu scalingMenu()
+    {
+        juce::PopupMenu sizes;
+        const auto stored = scaled->storedScale();
+        const juce::Component::SafePointer<SettingsWindow> safe (this);
+        // FL's items (System is left out: LYNX's whole interface already follows the display's scale)
+        sizes.addItem (tr ("Host"), true, stored == 0, [safe] {
+            if (safe != nullptr)
+                safe->setStoredScale (0);
+        });
+        for (const auto percent : editorscale::menuPercents)
+            sizes.addItem (juce::String (percent) + "%", true, stored == percent, [safe, percent] {
+                if (safe != nullptr)
+                    safe->setStoredScale (editorscale::storedFor (percent));
+            });
+        return sizes;
+    }
+
+    void setStoredScale (int stored)
+    {
+        scaled->setStoredScale (stored);
+        setContentComponentSize (scaled->getWidth(), scaled->getHeight());
+        remember (stored);
+    }
+
 private:
+    void remember (int stored)
+    {
+        const auto& song = engineRef.getSong();
+        if (channel < 0 || channel >= (int) song.channels.size() || song.channels[(std::size_t) channel].editorScale == stored)
+            return;
+        engineRef.editSong ([ch = channel, stored] (Song& s) {
+            if (ch < (int) s.channels.size())
+                s.channels[(std::size_t) ch].editorScale = stored;
+        }, false);
+        engineRef.markModified();
+    }
+
     int channel;
     bool modulation;
+    AudioEngine& engineRef;
+    std::uint64_t instanceId = 0; // the channel's runtime identity (round 190mc)
+    PageAspectConstrainer aspect;
+    ScaledContent* scaled = nullptr; // (owned by the window: its content)
+    wrappermenu::MenuArrow titleMenu;               // FL's ▸ in LYNX's title bar (docked)
+    juce::Component* titlePresets = nullptr;        // the frame's preset bar, moved into the title bar (owned by the frame)
+    static constexpr int titlePresetsWidth = 190;
 };
 
 std::vector<std::unique_ptr<SettingsWindow>>& windows()
@@ -5381,11 +7495,12 @@ void alignAllChannelEditors (int selectedChannel)
             reference = w.get();
     if (reference == nullptr)
         return;
-    const auto at = reference->getPosition();
+    // (on the screen: a docked editor's own position is in the main window, round 190ev)
+    const auto at = reference->getScreenPosition();
     alignedChannelEditorPosition() = at;
     for (auto& w : open)
         if (! w->isModulation())
-            w->setTopLeftPosition (at);
+            setWindowScreenPosition (*w, at);
     reference->toFront (true);
 }
 
@@ -5399,7 +7514,7 @@ void openChannelMisc (AudioEngine& engine, int channel)
     openWindow (engine, channel, false);
     for (auto& w : windows())
         if (w->getChannel() == channel && ! w->isModulation())
-            if (auto* frame = dynamic_cast<ChannelFrame*> (w->getContentComponent()))
+            if (auto* frame = dynamic_cast<ChannelFrame*> (w->page()))
                 frame->showTab (frame->tabCount() - 1);
 }
 
@@ -5419,6 +7534,7 @@ bool hasChannelSettings (InstrumentKind kind) noexcept
     {
         case InstrumentKind::synth:
         case InstrumentKind::sampler:
+        case InstrumentKind::audioClip:
         case InstrumentKind::controller:
         case InstrumentKind::midiOut:
         case InstrumentKind::sakura:
@@ -5461,6 +7577,10 @@ bool hasChannelSettings (InstrumentKind kind) noexcept
         case InstrumentKind::fruityslicer:
         case InstrumentKind::slicex:
         case InstrumentKind::fpc:
+        case InstrumentKind::pocketSuperSaw:
+        case InstrumentKind::tetra:
+        case InstrumentKind::helix:
+        case InstrumentKind::braid:
             return true;
         default:
             return false;
@@ -5507,6 +7627,38 @@ int showChannelLayoutPage (juce::Component& frame, int page)
 int channelFrameHeaderHeight() noexcept
 {
     return ChannelFrame::headerHeight;
+}
+
+std::unique_ptr<juce::Component> makeChannelWindowForShot (AudioEngine& engine, int channel, int tab)
+{
+    if (channel < 0 || channel >= (int) engine.getSong().channels.size())
+        return nullptr;
+    auto window = std::make_unique<SettingsWindow> (engine, channel, false, true);
+    if (auto* frame = dynamic_cast<ChannelFrame*> (window->page()))
+        frame->showTab (tab < 0 ? frame->tabCount() - 1 : tab);
+    return window;
+}
+
+std::optional<juce::PopupMenu> channelWrapperMenu (juce::Component& root)
+{
+    if (auto* frame = dynamic_cast<ChannelFrame*> (&root))
+        return frame->buildWrapperMenu();
+    for (auto* child : root.getChildren())
+        if (auto menu = channelWrapperMenu (*child))
+            return menu;
+    return std::nullopt;
+}
+
+std::unique_ptr<juce::Component> makeChannelHeaderControls (AudioEngine& engine, int channel)
+{
+    if (channel < 0 || channel >= (int) engine.getSong().channels.size())
+        return nullptr;
+    return std::make_unique<ChannelHeaderControls> (engine, channel);
+}
+
+int channelHeaderControlsWidth() noexcept
+{
+    return ChannelHeaderControls::preferredWidth;
 }
 
 std::unique_ptr<juce::Component> makeChannelFrame (AudioEngine& engine, int channel, int tab)
@@ -5558,6 +7710,18 @@ std::unique_ptr<juce::Component> makeChannelSettingsPanel (AudioEngine& engine, 
         return makeFpcEditor (engine, [channel] (Song& s) -> ChannelDef* {
             return channel >= 0 && channel < (int) s.channels.size() ? &s.channels[(std::size_t) channel] : nullptr;
         }, channel); // round 190q
+    if (engine.getSong().channels[(std::size_t) channel].instrument == InstrumentKind::tetra)
+        return makeTetraEditor (engine, [channel] (Song& s) -> ChannelDef* {
+            return channel >= 0 && channel < (int) s.channels.size() ? &s.channels[(std::size_t) channel] : nullptr;
+        }, channel); // round 190hs
+    if (engine.getSong().channels[(std::size_t) channel].instrument == InstrumentKind::directwave)
+        return makeDirectWaveEditor (engine, [channel] (Song& s) -> ChannelDef* {
+            return channel >= 0 && channel < (int) s.channels.size() ? &s.channels[(std::size_t) channel] : nullptr;
+        }, channel); // round 190hz
+    if (engine.getSong().channels[(std::size_t) channel].instrument == InstrumentKind::helix)
+        return makeHelixEditor (engine, [channel] (Song& s) -> ChannelDef* {
+            return channel >= 0 && channel < (int) s.channels.size() ? &s.channels[(std::size_t) channel] : nullptr;
+        }, channel); // round 190ja
     if (const auto kind = engine.getSong().channels[(std::size_t) channel].instrument;
         kind == InstrumentKind::sakura || kind == InstrumentKind::drumpad || kind == InstrumentKind::boobass
                  || kind == InstrumentKind::drumsynth || kind == InstrumentKind::harmless || kind == InstrumentKind::harmor
@@ -5570,7 +7734,7 @@ std::unique_ptr<juce::Component> makeChannelSettingsPanel (AudioEngine& engine, 
                  || kind == InstrumentKind::simsynth || kind == InstrumentKind::wasp || kind == InstrumentKind::plucked
                  || kind == InstrumentKind::beepmap || kind == InstrumentKind::sawer || kind == InstrumentKind::flkeys
                  || kind == InstrumentKind::granulizer || kind == InstrumentKind::drumaxx
-                 || kind == InstrumentKind::slayer || kind == InstrumentKind::fruitydance || kind == InstrumentKind::sytrus)
+                 || kind == InstrumentKind::slayer || kind == InstrumentKind::fruitydance || kind == InstrumentKind::sytrus || kind == InstrumentKind::pocketSuperSaw)
         return std::make_unique<ModelPanel> (engine, ChannelRef::rack (channel));
 
     return std::make_unique<SettingsPanel> (engine, ChannelRef::rack (channel));
@@ -5578,7 +7742,8 @@ std::unique_ptr<juce::Component> makeChannelSettingsPanel (AudioEngine& engine, 
 
 bool hasNodeEditor (const ChannelDef& channel) noexcept
 {
-    return channel.instrument == InstrumentKind::synth || channel.instrument == InstrumentKind::sampler || isModelKind (channel.instrument);
+    return channel.instrument == InstrumentKind::synth || channel.instrument == InstrumentKind::sampler || isModelKind (channel.instrument)
+           || channel.instrument == InstrumentKind::tetra || channel.instrument == InstrumentKind::helix; // rounds 190hs, 190ja
 }
 
 std::unique_ptr<juce::Component> makeNodeChannelFrame (AudioEngine& engine, std::function<ChannelDef* (Song&)> locate)
@@ -5593,9 +7758,127 @@ std::unique_ptr<juce::Component> makeNodeChannelFrame (AudioEngine& engine, std:
     const auto kind = def->instrument;
     return std::make_unique<ChannelFrame> (engine, ref, std::move (page), makeEnvelopePage (engine, ref, kind));
 }
+std::function<void (int channel, wrappermenu::Spec&)>& channelWrapperItemsHandler()
+{
+    static std::function<void (int, wrappermenu::Spec&)> handler;
+    return handler;
+}
+
 std::function<void (int)>& openMixerInsertHandler()
 {
     static std::function<void (int)> handler;
     return handler;
+}
+
+std::function<void (const juce::File&)>& locateInBrowserHandler()
+{
+    static std::function<void (const juce::File&)> handler;
+    return handler;
+}
+
+std::function<void (const juce::File&, InstrumentKind)>& openInNewChannelHandler()
+{
+    static std::function<void (const juce::File&, InstrumentKind)> handler;
+    return handler;
+}
+
+namespace
+{
+SettingsPanel* findSamplerPage (juce::Component& c)
+{
+    if (auto* p = dynamic_cast<SettingsPanel*> (&c))
+        return p;
+    for (auto* child : c.getChildren())
+        if (auto* p = findSamplerPage (*child))
+            return p;
+    return nullptr;
+}
+} // namespace
+
+std::optional<juce::PopupMenu> samplerHistoryMenu (juce::Component& root)
+{
+    if (auto* p = findSamplerPage (root))
+        return p->sampleHistoryMenuForShot();
+    return std::nullopt;
+}
+
+bool samplerPageTurn (juce::Component& root, const juce::String& what, double value, bool shift)
+{
+    auto* p = findSamplerPage (root);
+    return p != nullptr && p->shotTurn (what, value, shift);
+}
+
+juce::String samplerPageQuery (juce::Component& root, const juce::String& what)
+{
+    auto* p = findSamplerPage (root);
+    if (p == nullptr)
+        return {};
+    if (what.startsWith ("handleAt")) // round 190im: the handle a press at a handle's drawn place takes ("start", "loopStart", "loopEnd")
+        return p->handleProbeForShot (what.fromFirstOccurrenceOf ("handleAt", false, false));
+    if (what == "legacy")
+        return p->shotLegacyShown() ? "1" : "0";
+    if (what == "mode")
+        return p->shotModeText();
+    if (what == "scroll")
+        return juce::String (p->shotScrollStart(), 3);
+    if (what == "mulText" || what == "corner" || what == "waveHint")
+        return p->shotText (what);
+    return p->shotEnabled (what) ? "1" : "0";
+}
+
+namespace
+{
+template <typename T>
+T* findChild (juce::Component& c)
+{
+    if (auto* p = dynamic_cast<T*> (&c))
+        return p;
+    for (auto* child : c.getChildren())
+        if (auto* p = findChild<T> (*child))
+            return p;
+    return nullptr;
+}
+} // namespace
+
+std::optional<juce::PopupMenu> channelPresetMenu (juce::Component& root)
+{
+    if (auto* bar = findChild<ChannelPresetBar> (root))
+        return bar->buildMenu();
+    if (auto* synth = findChild<SynthPanel> (root))
+        return synth->presetBoxMenu();
+    return std::nullopt;
+}
+
+bool channelPresetSave (juce::Component& root, const juce::String& name)
+{
+    if (auto* bar = findChild<ChannelPresetBar> (root))
+        return bar->saveNamed (name);
+    if (auto* synth = findChild<SynthPanel> (root))
+        return synth->saveNamed (name);
+    return false;
+}
+
+juce::String channelPresetName (juce::Component& root)
+{
+    if (auto* bar = findChild<ChannelPresetBar> (root))
+        return bar->shownName();
+    return {};
+}
+
+std::optional<juce::PopupMenu> samplerWaveMenu (juce::Component& root)
+{
+    auto* p = findSamplerPage (root);
+    if (p == nullptr)
+        return std::nullopt;
+    return p->waveMenuForShot();
+}
+
+bool samplerFileRowPress (juce::Component& root, int button)
+{
+    auto* p = findSamplerPage (root);
+    if (p == nullptr)
+        return false;
+    p->pressFileRow (button);
+    return true;
 }
 } // namespace lynx

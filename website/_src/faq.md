@@ -13,7 +13,7 @@ Windows 10 and 11 (64-bit), macOS 11 or newer (Apple Silicon and Intel) and Linu
 
 ## Is this FL Studio, or made by Image-Line?
 
-No. LYNX SHARE is an independent program with an FL Studio-style workflow. FL Studio's behaviour and file format were studied clean-room, no Image-Line code was copied, and LYNX SHARE is not affiliated with Image-Line.
+No. LYNX SHARE is an independent program. Its default workflow works the way FL Studio does, next to a Clip-launch workflow in the style of Ableton Live and a Simple workflow in the style of BandLab and FL Studio Mobile. FL Studio's behaviour and file format were studied clean-room, no Image-Line code was copied, and LYNX SHARE is not affiliated with Image-Line.
 
 ## Does it open my FL Studio projects, and what is lost?
 
@@ -21,15 +21,15 @@ No. LYNX SHARE is an independent program with an FL Studio-style workflow. FL St
 
 ## Does it open Ableton Live sets?
 
-Yes, sets saved by Live 11 and 12 (`.als`): tracks, clips, mixer settings, automation and VST2 or VST3 plugins. Racks come in with their chains and macros, Simpler, Sampler and drum racks become LYNX SHARE samplers, and Live's other devices are dropped. See [Coming from Ableton Live](/wiki/coming-from-ableton/).
+Yes, sets saved by Live 11 and 12 (`.als`): tracks, clips, mixer settings, automation and VST2 or VST3 plugins. Racks and Drum Racks come in with their chains and macros, many of Live's own effects and instruments (EQ Eight, Compressor, Reverb, Auto Filter, Simpler, Drift and more) become LYNX SHARE's own, and the others are dropped and listed in the import report. See [Coming from Ableton Live](/wiki/coming-from-ableton/).
 
 ## Does it open FL Studio Mobile projects?
 
-Partly. A `.flm` opens with its arrangement, samples, drum kits and DirectWave programs, the MiniSynth, Transistor Bass, 3x Osc and GMSynth instruments, FL Studio Mobile's effects and its automation. Other instruments play the built-in synth.
+Partly. A `.flm` opens with its arrangement, samples, drum kits, DW Sampler and DirectWave programs, the Slicer, the MiniSynth, Transistor Bass, 3x Osc, GMSynth and SuperSaw instruments, FL Studio Mobile's effects, its automation and its chord sets. Other instruments play the built-in synth.
 
 ## Can I send a project back to FL Studio or Live?
 
-Yes. `File › Export › FL Studio project...` writes a `.flp`, and `File › Export › Ableton Live set (.als)...` writes a set for Live 12 or Live 11. What the other program does not have is rendered to audio or left out, and a report says which. The limits are on the [File formats](/wiki/file-formats/) page.
+Yes. `File › Export › FL Studio project...` writes a `.flp`, `File › Export › Ableton Live set (.als)...` writes a set for Live 12 or Live 11, and `File › Export › DAWproject (.dawproject)...` writes a file that Bitwig, Studio One, Cubase and other apps open. What the other program does not have is rendered to audio or left out, and a report says which. The limits are on the [File formats](/wiki/file-formats/) page.
 
 ## Do my VST plugins work?
 
@@ -59,6 +59,18 @@ Fifteen: English, Simplified Chinese, Traditional Chinese, Dutch, French, German
 
 Open an issue at [github.com/Ka1-S/LYNX-SHARE/issues](https://github.com/Ka1-S/LYNX-SHARE/issues), or use `Help › Report a problem...` inside the program. The source code is in the same repository, and pull requests from contributors have been merged in past releases.
 
-## Is there a simpler layout for beginners?
+## What are the three workflows?
 
-Yes. `View › Layout style › Simple workflow` shows one window with the tracks and the timeline, and the setup wizard offers it at the first start. The Pattern workflow stays the default, and the same menu switches back. See [Simple layout](/wiki/simple-layout/).
+LYNX SHARE has three ways of working in one program, and `View › Layout style` switches between them at any time without changing the project. The Pattern workflow, the default, is the FL Studio workflow: Channel rack, Piano roll, Playlist and Mixer. The Clip-launch workflow, in the style of Ableton Live, adds a grid of clips and scenes, a Session mixer and the clip and device views. The Simple workflow mixes BandLab's approachable one-window style with FL Studio Mobile's way of working: tracks and a timeline, loops, pads and quick recording, which makes it a good place for a first song. The setup wizard offers all three at the first start. See [Layouts](/wiki/layouts/) and [Simple layout](/wiki/simple-layout/).
+
+## Will an update change how my projects sound?
+
+No, not on purpose. When one of LYNX SHARE's effects is refitted to sound closer to the plugin it is modelled on, the new behaviour is a switch (`Law: Classic | Measured`): new instances use it, and projects and presets saved earlier keep the old one. Only real fixes, such as a limiter that went over its ceiling, change a saved project, and the release notes list them.
+
+## Can I use FL Studio's own plugins in LYNX SHARE?
+
+Yes, through the FL Studio plugin that comes with FL Studio. FL Studio installs itself as a plugin too: `FL Studio VSTi` and `FL Studio VSTi (Multi)` (VST2) on Windows, and an Audio Unit on macOS. Put it on a channel in LYNX SHARE and FL Studio runs inside it, with its Channel rack, Patcher, Sytrus, Harmor and the other plugins your FL Studio licence covers. It needs FL Studio installed and your own licence. LYNX SHARE does not load FL Studio's plugin files directly, because they are made to run only inside FL Studio. If an older version of LYNX SHARE listed the FL Studio plugin as `Failed to load`, right-click it in `Options › Plugin manager...` and choose `Try again (scan this file now)`.
+
+## Does it open GarageBand, BandLab or DAWproject files?
+
+Yes. `File › Open...` reads DAWproject files (`.dawproject`) with their tracks, folders, clips, automation, mixer and plugins, and can write them back. GarageBand projects (`.band`, from GarageBand 10 or GarageBand for iOS) and BandLab projects downloaded by Cakewalk or Sonar (`.blx`) open as Simple-workflow tracks with their regions, tempo, key and mix; their instrument sounds are not stored in a readable form, so instrument tracks play LYNX SHARE's built-in synth and drums. Sampler instruments also open: DirectWave programs (`.dwp`, `.dwb`), `.gig` instruments and Kontakt's `.ncw` samples.

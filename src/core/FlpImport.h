@@ -32,7 +32,11 @@ struct FlpImportReport
 {
     std::map<std::string, int> converted;    // generators truly converted (3x Osc, FPC, DirectWave...)
     std::map<std::string, int> approximated; // approximated by the internal synth (MiniSynth, DX10...)
-    std::map<std::string, int> unsupported;  // no equivalent: play with a synth preset chosen by name
+    std::map<std::string, int> unsupported;  // instruments/generators with no equivalent: play with a synth preset chosen by name
+    // Round qafix190kq: everything else the import does not reproduce exactly (automation, clip and region data, grooves,
+    // scenes, MIDI / note effects, project info, a channel left silent...): left out or played differently. Before this
+    // round these lines were in `unsupported`, under the report's "played with a synth preset" heading.
+    std::map<std::string, int> notReproduced;
     std::map<std::string, int> droppedEffects; // effects with no equivalent (removed from the mixer)
     std::map<std::string, int> partialEffects; // effects kept but approximated or partly reproduced (still in the mixer)
     int missingSamples = 0;
@@ -59,6 +63,10 @@ struct FlpImportOptions
 
     // Samples the user located (the "Missing files" window): saved path (FL's variables resolved) → file to use instead.
     std::map<std::string, std::string> relocations;
+
+    // Round 190fn (O1): the user's own copies of FL Studio Mobile's "Resources" folder, for the FL Studio Mobile Rack
+    // generator's factory content (FL's copy in its install folder is searched after these)
+    std::vector<std::string> flmResourceRoots;
 
     bool threeOscAsSynth = false; // 3x Osc → the built-in synth conversion instead of FL's engine (the synth's preset menu)
     bool fpcAsPads = false;       // FPC → one sampler channel per pad (the import before round 190q) instead of one FPC channel

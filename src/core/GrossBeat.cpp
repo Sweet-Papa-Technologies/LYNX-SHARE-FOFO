@@ -4,6 +4,7 @@
 // IPP-style vector steps), which is what makes the output sample-identical.
 
 #include "core/GrossBeat.h"
+#include "core/FlCurve.h"
 
 #include <algorithm>
 #include <atomic>
@@ -198,9 +199,34 @@ void precompute (std::vector<Point>& pts) noexcept
                 }
                 break;
             }
-            default: // 2 hold; 10 (spline, not decoded: evaluated as a straight line)
-                if (p.type == 10)
+            case 10:
+            {
+                // round 190ee: "Smooth" — a cubic Hermite segment whose end slopes come from the neighbouring Smooth
+                // segments (the plugin's own preparation, Gross Beat_x64.dll 0x784d60 at 0x785157, is FLEngine's law:
+                // core/FlCurve prepareSmooth). Before this round it played as a straight line.
+                flcurve::SmoothSide before, after;
+                if (pts[i - 1].type == 10)
+                {
+                    before.smooth = true;
+                    before.dx = pts[i - 1].dx;
+                    before.hasY = i >= 2;
+                    before.y = i >= 2 ? (double) pts[i - 2].y : 0.0;
+                }
+                if (i + 1 < pts.size() && pts[i + 1].type == 10)
+                {
+                    after.smooth = true;
+                    after.dx = pts[i + 1].dx;
+                    after.y = (double) pts[i + 1].y;
+                }
+                const auto s = flcurve::prepareSmooth (p.tension, p.dx, (double) pts[i - 1].y, (double) p.y, before, after);
+                p.k14 = s.c0;
+                p.k18 = s.c1;
+                p.k1c = s.c2;
+                if (s.sign == 2)
                     p.dir = 2;
+                break;
+            }
+            default: // 2 hold
                 break;
         }
         // types 0, 1, 7, 8, 9, 11, 12 with no tension: straight line
@@ -321,6 +347,11 @@ double shape (const Point& p, double ph) noexcept
             const auto q = ph * (double) 1.57079637f;
             const auto c = p.dir < 1 ? 1.0 - std::cos (q) : std::sin (q);
             return ph - (ph - c) * k14;
+        }
+        case 10: // round 190ee: Smooth (players 0x789a70 / 0x788d60), the same law as flcurve::evaluate
+        {
+            const auto x2 = ph * ph, x1 = ph - 1.0;
+            return ph + ((((x2 * 3.0 - x2 * 2.0 * ph) + x2 * x1 * k14) + ph * x1 * x1 * k18) - ph) * k1c;
         }
         case 11:
             if (p.dir < 1)
@@ -590,7 +621,22 @@ std::optional<State> parseState (const std::uint8_t* d, std::size_t size)
         if ((double) slot.points[0].y != 1.0)
             slot.flat = false;
     }
+    // round 190ee: "Trigger slots from MIDI notes" — on for states before version 9, else the byte after the slots
+    s.midiTrigger = true;
+    if (v > 8 && pos < size)
+        s.midiTrigger = d[pos] != 0;
     return s;
+}
+
+std::pair<int, int> slotForKey (int key) noexcept
+{
+    // kind 0 first, then kind 1 (the later match wins, as FL's lookup 0x844ae0; the ranges never overlap)
+    std::pair<int, int> r { -1, -1 };
+    if (key >= timeBaseKey && key < timeBaseKey + slotsPerKind)
+        r = { 0, key - timeBaseKey };
+    if (key >= volumeBaseKey && key < volumeBaseKey + slotsPerKind)
+        r = { 1, key - volumeBaseKey };
+    return r;
 }
 
 std::vector<std::uint8_t> pack (const std::vector<std::uint8_t>& flState, int ppq)
@@ -649,7 +695,10 @@ std::vector<std::uint8_t> writeState (const State& st)
 {
     std::vector<std::uint8_t> b;
     b.reserve (72 * 96);
-    put<std::int32_t> (b, 0x00080003); // version 8 in the high half, as FL's demo projects
+    // version 8 in the high half, as FL's demo projects; version 9 (FL 2026's own) when the state came as version 9 or
+    // has "Trigger slots from MIDI notes" off, which only version 9 can say (one byte after the slots, round 190ee)
+    const auto v9 = st.version >= 9 || ! st.midiTrigger;
+    put<std::int32_t> (b, v9 ? 0x00090003 : 0x00080003);
     for (const auto v : st.params)
         put<std::int32_t> (b, v);
     b.insert (b.end(), st.options.begin(), st.options.end());
@@ -688,13 +737,16 @@ std::vector<std::uint8_t> writeState (const State& st)
         for (int i = 0; i < 4; ++i)
             put<std::int32_t> (b, -1);
     }
+    if (v9)
+        b.push_back (st.midiTrigger ? 1 : 0);
     return b;
 }
 
 State emptyState()
 {
     State s;
-    s.version = 8;
+    s.version = 9; // round 190ee: FL 2026's instance, whose state is version 9 with the MIDI byte (off: 0x83fcf0)
+    s.midiTrigger = false;
     s.params = { 0, 0, 256, 256, 1765, 5000, 0, 0, 0x10000 };
     s.options = { 0, 0, 0, 0, 0, 0, 1, 1, 1 }; // FUN_0083fcf0: high quality (byte 6), byte 7 and declick (byte 8) on
     for (auto& slot : s.slots)
@@ -965,6 +1017,10 @@ State factoryState()
     }
     fill (volume (29), "Mute last beat", Shape (1.0f).step (3.0, 0.0f).step (4.0, 1.0f));
     fill (volume (30), "Stutter gate 1/16", gate (0.0625, 0.03125));
+    // round 190ee: LYNX's bank stands in for FL's Default preset, which a new FL instance loads (a version-4 state:
+    // "Trigger slots from MIDI notes" on); kept as the version-8 bytes it always had
+    s.version = 8;
+    s.midiTrigger = true;
     return s;
 }
 
@@ -1077,6 +1133,62 @@ void movePoint (std::vector<EditPoint>& points, int index, double x, float y)
     if (index == 0 || index + 1 == (int) points.size())
         return;
     p.x = std::clamp (x, points[(std::size_t) index - 1].x, points[(std::size_t) index + 1].x);
+}
+
+void slidePoint (std::vector<EditPoint>& points, int index, double x, float y)
+{
+    if (index < 0 || index >= (int) points.size())
+        return;
+    auto& p = points[(std::size_t) index];
+    p.y = std::clamp (y, 0.0f, 1.0f);
+    if (index == 0 || index + 1 == (int) points.size())
+        return;
+    const auto end = points.back().x;
+    const auto from = p.x;
+    p.x = std::clamp (x, points[(std::size_t) index - 1].x, end);
+    const auto dx = p.x - from;
+    auto prev = p.x;
+    for (auto i = (std::size_t) index + 1; i + 1 < points.size(); ++i)
+    {
+        points[i].x = std::clamp (points[i].x + dx, prev, end);
+        prev = points[i].x;
+    }
+}
+
+void stepDraw (std::vector<EditPoint>& points, double x0, double x1, float y)
+{
+    if (points.size() < 2)
+        return;
+    x0 = std::clamp (x0, 0.0, barLength);
+    x1 = std::clamp (x1, x0, barLength);
+    y = std::clamp (y, 0.0f, 1.0f);
+    // the old level where the step ends (a hold segment keeps the level of the point it starts from)
+    Slot old;
+    setPoints (old, points);
+    const auto after = levelAt (old, x1);
+    constexpr double eps = 1.0e-9;
+    // the points strictly inside the step go (the first and the last of the envelope stay, moved in level only)
+    std::vector<EditPoint> out;
+    for (std::size_t i = 0; i < points.size(); ++i)
+    {
+        const auto& p = points[i];
+        const auto edge = i == 0 || i + 1 == points.size();
+        if (! edge && p.x > x0 - eps && p.x < x1 - eps)
+            continue;
+        out.push_back (p);
+    }
+    // the step's start: the first point when it starts at 0, else a hold point
+    if (x0 <= eps)
+        out.front().y = y;
+    else
+        addPoint (out, x0, y, 2, 0.0f);
+    // its end: back to the old level, unless a point is there already
+    const bool endHasPoint = std::any_of (out.begin(), out.end(), [x1] (const EditPoint& p) { return std::abs (p.x - x1) < eps; });
+    if (! endHasPoint && x1 < barLength - eps)
+        addPoint (out, x1, after, 2, 0.0f);
+    if (x1 >= barLength - eps) // (a step to the bar's end: the end point holds the step's level)
+        out.back().y = y;
+    points = std::move (out);
 }
 
 float levelAt (const Slot& slot, double beat)
@@ -1269,6 +1381,17 @@ struct Engine::Impl
             f.set (attackSamples * inv, rel * inv);
     }
 
+    // Options › Click reduction (option byte 8: 0 off, 1 low, 2 high): the jump fade and the speed smoothing
+    void setClickReduction() noexcept
+    {
+        const auto opt = std::min<int> (st.options[8], 2);
+        static constexpr float clickMs[3] { 25.0f, 25.0f, 35.0f };
+        static constexpr float speedMs[3] { 1.0f, 1.0f, 5.0f };
+        clickDecay = (float) std::exp (std::log (0.01) / ((double) clickMs[opt] * 0.001 * (double) fs));
+        const auto sm = (double) speedMs[opt] * 0.001 * (double) fs;
+        reader.speed.set (sm, sm);
+    }
+
     void setTension()
     {
         const auto mag = (double) (float) std::fabs ((double) ((float) P[6] * 0.00390625f));
@@ -1308,12 +1431,7 @@ struct Engine::Impl
         fadeReader.setCutoff (1.0);
         fadeLen = (int) std::max<std::int64_t> (roundEven ((double) fs * 0.001), 1);
         jumpLevel = (float) ((double) fs * 0.002);
-        const auto opt = std::min<int> (st.options[8], 2);
-        static constexpr float clickMs[3] { 25.0f, 25.0f, 35.0f };
-        static constexpr float speedMs[3] { 1.0f, 1.0f, 5.0f };
-        clickDecay = (float) std::exp (std::log (0.01) / ((double) clickMs[opt] * 0.001 * (double) fs));
-        const auto sm = (double) speedMs[opt] * 0.001 * (double) fs;
-        reader.speed.set (sm, sm);
+        setClickReduction();
         dcC2 = (float) (44100.0 / (double) fs * 2.2834999999999997e-05);
         span = 0.0;
         timing();
@@ -1360,6 +1478,8 @@ struct Engine::Impl
         st.options = s.options;
         if (oldOptions[5] != st.options[5])
             setFollowers();
+        if (oldOptions[8] != st.options[8]) // round 190ez: the Options menu changes it while playing
+            setClickReduction();
         quality = st.options[6] != 0 ? 16 : 8;
         for (int k = 0; k < 2; ++k)
         {
@@ -1984,6 +2104,35 @@ void Engine::start (double ticks) { impl->start (ticks); }
 void Engine::stop() { impl->stop(); }
 bool Engine::playing() const noexcept { return impl->enabled; }
 
+// the player's place in its envelope, in beats: the points before its segment plus the part of the segment played
+// (segment `idx` runs from point idx - 1 to point idx and is p[idx].dx wide; phase is 0 … 1 across it)
+static double playerBeat (const Player& player, const std::vector<Point>& p) noexcept
+{
+    if (p.empty())
+        return 0.0;
+    const auto idx = std::clamp (player.idx, 0, (int) p.size() - 1);
+    double x = 0.0;
+    for (int k = 0; k < idx; ++k)
+        x += p[(std::size_t) k].dx;
+    x += std::clamp (player.phase, 0.0, 1.0) * std::max (0.0, p[(std::size_t) idx].dx);
+    return std::clamp (x, 0.0, barLength);
+}
+
+Engine::Live Engine::live() const noexcept
+{
+    Live out;
+    out.playing = impl->enabled;
+    for (int k = 0; k < 2; ++k)
+    {
+        const auto& K = impl->kinds[(std::size_t) k];
+        out.slot[(std::size_t) k] = K.current;
+        out.queued[(std::size_t) k] = K.pendingTime != intMax ? K.pendingIndex : -1;
+        if (K.current >= 0)
+            out.position[(std::size_t) k] = playerBeat (K.player, impl->currentSlot (k).points) / barLength;
+    }
+    return out;
+}
+
 void Engine::jump (double ticks)
 {
     impl->hostTicks = ticks;
@@ -2036,6 +2185,16 @@ public:
         ok = true;
         engine.load (state, flPpq);
         raw = state.params;
+        current = { raw[0], raw[1] };
+        takeMidiSettings (state);
+    }
+
+    // round 190ee: a note on the effect's MIDI input port (FL: Options › "Trigger slots from MIDI notes"); applied at
+    // the start of the next block (FL handles it on its editor's thread, not at the note's sample)
+    void midiNote (int key, int velocity, int midiChannel) noexcept override
+    {
+        if (queued < (int) queue.size())
+            queue[(std::size_t) queued++] = { key, velocity, midiChannel };
     }
 
     // the editor changed a slot (points, settings, a preset's bank): the new bank is parsed here, off the audio thread,
@@ -2096,6 +2255,7 @@ public:
         if (incomingFull.load (std::memory_order_acquire))
         {
             engine.update (incoming);
+            takeMidiSettings (incoming);
             incomingFull.store (false, std::memory_order_release);
         }
         for (int i = 0; i < paramCount; ++i)
@@ -2104,9 +2264,41 @@ public:
             if (v != raw[(std::size_t) i])
             {
                 raw[(std::size_t) i] = v;
+                // round 190gk: a slot MIDI picked comes back as the parameter (the message thread writes it, as FL's
+                // click sets it). The slot already playing is not selected again; a pick that a later note replaced
+                // within the last half second is that note's out-of-date echo, not a click.
+                if (i < 2 && v >= 0 && v < slotsPerKind)
+                {
+                    if (v == current[(std::size_t) i])
+                        continue;
+                    if (samplesDone - pickedAt[(std::size_t) i][(std::size_t) v] < (std::int64_t) sampleRate / 2)
+                        continue;
+                }
                 engine.setParam (i, v);
+                if (i < 2)
+                    current[(std::size_t) i] = v;
             }
         }
+        // MIDI notes select slots as a click in the grids would (the editor's handler 0x848330); the slot's own
+        // parameter keeps its value, so a later change of it still applies
+        for (int e = 0; e < queued; ++e)
+        {
+            const auto& ev = queue[(std::size_t) e];
+            if (! midiTrigger)
+                continue;
+            const auto [kind, slot] = midi.note (ev.velocity > 0, ev.channel, ev.key, current,
+                                                 [this] (int k, int s) { return keyHeld[(std::size_t) (k * slotsPerKind + s)]; });
+            if (kind >= 0)
+            {
+                current[(std::size_t) kind] = slot;
+                engine.setParam (kind, slot);
+                // round 190gk: published so the parameter (and the editor's grid) follows, as a click would
+                pickedAt[(std::size_t) kind][(std::size_t) slot] = samplesDone;
+                (kind == 0 ? picks.timeSlot : picks.volumeSlot).store (slot, std::memory_order_relaxed);
+                picks.serial.fetch_add (1, std::memory_order_release);
+            }
+        }
+        queued = 0;
         engine.setTempo ((float) bpm);
         const auto flTicks = songTicks / (double) ppq * (double) flPpq;
         // LYNX's transport: a moving song position is FL's "playing"; a position that does not follow the previous
@@ -2121,9 +2313,64 @@ public:
         lastTicks = songTicks;
         expected = songTicks + (double) n * bpm / 60.0 * (double) ppq / (double) sampleRate;
         engine.process (l, r, n, flTicks);
+        samplesDone += n;
+        publishLive();
+    }
+
+    // round 190ih: the editor's playback locator and slot states (outputs; the rack zeroes them for a bypassed slot)
+    float controlOutput (int output) const noexcept override
+    {
+        return output >= 0 && output < liveOutputs ? live[(std::size_t) output].load (std::memory_order_relaxed) : 0.0f;
     }
 
 private:
+    // outputs: 0 playing (1 / 0), 1 / 2 the time / volume envelope's position (0 … 1), 3 / 4 the time / volume slot
+    // playing + 1, 5 / 6 the slot queued + 1 (0 = none: what a cleared meter reads)
+    static constexpr int liveOutputs = 7;
+    std::array<std::atomic<float>, liveOutputs> live {};
+    void publishLive() noexcept
+    {
+        const auto s = engine.live();
+        live[0].store (s.playing ? 1.0f : 0.0f, std::memory_order_relaxed);
+        for (int k = 0; k < 2; ++k)
+        {
+            live[(std::size_t) (1 + k)].store ((float) s.position[(std::size_t) k], std::memory_order_relaxed);
+            live[(std::size_t) (3 + k)].store ((float) (s.slot[(std::size_t) k] + 1), std::memory_order_relaxed);
+            live[(std::size_t) (5 + k)].store ((float) (s.queued[(std::size_t) k] + 1), std::memory_order_relaxed);
+        }
+    }
+
+    void takeMidiSettings (const State& s) noexcept
+    {
+        midiTrigger = s.midiTrigger;
+        for (std::size_t k = 0; k < keyHeld.size(); ++k)
+            keyHeld[k] = s.slots[k].keyHeld;
+    }
+
+    struct Note
+    {
+        int key = 0, velocity = 0, channel = 0;
+    };
+    std::array<Note, 256> queue {};
+    int queued = 0;
+    MidiSlots midi;
+    bool midiTrigger = true;
+    std::array<bool, 2 * slotsPerKind> keyHeld {};
+    std::array<int, 2> current {};
+    // per kind and slot: when MIDI last picked it (in samples processed; far in the past = never)
+    std::array<std::array<std::int64_t, slotsPerKind>, 2> pickedAt = [] {
+        std::array<std::array<std::int64_t, slotsPerKind>, 2> a {};
+        for (auto& k : a)
+            k.fill (std::numeric_limits<std::int64_t>::min() / 2);
+        return a;
+    }();
+    std::int64_t samplesDone = 0;
+
+public:
+    MidiPicks picks;
+
+private:
+
     State state, incoming;
     std::atomic<bool> incomingFull { false };
     Engine engine;
@@ -2135,4 +2382,309 @@ private:
 } // namespace
 
 std::unique_ptr<Effect> make (const std::vector<std::uint8_t>& container) { return std::make_unique<GrossBeatEffect> (container); }
+
+MidiPicks* midiPicksOf (Effect* effect)
+{
+    if (auto* g = dynamic_cast<GrossBeatEffect*> (effect))
+        return &g->picks;
+    return nullptr;
+}
+
+std::vector<std::pair<int, float>> paramsForPicks (const MidiPicks& picks, const EffectParams& params)
+{
+    std::vector<std::pair<int, float>> out;
+    for (int kind = 0; kind < 2; ++kind)
+        if (const auto slot = picks.slotOf (kind); slot >= 0 && slot < slotsPerKind && rawFromParam (kind, params[(std::size_t) kind]) != slot)
+            out.push_back ({ kind, paramFromRaw (kind, slot) });
+    return out;
+}
+
+// --- round 190mk (DP-7): FL's envelope state files, Prepare for smooth editing, the point clipboard, Analyze audio ------
+std::optional<std::vector<EditPoint>> readEnvelopeFile (const std::uint8_t* d, std::size_t size)
+{
+    if (d == nullptr || size < 12 || i32 (d) != 3)
+        return std::nullopt;
+    const auto ev = i32 (d + 4);
+    const auto n = i32 (d + 8);
+    if (ev < 0 || ev >= 4 || n < 1 || n > maxEditPoints * 4)
+        return std::nullopt;
+    const auto pointBytes = (std::size_t) (ev < 2 ? 8 : 16) + (std::size_t) (ev < 1 ? 4 : 8);
+    std::size_t pos = 12;
+    if (pos + (std::size_t) n * pointBytes > size)
+        return std::nullopt;
+    std::vector<Point> pts ((std::size_t) n);
+    for (auto& p : pts)
+    {
+        if (ev < 2)
+        {
+            float x, y;
+            std::memcpy (&x, d + pos, 4);
+            std::memcpy (&y, d + pos + 4, 4);
+            p.dx = x, p.y = y;
+            pos += 8;
+        }
+        else
+        {
+            double x, y;
+            std::memcpy (&x, d + pos, 8);
+            std::memcpy (&y, d + pos + 8, 8);
+            p.dx = x, p.y = (float) y;
+            pos += 16;
+        }
+        std::memcpy (&p.tension, d + pos, 4);
+        if (ev >= 1)
+            p.type = d[pos + 4];
+        pos += ev < 1 ? 4 : 8;
+        if (! std::isfinite (p.dx) || p.dx < 0.0)
+            p.dx = 0.0;
+        if (! std::isfinite (p.y))
+            p.y = 1.0f;
+        if (! std::isfinite (p.tension))
+            p.tension = 0.0f;
+    }
+    normalise (pts); // (the plugin's own rule: a first point at 0, the Δx stretched to the bar)
+    std::vector<EditPoint> out;
+    double x = 0.0;
+    for (const auto& p : pts)
+    {
+        x += p.dx;
+        out.push_back ({ std::clamp (x, 0.0, barLength), std::clamp (p.y, 0.0f, 1.0f), std::clamp (p.tension, -1.0f, 1.0f), p.type });
+    }
+    if (out.size() < 2)
+        out.push_back ({ barLength, out.back().y, 0.0f, 2 });
+    if ((int) out.size() > maxEditPoints)
+        out.resize ((std::size_t) maxEditPoints), out.back().x = barLength;
+    return out;
+}
+
+std::vector<std::uint8_t> writeEnvelopeFile (const Slot& slot)
+{
+    std::vector<std::uint8_t> b;
+    put<std::int32_t> (b, 3); // the "map" stream, version 3 (as the plugin's state writes it)
+    put<std::int32_t> (b, 3);
+    put<std::int32_t> (b, (std::int32_t) slot.points.size());
+    for (const auto& p : slot.points)
+    {
+        put<double> (b, p.dx);
+        put<double> (b, (double) p.y);
+        put<float> (b, p.tension);
+        b.push_back (p.type);
+        b.push_back (0);
+        b.push_back (0);
+        b.push_back ((std::uint8_t) p.dir);
+    }
+    put<std::int32_t> (b, 0);
+    for (int i = 0; i < 4; ++i)
+        put<std::int32_t> (b, -1);
+    return b;
+}
+
+std::vector<EditPoint> prepareForSmoothEditing (const Slot& slot)
+{
+    const auto pts = editPoints (slot);
+    const auto at = [&] (double beat) {
+        float y = levelAt (slot, beat);
+        for (const auto& p : pts) // (a point on the beat: its level, the last one there)
+            if (std::abs (p.x - beat) < 1.0e-9)
+                y = p.y;
+        return y;
+    };
+    std::vector<EditPoint> out;
+    for (int beat = 0; beat < (int) barLength; ++beat)
+        out.push_back ({ (double) beat, at ((double) beat), 0.0f, 10 });
+    out.push_back ({ barLength, out.front().y, 0.0f, 10 }); // (the bar loops: its end takes the start's level)
+    out.front().type = 10;
+    return out;
+}
+
+namespace
+{
+std::vector<int> sortedSelection (const std::vector<EditPoint>& points, std::vector<int> selected)
+{
+    std::sort (selected.begin(), selected.end());
+    selected.erase (std::unique (selected.begin(), selected.end()), selected.end());
+    selected.erase (std::remove_if (selected.begin(), selected.end(), [&points] (int i) { return i < 0 || i >= (int) points.size(); }), selected.end());
+    return selected;
+}
+
+// the body points (all but the bar's end) with their select flags back as an envelope: in order, the first at 0, nothing
+// at or past the end, the end point kept at the bar's end
+std::pair<std::vector<EditPoint>, std::vector<int>> withEnd (std::vector<std::pair<EditPoint, bool>> body, const EditPoint& end)
+{
+    std::stable_sort (body.begin(), body.end(), [] (const auto& a, const auto& b) { return a.first.x < b.first.x; });
+    std::pair<std::vector<EditPoint>, std::vector<int>> r;
+    for (const auto& [p, sel] : body)
+    {
+        if (p.x >= barLength - 1.0e-9 && ! r.first.empty())
+            continue;
+        if (sel)
+            r.second.push_back ((int) r.first.size());
+        r.first.push_back (p);
+    }
+    if (r.first.empty())
+        r.first.push_back ({ 0.0, end.y, 0.0f, 2 });
+    r.first.front().x = 0.0;
+    auto last = end;
+    last.x = barLength;
+    r.first.push_back (last);
+    return r;
+}
+} // namespace
+
+PointClip copyPoints (const std::vector<EditPoint>& points, const std::vector<int>& selectedIn)
+{
+    PointClip clip;
+    const auto selected = sortedSelection (points, selectedIn);
+    if (selected.empty())
+        return clip;
+    const auto first = points[(std::size_t) selected.front()].x;
+    for (const auto i : selected)
+    {
+        auto p = points[(std::size_t) i];
+        p.x -= first;
+        clip.points.push_back (p);
+    }
+    return clip;
+}
+
+std::pair<std::vector<EditPoint>, std::vector<int>> pasteInsert (const std::vector<EditPoint>& points, const std::vector<int>& selectedIn,
+                                                                 const PointClip& clip, double at)
+{
+    if (points.size() < 2 || clip.points.empty())
+        return { points, sortedSelection (points, selectedIn) };
+    const auto selected = sortedSelection (points, selectedIn);
+    const auto endIndex = (int) points.size() - 1;
+    const auto last = selected.empty() ? -1 : selected.back();
+    const auto anchor = last >= 0 ? points[(std::size_t) last].x : std::clamp (at, 0.0, barLength);
+    const auto length = clip.length();
+    std::vector<std::pair<EditPoint, bool>> body;
+    for (int i = 0; i < endIndex; ++i)
+    {
+        auto p = points[(std::size_t) i];
+        const auto before = last >= 0 ? i <= last : p.x <= anchor;
+        if (! before)
+            p.x += length;
+        body.push_back ({ p, std::binary_search (selected.begin(), selected.end(), i) });
+    }
+    for (auto p : clip.points)
+    {
+        p.x += anchor;
+        body.push_back ({ p, true });
+    }
+    // (stable order: a pasted point at the same x as an original comes after it)
+    return withEnd (std::move (body), points.back());
+}
+
+std::pair<std::vector<EditPoint>, std::vector<int>> pasteReplace (const std::vector<EditPoint>& points, const std::vector<int>& selectedIn,
+                                                                  const PointClip& clip)
+{
+    const auto selected = sortedSelection (points, selectedIn);
+    if (points.size() < 2 || clip.points.empty() || selected.empty())
+        return { points, selected };
+    const auto endIndex = (int) points.size() - 1;
+    const auto start = points[(std::size_t) selected.front()].x;
+    const auto shift = clip.length() - (points[(std::size_t) selected.back()].x - start);
+    std::vector<std::pair<EditPoint, bool>> body;
+    for (int i = 0; i < endIndex; ++i)
+    {
+        if (std::binary_search (selected.begin(), selected.end(), i))
+            continue;
+        auto p = points[(std::size_t) i];
+        if (i > selected.back())
+            p.x += shift;
+        body.push_back ({ p, false });
+    }
+    for (auto p : clip.points)
+    {
+        p.x += start;
+        body.push_back ({ p, true });
+    }
+    std::stable_sort (body.begin(), body.end(), [] (const auto& a, const auto& b) { return a.first.x < b.first.x; });
+    return withEnd (std::move (body), points.back());
+}
+
+std::pair<std::vector<EditPoint>, std::vector<int>> duplicatePoints (const std::vector<EditPoint>& points, const std::vector<int>& selected)
+{
+    auto r = pasteInsert (points, selected, copyPoints (points, selected), 0.0);
+    // the copy becomes the selection: the pasted points are the selected ones after the originals' places
+    const auto originals = sortedSelection (points, selected);
+    if (r.second.size() > originals.size())
+        r.second.erase (r.second.begin(), r.second.begin() + (std::ptrdiff_t) originals.size());
+    else
+        r.second.clear(); // (the whole copy fell past the bar's end)
+    return r;
+}
+
+std::vector<EditPoint> cutPoints (const std::vector<EditPoint>& points, const std::vector<int>& selectedIn)
+{
+    auto selected = sortedSelection (points, selectedIn);
+    const auto endIndex = (int) points.size() - 1;
+    selected.erase (std::remove_if (selected.begin(), selected.end(), [endIndex] (int i) { return i == 0 || i == endIndex; }), selected.end());
+    if (points.size() < 3 || selected.empty())
+        return points;
+    const auto prevX = points[(std::size_t) selected.front() - 1].x;
+    const auto next = selected.back() + 1;
+    const auto gap = next < endIndex ? points[(std::size_t) next].x - prevX : 0.0; // (nothing after it but the end: no gap to close)
+    std::vector<std::pair<EditPoint, bool>> body;
+    for (int i = 0; i < endIndex; ++i)
+    {
+        if (std::binary_search (selected.begin(), selected.end(), i))
+            continue;
+        auto p = points[(std::size_t) i];
+        if (i > selected.back())
+            p.x = std::max (prevX, p.x - gap);
+        body.push_back ({ p, false });
+    }
+    return withEnd (std::move (body), points.back()).first;
+}
+
+std::vector<EditPoint> envelopeFromLevels (const std::vector<float>& peaks, int maxPoints)
+{
+    const auto n = (int) peaks.size();
+    if (n < 2)
+        return { { 0.0, 1.0f, 0.0f, 0 }, { barLength, 1.0f, 0.0f, 0 } };
+    const auto top = std::max (1.0e-9f, *std::max_element (peaks.begin(), peaks.end()));
+    std::vector<double> ys ((std::size_t) n);
+    for (int i = 0; i < n; ++i)
+        ys[(std::size_t) i] = std::clamp ((double) peaks[(std::size_t) i] / (double) top, 0.0, 1.0);
+    const auto xOf = [n] (int i) { return barLength * (double) i / (double) (n - 1); };
+    // Ramer-Douglas-Peucker on the level curve; the tolerance grows until at most maxPoints remain (dense where it moves)
+    const auto simplify = [&] (double tolerance) {
+        std::vector<char> keep ((std::size_t) n, 0);
+        keep.front() = keep.back() = 1;
+        std::vector<std::pair<int, int>> stack { { 0, n - 1 } };
+        while (! stack.empty())
+        {
+            const auto [a, b] = stack.back();
+            stack.pop_back();
+            int worst = -1;
+            double worstError = tolerance;
+            for (int i = a + 1; i < b; ++i)
+            {
+                const auto t = (double) (i - a) / (double) (b - a);
+                const auto e = std::abs (ys[(std::size_t) i] - (ys[(std::size_t) a] + (ys[(std::size_t) b] - ys[(std::size_t) a]) * t));
+                if (e > worstError)
+                    worst = i, worstError = e;
+            }
+            if (worst >= 0)
+            {
+                keep[(std::size_t) worst] = 1;
+                stack.push_back ({ a, worst });
+                stack.push_back ({ worst, b });
+            }
+        }
+        return keep;
+    };
+    auto tolerance = 0.01;
+    auto keep = simplify (tolerance);
+    for (int pass = 0; pass < 40 && (int) std::count (keep.begin(), keep.end(), (char) 1) > std::max (2, maxPoints); ++pass)
+        keep = simplify (tolerance *= 1.25);
+    std::vector<EditPoint> out;
+    for (int i = 0; i < n; ++i)
+        if (keep[(std::size_t) i] != 0)
+            out.push_back ({ xOf (i), (float) ys[(std::size_t) i], 0.0f, 0 }); // (FL: single-curve points)
+    out.front().x = 0.0;
+    out.back().x = barLength;
+    return out;
+}
 } // namespace lynx::grossbeat

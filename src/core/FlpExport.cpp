@@ -1,6 +1,10 @@
+#include "core/ClipEnvelope.h"
+#include "core/FlCurve.h"
+#include "core/NoteRepeat.h"
 #include "core/PlaylistOps.h"
 #include "core/FlpExport.h"
 #include "core/Fpc.h"
+#include "core/SamplerPage.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +13,7 @@
 #include <numeric>
 #include <set>
 
+#include "core/EditorPolish.h"
 #include "core/Effects.h"
 #include "core/FlEffects.h"
 #include "core/FlStateWrite.h"
@@ -25,6 +30,13 @@ namespace lynx::flpexport
 {
 namespace
 {
+// FL's curve mode byte of a LYNX segment (an older project's bend, LYNX's own law, goes out as a Single curve with the
+// same tension: the nearest FL shape)
+std::uint8_t flCurveOf (const AutomationPoint& p) noexcept
+{
+    return p.mode < flcurve::modeCount ? p.mode : (std::uint8_t) flcurve::singleCurve;
+}
+
 // ---- small helpers ----
 int iround (double v) noexcept { return (int) std::lround (v); }
 
@@ -214,6 +226,10 @@ std::int32_t rawValue (const AutomationTarget& t, float v)
     {
         case AutomationTargetKind::channelVolume:
         case AutomationTargetKind::channelPan: return iround (v * 12800.0);
+        case AutomationTargetKind::channelAdjust: // (round 190dz) FL's knob ranges: volume 0…25600, pan ±6400, Mod X / Y ±256
+            return t.param == leveladjust::volume ? iround (v * 25600.0)
+                 : t.param == leveladjust::pan    ? iround ((v * 2.0 - 1.0) * 6400.0)
+                                                  : iround ((v * 2.0 - 1.0) * 256.0);
         case AutomationTargetKind::mixerVolume:
         case AutomationTargetKind::mixerSend: return iround (v * 16000.0);
         case AutomationTargetKind::mixerPan: return iround ((v * 2.0 - 1.0) * 6400.0);
@@ -526,12 +542,14 @@ void applyFreeze (Song& song, int channel, const std::string& wav, std::int64_t 
                               p.channelLoops.end());
         for (auto& lane : p.events)
             if ((lane.target.kind == AutomationTargetKind::channelVolume || lane.target.kind == AutomationTargetKind::channelPan
-                 || lane.target.kind == AutomationTargetKind::channelParam) && lane.target.index == channel)
+                 || lane.target.kind == AutomationTargetKind::channelParam || lane.target.kind == AutomationTargetKind::channelAdjust)
+                && lane.target.index == channel)
                 lane.target.kind = AutomationTargetKind::none;
     }
     for (auto& a : song.automations)
         if ((a.target.kind == AutomationTargetKind::channelVolume || a.target.kind == AutomationTargetKind::channelPan
-             || a.target.kind == AutomationTargetKind::channelParam) && a.target.index == channel)
+             || a.target.kind == AutomationTargetKind::channelParam || a.target.kind == AutomationTargetKind::channelAdjust)
+            && a.target.index == channel)
             a.target.kind = AutomationTargetKind::none;
 
     int lane = 0;
@@ -767,6 +785,7 @@ struct Converter
         out.flagsA9 = 15;
         out.tempo = song.bpm;
         out.beatsPerBar = song.beatsPerBar;
+        out.beatUnit = meterUnit (song.beatUnit);
         out.swing = std::clamp (iround (song.swing * 128.0), 0, 128);
         out.mainPitch = iround (song.masterPitch);
         out.currentPattern = std::clamp (song.currentPattern, 0, std::max (0, (int) song.patterns.size() - 1)) + 1;
@@ -917,6 +936,15 @@ struct Converter
         c.hasLevels = true;
         c.volume = std::clamp (iround (volume * 12800.0), 0, 12800);
         c.pan = std::clamp (iround (6400.0 + def.pan * 6400.0), 0, 12800);
+        // FL's Levels adjustment (0xE5, round 190dz): the Misc tab's offsets as FL's raw values
+        {
+            const auto& l = def.misc.levels;
+            c.hasLevelAdjust = true;
+            c.panAdj = std::clamp (iround (l.pan * 6400.0), -6400, 6400);
+            c.volAdj = std::clamp (iround (l.volume * 12800.0), 0, 25600);
+            c.modXAdj = std::clamp (iround (l.modX * 256.0), -256, 256);
+            c.modYAdj = std::clamp (iround (l.modY * 256.0), -256, 256);
+        }
         const auto root = std::clamp (def.misc.rootNote, 0, 127);
         // FL's stretch PITCH knob and the header pitch add up, but do not sound the same in FL's stretcher (Thief with all
         // of it in the header: xcorr 0.934 against FL's own, round 180d), so what came from the knob goes back to the knob
@@ -1099,18 +1127,20 @@ struct Converter
         c.reverbType = p.reverbType;
         c.pogo = p.pogo;
         c.declickMode = s.declickMode;
-        c.sampleFlags = 2 | (s.useLoopPoints ? 8 : 0);
+        c.sampleFlags = samplerpage::contentFlags (s); // (round 190dh: FL's Content options and Use loop points)
+        if (s.hasLoopOverride())
+            c.loopStart = s.loopStart, c.loopEnd = s.loopEnd;
         // the region: FL's end is a fraction of what follows the start (REA_rodada167h §2)
         const auto start = std::clamp ((double) s.regionStart, 0.0, 1.0);
         const auto end = std::clamp ((double) s.regionEnd, start, 1.0);
         c.sampleStart = start;
         c.sampleEnd = start < 1.0 ? (end - start) / (1.0 - start) : 1.0;
         c.startOffset = std::clamp ((double) s.startOffset, 0.0, 1.0);
-        // the time-stretch: the whole sample lasts TIME/192 beats (MUL 0)
+        // the time-stretch: the whole sample lasts TIME/192 beats × MUL's factor (round 190dh: MUL kept, TIME without it)
         if (s.stretchBeats > 0.0f)
         {
-            c.stretchTime = s.stretchBeats * 192.0f;
-            c.stretchMul = 0;
+            c.stretchTime = samplerpage::stretchTime (s) * 192.0f;
+            c.stretchMul = std::clamp (s.stretchMul, -20000, 20000);
         }
         c.stretchMode = flStretchMode (s);
         if (s.cut && c.cutGroup == 0 && c.cutBy == 0)
@@ -1151,6 +1181,11 @@ struct Converter
                 if (t.index < 0 || t.index >= (int) song.channels.size())
                     return std::nullopt;
                 id.raw = ((std::uint32_t) t.index << 16) | (t.kind == AutomationTargetKind::channelPan ? 1u : 0u);
+                return id;
+            case AutomationTargetKind::channelAdjust: // FL's channel parameters 0x10…0x14 (round 190dz)
+                if (t.index < 0 || t.index >= (int) song.channels.size() || ! leveladjust::valid (t.param))
+                    return std::nullopt;
+                id.raw = ((std::uint32_t) t.index << 16) | (std::uint32_t) (0x10 + t.param);
                 return id;
             case AutomationTargetKind::channelParam:
                 if (t.index < 0 || t.index >= (int) song.channels.size() || song.channels[(std::size_t) t.index].instrument != InstrumentKind::plugin
@@ -1294,6 +1329,7 @@ struct Converter
                 f.flags = (std::uint16_t) (0x4000 | (n.slide ? 8 : 0));
                 f.extra = (std::uint8_t) ((n.colour & 0x0F) | (n.porta ? 0x10 : 0) | (n.muted ? 0x20 : 0));
                 f.group = (std::uint16_t) std::max (0, n.group);
+                f.repeats = (std::uint8_t) std::clamp (n.repeat, 0, noterepeat::rateCount); // (issue #208)
                 p.notes.push_back (f);
             }
             std::stable_sort (p.notes.begin(), p.notes.end(), [] (const flp::Note& a, const flp::Note& b) { return a.position < b.position; });
@@ -1354,6 +1390,7 @@ struct Converter
             c.index = (int) out.channels.size();
             c.type = flp::ChannelType::automationClip;
             c.name = src.name;
+            c.colour = src.colour != 0 ? rgb (src.colour) : 0; // (round 190ig: the clip's colour; none = FL's default)
             // an automation clip's channel levels are its range: pan = minimum, volume = maximum (of 12800, in the
             // target's whole range) [DATA: FL's tempo clips keep 1250…4250 = 60…180 BPM; FL 2026 played a clip written
             // with a channel's default levels over 6400…10000: round 171e, FL render]. Always the whole range here.
@@ -1367,7 +1404,8 @@ struct Converter
                 fp.position = (double) pt.tick / ppq;
                 fp.value = std::clamp ((double) (map ? map (pt.value) : pt.value), 0.0, 1.0);
                 // FL's curve sits on the segment ending at the point (FlpImport: previous.tension = −p.tension)
-                fp.tension = i > 0 ? -src.points[i - 1].tension : 0.0f;
+                fp.tension = i > 0 ? 0.0f - src.points[i - 1].tension : 0.0f; // (0 − t: a straight segment writes +0)
+                fp.curve = i > 0 ? flCurveOf (src.points[i - 1]) : (std::uint8_t) 0;
                 c.automation.push_back (fp);
             }
             if (c.automation.empty())
@@ -1398,7 +1436,7 @@ struct Converter
                 f.points.clear();
                 for (std::size_t i = 0; i < lfo.amp.size(); ++i)
                     f.points.push_back ({ (double) lfo.amp[i].tick / ppq, (double) std::clamp (lfo.amp[i].value, 0.0f, 1.0f),
-                                          i > 0 ? -lfo.amp[i - 1].tension : 0.0f, 0 });
+                                          i > 0 ? 0.0f - lfo.amp[i - 1].tension : 0.0f, i > 0 ? flCurveOf (lfo.amp[i - 1]) : (std::uint8_t) 0 });
                 if (lfo.amp == lfo.fl.rawAmp && lfo.fl.rawPoints.size() == lfo.amp.size() * 24)
                     f.rawPoints = lfo.fl.rawPoints; // unchanged since the import: its records byte for byte
             }
@@ -1434,7 +1472,7 @@ struct Converter
                     a.items.push_back (*item);
             std::stable_sort (a.items.begin(), a.items.end(), [] (const flp::PlaylistItem& x, const flp::PlaylistItem& y) { return x.position < y.position; });
             for (int t = 0; t < (int) song.playlistTracks.size() && t < 500; ++t)
-                a.tracks.push_back (trackInfo (song.playlistTracks[(std::size_t) t], t));
+                a.tracks.push_back (trackInfo (song.playlistTracks[(std::size_t) t], t, song.playlistRowHeight));
             out.arrangements.push_back (std::move (a));
         }
         report.exact.push_back ("Playlist: " + std::to_string (song.arrangements.size()) + " arrangement(s), tracks, markers");
@@ -1493,7 +1531,7 @@ struct Converter
                                      | (shape (0, (clip.flFadeFlags >> 8) & 3) << 8) | (shape (1, (clip.flFadeFlags >> 12) & 3) << 12);
                 }
                 item.gain = clip.gain;
-                item.pitch = clip.pitch;
+                item.pitch = std::clamp (clip.pitch, -12.0f, 12.0f); // (FL's clip pitch range; a Live transpose may reach ±48)
                 item.reversed = clip.reversed;
                 return item;
             }
@@ -1523,7 +1561,7 @@ struct Converter
         return std::nullopt;
     }
 
-    static flp::PlaylistTrackInfo trackInfo (const PlaylistTrack& t, int index)
+    static flp::PlaylistTrackInfo trackInfo (const PlaylistTrack& t, int index, int rowHeight)
     {
         flp::PlaylistTrackInfo info;
         info.index = index;
@@ -1534,6 +1572,7 @@ struct Converter
         info.expanded = ! t.collapsed;
         info.lockedToContent = t.lockedToContent;
         info.lockedHeight = t.lockedHeight;
+        info.heightScale = t.height > 0 ? polish::flSizeForHeight (t.height, rowHeight) : 1.0f; // (round 190ft: FL's size factor; 190gw: on the song's default row)
         info.mode = t.mode == PlaylistTrackMode::audio ? 1 : t.mode == PlaylistTrackMode::instrument ? 3 : 0;
         info.mixerTrack = t.mixerTrack;
         info.channel = t.channel;
@@ -1612,7 +1651,10 @@ struct Converter
                         control (0, flp::ControlId::mixerSendBase + target, 0);
             }
 
-            // the effect slots
+            // the effect slots. Round 190bu: FL has no dry/wet for a whole chain, so the insert's Blend goes into each
+            // exported slot's own Mix (the same for one effect, close for several) and the report says so
+            const auto chainBlend = std::isfinite (track.chainBlend) ? std::clamp (track.chainBlend, 0.0f, 1.0f) : 1.0f;
+            bool blendNoted = false;
             int next = 0;
             for (int s = 0; s < (int) track.effects.size(); ++s)
             {
@@ -1682,7 +1724,13 @@ struct Converter
                 slotMap[{ t, s }] = row;
                 slotPlugin[{ t, s }] = slot.plugin;
                 control (row, 0x1F00, fx.enabled ? 1 : 0);
-                control (row, 0x1F01, std::clamp (iround (fx.mix * 12800.0), 0, 12800));
+                control (row, 0x1F01, std::clamp (iround (fx.mix * chainBlend * 12800.0), 0, 12800));
+                if (chainBlend < 1.0f && ! blendNoted)
+                {
+                    blendNoted = true;
+                    report.notes.push_back (insertLabel (song, t) + ": the chain's Blend (" + std::to_string (iround (chainBlend * 100.0))
+                                            + "%) is written into each effect's Mix level (FL has no dry/wet for a whole chain)");
+                }
                 m.slots.push_back (std::move (slot));
                 next = row + 1;
             }
@@ -1801,6 +1849,10 @@ flp::Project toProject (const Song& input, const Options& options, Report& repor
         if (n > 0)
             report.notes.push_back ("Pattern Blocks: " + std::to_string (n) + " block(s) written as pattern clips (FL 2026 has no blocks)");
     }
+    // audio clip envelopes (round 190gi): FL has none on a clip; FL's own way is the clip menu's Automate › Volume /
+    // Panning, an automation clip of the clip channel's Levels adjustment over the clip — written that way, same curve
+    if (const auto n = clipenv::bakeToAutomation (song); n > 0)
+        report.notes.push_back ("Clip envelopes: " + std::to_string (n) + " envelope(s) written as automation clips of the clip's channel Levels adjustment (FL's Automate > Volume / Panning)");
     // automation lanes (round 177b): FL has none; each becomes an automation clip on a free track
     if (const auto n = autolanes::lanesToClips (song); n > 0)
         report.notes.push_back ("Automation lanes: " + std::to_string (n) + " lane(s) written as automation clips (FL has no lanes)");

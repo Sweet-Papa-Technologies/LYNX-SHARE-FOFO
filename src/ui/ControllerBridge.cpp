@@ -6,6 +6,7 @@
 #include "core/ClipOps.h"
 #include "core/ModelParams.h"
 #include "core/ProjectContents.h"
+#include "engine/ClapFormat.h"
 
 namespace lynx
 {
@@ -72,7 +73,7 @@ void ControllerBridge::command (Command c)
     };
     auto bar = [this] (bool forward) {
         // to the previous / next bar line (from inside a bar, back goes to its start)
-        const auto ticks = (double) ppq * juce::jmax (1, engine.getSong().beatsPerBar);
+        const auto ticks = (double) engine.getSong().barTicks();
         const auto at = engine.getTransport().positionTicks.load() / ticks;
         const auto target = forward ? std::floor (at + 1e-6) + 1.0 : std::ceil (at - 1e-6) - 1.0;
         engine.seek (juce::jmax (0.0, target) * ticks);
@@ -225,6 +226,20 @@ std::string ControllerBridge::pluginName() const
     return channelName (channel);
 }
 
+namespace
+{
+// Round 190jg (clap.remote-controls): a CLAP plugin's own pages of 8 knobs put its parameters in the controller's
+// order (page 1 on knobs 1-8, page 2 on 9-16 ...; an empty knob of a page stays empty), as Bitwig maps them. Empty for
+// other plugins and CLAP plugins without pages: then the plugin's parameter order, as before.
+std::vector<int> knobOrder (juce::AudioPluginInstance& plugin)
+{
+    std::vector<int> order;
+    for (const auto& page : clapRemoteControls (plugin))
+        order.insert (order.end(), page.params.begin(), page.params.end());
+    return order;
+}
+} // namespace
+
 int ControllerBridge::pluginParams() const
 {
     const auto& song = engine.getSong();
@@ -232,7 +247,11 @@ int ControllerBridge::pluginParams() const
     if (channel < 0 || channel >= (int) song.channels.size())
         return 0;
     if (auto* plugin = dynamic_cast<PluginInstrument*> (engine.getChannelInstrument (channel).get()))
+    {
+        if (const auto order = knobOrder (plugin->getInstance()); ! order.empty())
+            return (int) order.size();
         return plugin->getInstance().getParameters().size();
+    }
     if (const auto* table = modelparams::tableOf (song.channels[(std::size_t) channel].instrument); table != nullptr && table->params != nullptr)
         return (int) table->params->size();
     return 0;
@@ -244,8 +263,13 @@ AutomationTarget ControllerBridge::paramTarget (int index) const
     const auto channel = engine.getSelectedChannel();
     if (index < 0 || index >= pluginParams())
         return {};
-    if (dynamic_cast<PluginInstrument*> (engine.getChannelInstrument (channel).get()) != nullptr)
+    if (auto* plugin = dynamic_cast<PluginInstrument*> (engine.getChannelInstrument (channel).get()))
+    {
+        if (const auto order = knobOrder (plugin->getInstance()); ! order.empty())
+            return order[(std::size_t) index] >= 0 ? AutomationTarget { AutomationTargetKind::channelParam, channel, 0, order[(std::size_t) index] }
+                                                  : AutomationTarget {};
         return { AutomationTargetKind::channelParam, channel, 0, index };
+    }
     const auto* table = modelparams::tableOf (song.channels[(std::size_t) channel].instrument);
     return { AutomationTargetKind::channelParam, channel, 0, (*table->params)[(std::size_t) index].index };
 }
@@ -257,7 +281,11 @@ std::string ControllerBridge::pluginParamName (int index) const
     if (index < 0 || index >= pluginParams())
         return {};
     if (auto* plugin = dynamic_cast<PluginInstrument*> (engine.getChannelInstrument (channel).get()))
-        return plugin->getInstance().getParameters()[index]->getName (32).toStdString();
+    {
+        const auto t = paramTarget (index);
+        const auto& params = plugin->getInstance().getParameters();
+        return t.kind == AutomationTargetKind::none || t.param >= params.size() ? std::string() : params[t.param]->getName (32).toStdString();
+    }
     return (*modelparams::tableOf (song.channels[(std::size_t) channel].instrument)->params)[(std::size_t) index].name;
 }
 
@@ -281,7 +309,7 @@ void ControllerBridge::playNote (int key, float velocity, bool on)
                                : juce::MidiMessage::noteOff (1, juce::jlimit (0, 127, key)));
 }
 
-int ControllerBridge::steps() const { return stepsPerBeat * juce::jmax (1, engine.getSong().beatsPerBar); }
+int ControllerBridge::steps() const { return (int) juce::jmax<std::int64_t> (1, engine.getSong().barTicks() / ticksPerStep); }
 
 bool ControllerBridge::step (int index) const
 {
@@ -289,7 +317,7 @@ bool ControllerBridge::step (int index) const
     const auto channel = engine.getSelectedChannel();
     if (song.currentPattern < 0 || song.currentPattern >= (int) song.patterns.size() || channel < 0 || channel >= (int) song.channels.size())
         return false;
-    return song.patterns[(std::size_t) song.currentPattern].hasStep (channel, index);
+    return song.activePattern().hasStep (channel, index);
 }
 
 void ControllerBridge::setStep (int index, bool on)
@@ -302,7 +330,7 @@ void ControllerBridge::setStep (int index, bool on)
     flush();
     engine.editSong ([channel, index] (Song& song) {
         if (song.currentPattern >= 0 && song.currentPattern < (int) song.patterns.size())
-            song.patterns[(std::size_t) song.currentPattern].toggleStep (channel, index);
+            song.activePattern().toggleStep (channel, index);
     });
 }
 

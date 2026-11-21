@@ -516,13 +516,13 @@ private:
                 g.drawHorizontalLine ((int) ad.getY() + 98, ad.getX() + 10.0f, ad.getRight() - 10.0f);
             }
         }
-        // latency (constant: the maximum look-ahead, + the oversampler)
+        // latency (constant: the maximum look-ahead, + the oversampler, + the true-peak guard with True peak on)
         {
             // on a dark plate at the top left of the display, right of the GAIN slider
             const auto lr = juce::Rectangle<float> (p.getX() + 64.0f, p.getY() + 2.0f, 132.0f, 15.0f);
             g.setColour (colour::textDisabled); // round tp172b4: plain dim text (the reference has no plate there)
             g.setFont (font (type::caption));
-            g.drawText (tr ("latency {0} samples", { juce::String (apex::latencyFor (48000.0, apex::oversamplingFactor (v (apex::pOversampling)))) }),
+            g.drawText (tr ("latency {0} samples", { juce::String (apex::latencyFor (48000.0, apex::oversamplingFactor (v (apex::pOversampling)), v (apex::pTruePeak) >= 0.5f)) }),
                         lr.reduced (5.0f, 0.0f), juce::Justification::centredLeft, true);
         }
         if (loudnessShown()) paintLoudness (g);
@@ -631,11 +631,12 @@ private:
 class HushEditor final : public ProEditor
 {
 public:
-    HushEditor (AudioEngine& e, int t, int s, bool d) : ProEditor (e, t, s, EffectKind::hushDeEsser, d, 720, 500)
+    // round 190dm: + a row for Air and Mix (500 → 596)
+    HushEditor (AudioEngine& e, int t, int s, bool d) : ProEditor (e, t, s, EffectKind::hushDeEsser, d, 720, 596)
     {
         knobRanges = true; // round tp172b4: each knob's scale under it, the value on hover
         fillDemo();
-        if (! displayShown()) setSize (720, 500 - (int) waveH);
+        if (! displayShown()) setSize (720, 596 - (int) waveH);
     }
 
 private:
@@ -774,6 +775,13 @@ private:
         auto la = toggle ({ 522.0f, y0 + 214.0f, 64.0f, 18.0f }, P ("Lookahead"), tr ("On"));
         la.hint = tr ("Look-ahead on / off");
         out.push_back (la);
+        // round 190dm: Air (the high shelf on the processed signal) and Mix (dry / processed), beside the output meters
+        auto air = knob ({ 420.0f, y0 + 244.0f, 84.0f, 90.0f }, P ("Air"), tr ("Air"));
+        air.cap = juce::Colour (0xff53524f);
+        out.push_back (air);
+        auto mix = knob ({ 512.0f, y0 + 244.0f, 84.0f, 90.0f }, P ("Mix"), tr ("Mix"));
+        mix.cap = juce::Colour (0xff53524f);
+        out.push_back (mix);
         // the meter's threshold arrow
         out.push_back (custom ({ meters().getX() - 12.0f, meterY ((float) thresholdDb()) - 7.0f, 12.0f, 14.0f }, idMeterThreshold, pThr(), tr ("Threshold: drag up or down")));
         // round 135w: the output meter (−30 … 0 dBFS, the reference's), its peak read-out and clip lamp: click to reset
@@ -801,7 +809,7 @@ private:
         {
             const auto show = ! displayShown();
             set ({ { P ("Display"), show ? 1.0f : 0.0f } }, false);
-            setSize (720, show ? 500 : 500 - (int) waveH);
+            setSize (720, show ? 596 : 596 - (int) waveH);
         }
         repaint();
     }
@@ -1541,6 +1549,11 @@ private:
             out.push_back (k);
         }
         out.push_back (toggle ({ 646.0f, m.getY() + 290.0f, 72.0f, 20.0f }, lookaheadOn, tr ("On")));
+        // round 190dm: the trigger (Level = the gate before; Transient = a drum gate) under the ratio / range knobs, its
+        // release shape under the style column (only with Transient)
+        out.push_back (tabs ({ 14.0f, m.getBottom() - 30.0f, 168.0f, 24.0f }, trigger, "Level|Transient", { 0.0f, 1.0f }));
+        if (v (trigger) >= 0.5f)
+            out.push_back (menu ({ 530.0f, m.getBottom() - 30.0f, 100.0f, 24.0f }, releaseShape, {}, "Smooth|Mid|Sharp", { 0.0f, 0.5f, 1.0f }));
         out.push_back (button ({ d.getCentreX() - 60.0f, m.getBottom() - 30.0f, 120.0f, 24.0f }, idExpert, tr ("Expert"), expertOpen,
                                tr ("Expert: side chain (internal / external, gain and mix per channel), side-chain filters, upward expansion, ducking, wet / dry level and pan")));
         if (expertOpen)
@@ -1562,6 +1575,9 @@ private:
             out.push_back (knob ({ 160.0f, ry, 70.0f, 96.0f }, scGainR, msMode ? tr ("Gain S") : tr ("Gain R"), 1, true));
             out.push_back (knob ({ 230.0f, ry, 70.0f, 96.0f }, scMixR, msMode ? tr ("Mix S") : tr ("Mix R"), 0, true));
             out.push_back (toggle ({ 330.0f, ry + 36.0f, 110.0f, 22.0f }, ducking, tr ("Ducking")));
+            // round 190dm: the transient detector's sensitivity (with Transient)
+            if (v (trigger) >= 0.5f)
+                out.push_back (knob ({ 446.0f, ry, 80.0f, 96.0f }, sensitivity, tr ("Sensitivity")));
             out.push_back (knob ({ 530.0f, ry, 84.0f, 96.0f }, wetPan, tr ("Wet pan"), 0, true));
             out.push_back (knob ({ 630.0f, ry, 84.0f, 96.0f }, dryPan, tr ("Dry pan"), 0, true));
         }
@@ -2945,6 +2961,29 @@ private:
         // they end left of the IN / OUT meter
         out.push_back (barValue ({ s.getX() + 698.0f, s.getY(), 86.0f, s.getHeight() }, inputPan, tr ("In pan")));
         out.push_back (barValue ({ s.getX() + 788.0f, s.getY(), 86.0f, s.getHeight() }, outputPan, tr ("Out pan")));
+        // rollup 0.1.28 (round 190fj's Law and Tape speed): the measured magnetic core runs where the Classic tape curve
+        // ran (one band, Style Tape, no voice / character / feedback); there its law and, on the measured core, the tape
+        // speed are two rows of keys under the strip, in Glow Leveler's Old | Measured look (owner decision)
+        if (const auto* fx = current())
+        {
+            auto withCore = fx->params;
+            withCore[(std::size_t) law] = 1.0f;
+            if (count() == 1 && measuredTape (withCore))
+            {
+                auto lawKeys = tabs ({ s.getX() + 2.0f, s.getY() + s.getHeight() + 18.0f, 132.0f, 16.0f }, law, tr ("Classic|Measured"), { 0.0f, 1.0f });
+                lawKeys.look = 2;
+                lawKeys.caption = tr ("Law");
+                out.push_back (lawKeys);
+                if (v (law) >= 0.5f)
+                {
+                    auto speedKeys = tabs ({ s.getX() + 146.0f, s.getY() + s.getHeight() + 18.0f, 230.0f, 16.0f }, tapeSpeed,
+                                           tr ("30 ips|15|7.5|3.75|1.875"), { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f });
+                    speedKeys.look = 2;
+                    speedKeys.caption = tr ("Tape speed");
+                    out.push_back (speedKeys);
+                }
+            }
+        }
         // round tp172d: back to the Classic panel (the Voicing on; Ember's Classic window replaces this one)
         out.push_back (button ({ s.getX() + 880.0f, s.getY(), 64.0f, s.getHeight() }, idClassic, tr ("Classic"), false,
                                    tr ("The Classic panel: one-screen hardware saturator (Drive, Punish, five styles)")));
@@ -4215,7 +4254,7 @@ public:
         setResizable (true, false);
         centreWithSize (w, h);
         setVisible (true);
-        keepAboveMainWindow (*this);
+        dockOrKeepAbove (*this); // FL's docked plugin window (round 190ev)
         // round 126: fade / scale in — on the holder: the editor's own transform is the holder's scale (round 190bj)
         if (content != nullptr)
             if (auto* holder = getContentComponent())

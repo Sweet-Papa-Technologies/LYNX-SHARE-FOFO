@@ -6,8 +6,11 @@
 // peak optionally including inter-sample peaks estimated by 4× interpolation) is held for the look-ahead window and
 // smoothed by a moving average of the same length, so the gain has fully reached its target when the peak leaves the
 // delay line; a program-dependent two-stage release (fast + slow, mixed by style) brings it back. A final safety
-// clip at the ceiling catches what is left. The latency is constant (maximum look-ahead + interpolator) so the
-// mixer's delay compensation never changes while look-ahead moves. Design targets come from our black-box
+// clip at the ceiling catches what is left. With True peak on, a true-peak guard ends the chain (round 190co): it
+// measures the true peak of what the stages before it deliver, at the base rate, and takes the rest off with a short
+// smooth gain dip, so the output's true peak stays at the ceiling at every oversampling setting (Guard in the .cpp).
+// The latency is constant (maximum look-ahead + interpolator, + the guard with True peak on) so the mixer's delay
+// compensation never changes while look-ahead moves. Design targets come from our black-box
 // measurements of a reference mastering limiter (docs/analise/MEASURE_fabfilter.md §3).
 //
 // Parameters (0..1, EffectKind::apexLimiter): [0] gain 0..30 dB, [1] ceiling −30..0 dB, [2] look-ahead 0..5 ms,
@@ -41,6 +44,10 @@ enum Param { pGain, pCeiling, pLookahead, pRelease, pStyle, pTruePeak, pLink, pA
              // round 190ar: the levelling stage before the limiter (off at 0 dB: nothing changes for existing projects)
              pLevelThreshold, pLevelAttack };
 constexpr double maxLookaheadMs = 5.0;
+// round 190lp, hidden (not in the info: no control, no text; saved while non-zero): revision 1 runs the styles' laws
+// refitted black-box on the reference limiter's renders (docs/PARITY.md "Round 190lp"). A new Apex and a translated
+// Pro-L 2 state get 1; a project or preset saved before (and the Live / substitute maps) keep 0, bit for bit.
+constexpr int pRevision = paramCount;
 
 // Round 128: 8 styles. The four original styles keep the positions their saved values round to (0, 1/3, 2/3, 1 of
 // the old 4-step list → 0, 2, 5, 7 of 8), the new ones sit between them.
@@ -68,8 +75,11 @@ const EffectInfo& info();
 std::string paramText (int param, float v);
 
 // Constant latency at a sample rate (samples), without oversampling; latencyFor: with an oversampling factor.
-int latencyAt (double sampleRate) noexcept;
-int latencyFor (double sampleRate, int factor) noexcept;
+// Round 190co: with True peak on (the default) the true-peak guard's latency is part of it (guardLatency: 85 samples at
+// 48 kHz); with it off the latency is the one of 0.1.26.
+int latencyAt (double sampleRate, bool truePeak = true) noexcept;
+int latencyFor (double sampleRate, int factor, bool truePeak = true) noexcept;
+int guardLatency (double sampleRate) noexcept;
 
 std::unique_ptr<Effect> make (const EffectParams* initial = nullptr);
 } // namespace lynx::apex

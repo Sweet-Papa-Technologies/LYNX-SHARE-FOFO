@@ -16,6 +16,8 @@ namespace lynx::update
 std::string Version::text() const
 {
     std::string s = std::to_string (major) + "." + std::to_string (minor) + "." + std::to_string (patch);
+    if (revision != 0)
+        s += "." + std::to_string (revision);
     for (std::size_t i = 0; i < pre.size(); ++i)
         s += (i == 0 ? "-" : ".") + pre[i];
     return s;
@@ -85,9 +87,9 @@ Version parseVersion (const std::string& input)
             return v;
     }
     const auto numbers = split (core, '.');
-    if (numbers.size() < 2 || numbers.size() > 3)
+    if (numbers.size() < 2 || numbers.size() > 4)
         return v;
-    int values[3] = { 0, 0, 0 };
+    int values[4] = { 0, 0, 0, 0 };
     for (std::size_t i = 0; i < numbers.size(); ++i)
     {
         if (! allDigits (numbers[i]) || numbers[i].size() > 6)
@@ -104,17 +106,18 @@ Version parseVersion (const std::string& input)
     v.major = values[0];
     v.minor = values[1];
     v.patch = values[2];
+    v.revision = values[3];
     v.valid = true;
     return v;
 }
 
 int compare (const Version& a, const Version& b)
 {
-    for (auto [x, y] : { std::pair { a.major, b.major }, { a.minor, b.minor }, { a.patch, b.patch } })
+    for (auto [x, y] : { std::pair { a.major, b.major }, { a.minor, b.minor }, { a.patch, b.patch }, { a.revision, b.revision } })
         if (x != y)
             return x < y ? -1 : 1;
-    if (a.pre.empty() || b.pre.empty())
-        return a.pre.empty() == b.pre.empty() ? 0 : (a.pre.empty() ? 1 : -1);
+    if (a.pre.empty() || b.pre.empty()) // (round 190hl: the build of a release equals its tag, see the header)
+        return 0;
     for (std::size_t i = 0; i < a.pre.size() && i < b.pre.size(); ++i)
     {
         const auto& x = a.pre[i];
@@ -505,6 +508,12 @@ Channel channelFromId (const std::string& id)
 
 bool isPrerelease (const Release& r) { return r.prerelease || ! r.version.pre.empty(); }
 
+bool newerThan (const Version& a, const Version& b)
+{
+    const auto c = compare (a, b);
+    return c > 0 || (c == 0 && a.pre.empty() && ! b.pre.empty());
+}
+
 int newestIndex (const std::vector<Release>& releases, const Version& running, Channel channel)
 {
     if (channel == Channel::byVersion)
@@ -513,11 +522,11 @@ int newestIndex (const std::vector<Release>& releases, const Version& running, C
     for (int i = 0; i < (int) releases.size(); ++i)
     {
         const auto& r = releases[(std::size_t) i];
-        if (r.draft || ! r.version.valid || compare (r.version, running) <= 0)
+        if (r.draft || ! r.version.valid || ! newerThan (r.version, running))
             continue;
         if (channel == Channel::stable && isPrerelease (r))
             continue;
-        if (best < 0 || compare (r.version, releases[(std::size_t) best].version) > 0)
+        if (best < 0 || newerThan (r.version, releases[(std::size_t) best].version))
             best = i;
     }
     return best;
@@ -960,6 +969,8 @@ Settings parseSettings (const std::string& text)
             s.skipped = parseVersion (value).valid ? value : std::string();
         else if (key == "lastCheck")
             s.lastCheckMs = allDigits (value) ? std::strtoll (value.c_str(), nullptr, 10) : 0;
+        else if (key == "previous")
+            s.previous = parseVersion (value).valid ? value : std::string();
     }
     return s;
 }
@@ -973,6 +984,8 @@ std::string formatSettings (const Settings& s)
         out += "skipped=" + s.skipped + "\n";
     if (s.lastCheckMs > 0)
         out += "lastCheck=" + std::to_string (s.lastCheckMs) + "\n";
+    if (! s.previous.empty())
+        out += "previous=" + s.previous + "\n";
     return out;
 }
 
@@ -986,7 +999,82 @@ bool shouldShow (const Release& release, const Settings& settings, bool manual)
     if (manual)
         return true;
     const auto skipped = parseVersion (settings.skipped);
-    return ! (skipped.valid && compare (release.version, skipped) <= 0);
+    return ! (skipped.valid && ! newerThan (release.version, skipped));
+}
+
+int rollbackIndex (const std::vector<Release>& releases, const Version& running, const std::string& previous)
+{
+    // (the fork lists a release and its nightly betas under the same numbers: of those, the release)
+    const auto wanted = parseVersion (previous);
+    int newestOlder = -1, wantedBeta = -1;
+    for (int i = 0; i < (int) releases.size(); ++i)
+    {
+        const auto& r = releases[(std::size_t) i];
+        if (r.draft || ! r.version.valid || ! running.valid || compare (r.version, running) >= 0)
+            continue;
+        if (wanted.valid && compare (r.version, wanted) == 0)
+        {
+            if (r.version.pre.empty() || ! wanted.pre.empty())
+                return i;
+            if (wantedBeta < 0)
+                wantedBeta = i;
+        }
+        if (newestOlder < 0 || newerThan (r.version, releases[(std::size_t) newestOlder].version))
+            newestOlder = i;
+    }
+    return wantedBeta >= 0 ? wantedBeta : newestOlder;
+}
+
+Settings afterUpdate (Settings settings, const Version& from)
+{
+    if (from.valid)
+        settings.previous = from.text();
+    return settings;
+}
+
+Settings skipLeft (Settings settings, const Version& left)
+{
+    const auto skipped = parseVersion (settings.skipped);
+    if (left.valid && (! skipped.valid || compare (left, skipped) > 0))
+        settings.skipped = left.text();
+    return settings;
+}
+
+Settings afterRollback (Settings settings, const Version& left)
+{
+    settings = skipLeft (std::move (settings), left);
+    settings.previous.clear();
+    return settings;
+}
+
+std::string formatInstalling (const InstallingNote& note)
+{
+    std::string out;
+    if (! note.from.empty())
+        out += "from=" + note.from + "\n";
+    out += "rollback=" + std::string (note.rollback ? "1" : "0") + "\n";
+    return out + "version=" + note.version + "\n"; // (last: see the header)
+}
+
+InstallingNote parseInstalling (const std::string& text)
+{
+    InstallingNote note;
+    std::istringstream in (text);
+    std::string line;
+    while (std::getline (in, line))
+    {
+        const auto eq = line.find ('=');
+        if (eq == std::string::npos)
+            continue;
+        const auto key = trim (line.substr (0, eq)), value = trim (line.substr (eq + 1));
+        if (key == "version" && note.version.empty())
+            note.version = value;
+        else if (key == "from")
+            note.from = value;
+        else if (key == "rollback")
+            note.rollback = value == "1";
+    }
+    return note;
 }
 
 bool cacheFresh (std::int64_t lastCheckMs, std::int64_t nowMs)
