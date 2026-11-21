@@ -1,7 +1,7 @@
 # Sunday release: proposes `v<version>` at the newest `main` commit whose required checks passed, waits for the
 # board's approval (the `production` environment's required reviewer), then tags it, starts the Release workflow on
-# the tag, and pushes the branch that moves `main` to the next patch version (so the next nightlies are betas of that
-# version); its summary links the pull request to open. (Opening it from here would need the repository setting that
+# the tag, and pushes the branch that moves `main` to next week's version (<year - 2000>.<ISO week>.0, so the next
+# nightlies are betas of that version); its summary links the pull request to open. (Opening it from here would need the repository setting that
 # also lets workflows approve pull requests, which stays off.)
 #
 # The `prepare` job's summary shows the commit and the release notes that would ship; approving the `release` job

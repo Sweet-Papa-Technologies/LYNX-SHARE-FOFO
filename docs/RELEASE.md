@@ -25,6 +25,27 @@ settings folders keep "LYNX" so existing installs, links and AppImage updates ke
 `workflow_dispatch` (Actions → Release → Run workflow, or `gh workflow run release.yml --ref <branch>`) builds and
 checks everything without a tag and keeps the files as workflow artifacts only.
 
+## Version numbers
+
+The fork numbers its releases by week: **`<year - 2000>.<ISO week>.<patch>`**.
+
+- `26.47.0` is the release of ISO week 47 of 2026 (the Sunday release of 22 Nov 2026). The week after is `26.48.0`;
+  the first week of 2027 is `27.1.0`. ISO weeks end on Sunday, the release day.
+- A hotfix of a release raises the patch: `26.47.1`. Bump it by hand in `CMakeLists.txt` and run the Sunday release
+  workflow by hand.
+- Nightly betas are betas of the coming Sunday's release: `v26.48.0-beta.20261124`.
+- The number is `CMakeLists.txt`'s `project(LYNX VERSION ...)`: always three numbers, no suffix (the Windows build,
+  the installer, the MSIX layout and `release.yml`'s tag check read exactly that).
+- Why not upstream's numbers: upstream (Ka1-S/LYNX-SHARE) keeps releasing `0.1.x` (and reserves a fourth number for its
+  own hotfixes), so a fork release named `0.1.28` would be a different program from upstream's `0.1.28`. The fork's
+  releases up to `0.1.27` used upstream's scheme; `26.47.0` is newer than all of them for the in-app update check.
+  Release notes say which upstream version a release is based on.
+- A release that slips keeps the number `main` carries (the week it was opened for); the Sunday workflow's summary
+  says so. The bump after a release always names the coming Sunday's week.
+- Known limits: a project's "saved by a newer version" notice compares these numbers with upstream's, so upstream's
+  `0.1.x` builds show it for every fork project, and the fork never shows it for a project from a newer upstream
+  build. *File › Save a copy for an older LYNX* names upstream's releases (its file formats), as upstream does.
+
 ## Release cadence (nightly betas, Sunday releases)
 
 Two workflows create every `v*` tag; nobody tags by hand:
@@ -38,7 +59,7 @@ Two workflows create every `v*` tag; nobody tags by hand:
 - **Sunday release** (`.github/workflows/weekly-release.yml`, Sunday 18:00 UTC): the `prepare` job proposes
   `v<version>` at the newest green commit, with a release-notes preview in its summary. The `release` job waits for the
   **production** environment's reviewer (the board). Approving it tags exactly the proposed commit, dispatches
-  `release.yml`, and pushes `chore/bump-<next>`. Open and merge that pull request (its summary links it): until
+  `release.yml`, and pushes `chore/bump-<next>` (`<next>` is the coming week's version, see *Version numbers*). Open and merge that pull request (its summary links it): until
   `main` carries the next version, nightlies skip, because `v<version>` is already released.
 - Both can be run by hand (Actions → Run workflow), with *ignore_checks* when a macOS runner never started.
   Preview the decision locally with `scripts/release-cadence.sh nightly` or `weekly`.
