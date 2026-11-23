@@ -1,34 +1,32 @@
 <p align="center">
-  <img src="docs/img/logo.png" alt="LYNX SHARE logo" width="128" height="128">
+  <img src="docs/img/logo.png" alt="Sweet Papa Studio logo" width="128" height="128">
 </p>
 
-<h1 align="center">LYNX SHARE</h1>
+<h1 align="center">LYNX SHARE FOFO</h1>
 
 <p align="center"><strong>A lightweight DAW with three workflows in one program: FL Studio-style patterns, Ableton Live-style clip launching and a simple one-window mode.</strong><br>
 Free and open source, for Windows, macOS and Linux. Opens your FL Studio, Ableton Live and FL Studio Mobile projects.</p>
 
-<p align="center"><em>This is <strong>LYNX-SHARE-FOFO</strong>, Sweet Papa Technologies' fork of
-<a href="https://github.com/Ka1-S/LYNX-SHARE">Ka1-S/LYNX-SHARE</a>, the original LYNX SHARE by Ka1-S.<br>
-Downloads, releases and issues below are this fork's; the original project lives at
+<p align="center"><em><strong>LYNX-SHARE-FOFO</strong> is <strong>Sweet Papa Technologies'</strong> fork of
+<a href="https://github.com/Ka1-S/LYNX-SHARE">LYNX SHARE</a>, the free DAW written by Ka1-S, kept under the same
+AGPL-3.0 license. The program is still called LYNX SHARE.<br>
+The downloads, releases and issues here are this fork's. The original project, its website and its wiki are at
 <a href="https://github.com/Ka1-S/LYNX-SHARE">github.com/Ka1-S/LYNX-SHARE</a> and <a href="https://lynx-share.com">lynx-share.com</a>.</em></p>
 
 <p align="center">
   <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/latest"><img src="https://img.shields.io/github/v/release/Sweet-Papa-Technologies/LYNX-SHARE-FOFO?style=for-the-badge&label=Download&color=d9534f" alt="Download LYNX SHARE"></a>
-  <a href="https://apps.microsoft.com/detail/9NQRFBFDCX6N"><img src="https://get.microsoft.com/images/en-us%20dark.svg" height="28" alt="Get it from Microsoft"></a>
   <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases"><img src="https://img.shields.io/github/downloads/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/total?style=for-the-badge&label=downloads&color=24292f" alt="Total downloads"></a>
   <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/stargazers"><img src="https://img.shields.io/github/stars/Sweet-Papa-Technologies/LYNX-SHARE-FOFO?style=for-the-badge&color=24292f" alt="GitHub stars"></a>
-  <a href="https://discord.gg/XHKkbtbkY"><img src="https://img.shields.io/badge/Discord-join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the LYNX SHARE Discord"></a>
 </p>
 
 <p align="center">
-  <a href="https://lynx-share.com"><strong>Original project website</strong></a> ·
-  <a href="https://discord.gg/XHKkbtbkY"><strong>Discord</strong></a> ·
   <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/latest"><strong>Download</strong></a> ·
   <a href="#features"><strong>Features</strong></a> ·
   <a href="#opens-your-projects">Your projects</a> ·
   <a href="#status-alpha">Status</a> ·
-  <a href="https://discord.gg/XHKkbtbkY">Discord</a> ·
-  <a href="#building">Build from source</a>
+  <a href="#building">Build from source</a> ·
+  <a href="https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new/choose">Report a bug</a> ·
+  <a href="https://lynx-share.com">Original project website</a>
 </p>
 
 <p align="center">
@@ -41,7 +39,7 @@ Downloads, releases and issues below are this fork's; the original project lives
 
 <p align="center">
   <img src="docs/img/workspace.png" alt="The LYNX SHARE workspace: Browser, Playlist, Piano Roll, Channel Rack and Mixer" width="100%">
-  <br><sub>LYNX SHARE's own demo project: Browser, Playlist, Piano Roll, Channel Rack and Mixer.</sub>
+  <br><sub>The demo project that comes with every download, in this fork's default theme: Browser, Playlist, Piano Roll, Channel Rack and Mixer.</sub>
 </p>
 
 ---
@@ -81,7 +79,7 @@ AGPL-3.0, and still an **alpha**.
 | 📂 **Your projects come with you** | Opens `.flp`, `.als` (Live 11 and 12), `.flm`, `.dawproject`, GarageBand `.band` and BandLab `.blx`; exports `.flp`, `.als` and `.dawproject`. FL Studio's native plugins play on LYNX SHARE's own engines, so a project that uses them plays without FL Studio installed. |
 | 🎛️ **Three workflows, one program** | The FL Studio workflow by default, a Clip-launch workflow in the style of Ableton Live, and a Simple workflow that mixes BandLab's one-window style with FL Studio Mobile's. Switch any time in *View › Layout style*; the project stays the same. |
 | 🤝 **Make music together** | Send a project to a friend as one file, or work on it live with up to three other people, end-to-end encrypted. |
-| ⚡ **Lightweight** | A lock-free engine that spreads channels and mixer tracks across CPU cores, skips idle channels, renders ahead what you are not playing live and streams long audio from disk. Measured on one Windows PC, LYNX SHARE 0.1.28 opened FL's *Thief* demo in 5.2 s with 345 MB of memory (FL Studio 2026: 12.2 s, 874 MB), its window was ready in about 1 s (FL Studio: 1.7 s), and a playing song is drawn at 143 frames a second (FL Studio: 143.8) ([0.1.28 notes](https://github.com/Ka1-S/LYNX-SHARE/releases/tag/v0.1.28-alpha)). |
+| ⚡ **Lightweight** | A lock-free engine that spreads channels and mixer tracks across CPU cores, skips idle channels, renders ahead what you are not playing live and streams long audio from disk. Measured by the original project on one Windows PC, its LYNX SHARE 0.1.28 opened FL's *Thief* demo in 5.2 s with 345 MB of memory (FL Studio 2026: 12.2 s, 874 MB), its window was ready in about 1 s (FL Studio: 1.7 s), and a playing song is drawn at 143 frames a second (FL Studio: 143.8) ([the original 0.1.28 notes](https://github.com/Ka1-S/LYNX-SHARE/releases/tag/v0.1.28-alpha); this fork has not re-measured them). |
 | 🆓 **Free, open source, clean-room** | No price, no account, no subscription. Every behaviour was studied from the outside and written from scratch: no Image-Line or Ableton code is in it. |
 
 ## Features
@@ -172,7 +170,7 @@ Edison (the audio editor) on any mixer slot, and Patcher for building your own c
 </table>
 
 Every one of them is listed, with a picture of its editor, in the
-[catalogue of instruments and effects](https://lynx-share.com/instruments-and-effects/).
+[catalogue of instruments and effects](https://lynx-share.com/instruments-and-effects/) on the original project's website.
 
 ### Audio editing, chords and sound design
 
@@ -389,7 +387,7 @@ platforms (`<v>` is the version, e.g. `26.47.0`: the release of week 47 of 2026)
 
 | System | File | Notes |
 |---|---|---|
-| **Windows** 10 / 11, 64-bit | `LYNX-<v>-setup-x64.exe` (installer) or `LYNX-<v>-windows-x64.zip` (portable) | Per-user installer, no admin rights. Also on the [Microsoft Store](https://apps.microsoft.com/detail/9NQRFBFDCX6N), which keeps it updated. |
+| **Windows** 10 / 11, 64-bit | `LYNX-<v>-setup-x64.exe` (installer) or `LYNX-<v>-windows-x64.zip` (portable) | Per-user installer, no admin rights. |
 | **macOS** 11 Big Sur or newer | `LYNX-<v>-macos-universal.dmg` | Universal: Apple Silicon and Intel. |
 | **Linux** x86_64, glibc 2.35+ | `LYNX-<v>-x86_64.AppImage` or `LYNX-<v>-linux-x86_64.tar.gz` | Ubuntu 22.04+, Debian 12+, Fedora 36+, current Arch / Manjaro. |
 
@@ -434,7 +432,7 @@ place with [Gear Lever](https://github.com/mijorus/gearlever) or AppImageUpdate.
    same computer. You can skip it and reopen it later from *Options › Setup wizard*.
 3. **Open a project** with *File › Open*: one of yours (`.flp`, `.als`, `.flm`, MIDI), or the demo project
    (`Demo.lynx`, included with every download).
-4. **Learn as you go** with the [wiki](https://lynx-share.com/wiki/):
+4. **Learn as you go** with the original project's [wiki](https://lynx-share.com/wiki/), which also fits this fork:
    [Your first song](https://lynx-share.com/wiki/first-song/),
    [Coming from FL Studio](https://lynx-share.com/wiki/coming-from-fl-studio/),
    [Coming from Ableton Live](https://lynx-share.com/wiki/coming-from-ableton/) and the
@@ -442,7 +440,7 @@ place with [Gear Lever](https://github.com/mijorus/gearlever) or AppImageUpdate.
 
 **Handy shortcuts:** Space plays and pauses, F5 / F6 / F7 / F8 / F9 show the Playlist / Channel Rack / Piano Roll /
 Browser / Mixer, L toggles Pattern / Song, and the keys `Z`…`M` and `Q`…`P` play the selected channel. The full list is
-on the [Shortcuts](https://lynx-share.com/wiki/shortcuts/) page.
+on the original wiki's [Shortcuts](https://lynx-share.com/wiki/shortcuts/) page.
 
 <details>
 <summary><strong>Command line</strong></summary>
@@ -473,7 +471,7 @@ LYNX.AppImage --menu-entry on|off              Linux AppImage: add to / remove f
 
 ## LYNX Remote Control (experimental)
 
-Contributed by @guike8 (PRs #71 and #76), in LYNX SHARE since 0.1.28.
+Contributed by @guike8 (PRs [#71](https://github.com/Ka1-S/LYNX-SHARE/pull/71) and [#76](https://github.com/Ka1-S/LYNX-SHARE/pull/76) of the original project), in LYNX SHARE since 0.1.28.
 
 Enable **Settings > General > Remote control** to let authenticated local clients read and edit the open project. It is off by default. An active indicator appears under the toolbar; switching the setting off closes the listener and removes its discovery file. Automatic update checks keep their normal behavior.
 
@@ -500,18 +498,16 @@ is approximated, what is missing) and the plan in [`docs/ROADMAP.md`](docs/ROADM
 
 ## Community and contributing
 
-- **Discord:** [discord.gg/XHKkbtbkY](https://discord.gg/XHKkbtbkY) for chat, help, feedback and release announcements.
-- **Bugs and ideas:** open an [issue](https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new/choose) (*Bug report*, *Feature request* or *Sound / plugin difference*). Several fixes in recent releases started as user reports.
+- **Bugs and ideas for this fork:** open an [issue](https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/issues/new/choose) (*Bug report*, *Feature request* or *Sound / plugin difference*). Several fixes in recent releases started as user reports.
 - **Pull requests** are welcome: read [`CONTRIBUTING.md`](CONTRIBUTING.md) first, including the clean-room rule.
+- **The original project's Discord:** [discord.gg/XHKkbtbkY](https://discord.gg/XHKkbtbkY) is Ka1-S's community for LYNX SHARE. It is not this fork's support channel: bugs in this fork go to the issues above.
 - **Radiant** ([Kenneth-Cho-InfoSec/Radiant](https://github.com/Kenneth-Cho-InfoSec/Radiant)) is an independent, unofficial Android adaptation of LYNX SHARE for tablets and phones. It is a separate community project, not maintained or reviewed by us.
 
-## Support LYNX SHARE
+## Support the original author
 
-LYNX SHARE is free and open source, made by an independent developer. If it helps your music, you can support it on
-[Ko-fi](https://ko-fi.com/lynxshare) (this goes to Ka1-S, the author of the original project, not to this fork). Donations keep the project going: they pay for the server (VPS) behind sharing,
-the relay and the tests, the AI tools and tokens used in development, the website, the Apple developer account for
-signed Mac builds, and the reference plugins used to check the sound quality. Donating is optional and never unlocks
-anything: everything in LYNX SHARE stays free for everyone. In the app: Help › Support LYNX SHARE...
+This fork has no donation page. LYNX SHARE itself is the work of Ka1-S, and if it helps your music you can support the
+original project on [Ko-fi](https://ko-fi.com/lynxshare): that money goes to Ka1-S, not to this fork. Donating is optional
+and never unlocks anything: everything in LYNX SHARE stays free for everyone.
 
 ## Building
 
@@ -604,7 +600,7 @@ FL Studio and FL Studio Mobile are trademarks of Image-Line Software; Ableton an
 BandLab is a trademark of BandLab Technologies. LYNX SHARE is not affiliated with, endorsed or sponsored by any of
 them. VST is a registered trademark of Steinberg Media Technologies GmbH.
 
-Logo by **w3teal**.
+This fork's icon is the Sweet Papa Studio badge (`resources/lynx_badge.png`). The original LYNX SHARE logo is by **w3teal**.
 
 Built with [JUCE](https://juce.com), [CLAP](https://github.com/free-audio/clap), the [WavPack](https://www.wavpack.com)
 decoder and the Steinberg ASIO SDK; their licences are listed in [`THIRD_PARTY.md`](THIRD_PARTY.md). Thanks to everyone
@@ -612,17 +608,15 @@ who reported bugs and sent pull requests.
 
 ## Code signing policy
 
-Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
-[SignPath Foundation](https://signpath.org). *(Pending approval: until the application is accepted, release
-binaries are not signed.)* This covers the Windows binaries. The macOS app has an ad-hoc signature only (no Apple
-Developer ID, not notarized); Linux packages are not signed.
+The Windows binaries of this fork are **not code-signed** (SmartScreen may warn on first launch), the macOS app has an
+ad-hoc signature only (no Apple Developer ID, not notarized) and Linux packages are not signed.
 
 - Release binaries are built only from this repository by GitHub Actions
-  ([`.github/workflows/release.yml`](.github/workflows/release.yml)); nothing built on a personal machine is signed.
-- Every signing request is approved manually for each release.
-- Team roles:
-  - Committers and reviewers ("Authors" and "Reviewers"): [Ka1-S](https://github.com/Ka1-S)
-  - Approvers: [Ka1-S](https://github.com/Ka1-S)
+  ([`.github/workflows/release.yml`](.github/workflows/release.yml)); nothing built on a personal machine is published.
+- Each Sunday release waits for a maintainer's approval in the repository's `production` environment before it is
+  tagged ([`weekly-release.yml`](.github/workflows/weekly-release.yml)), and every file is listed with its SHA-256 in
+  `SHA256SUMS.txt`.
+- Maintainers: [Sweet Papa Technologies](https://github.com/Sweet-Papa-Technologies).
 
 **Privacy:** This program will not transfer any information to other networked systems unless specifically
 requested by the user or the person installing or operating it. See [`PRIVACY.md`](PRIVACY.md).
