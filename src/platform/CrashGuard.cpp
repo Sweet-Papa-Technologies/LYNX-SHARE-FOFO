@@ -1144,6 +1144,46 @@ std::string moduleBacktrace (int skip)
     catch (...) { return {}; }
 }
 
+#if defined(LYNX_UNWIND) && defined(LYNX_CXXABI)
+namespace
+{
+std::string currentException(); // (with the fatal error handlers below)
+
+// Zig's Windows build (Itanium C++ ABI over SEH): a throw is RaiseException (0x20474343) with the unwinder's exception
+// object as its one argument. An exception that escapes a thread never gets to std::terminate there: the C runtime's
+// thread start frame hands it to UnhandledExceptionFilter first, so it arrives at the crash handler as a "fault" and
+// its crash file said "C++ exception" without saying which (the release self-test's `thread` case, 26.47.0).
+// "type: what()" of that exception, as std::terminate's report has it; "" when it is not this program's own (another
+// module's C++ runtime: its objects are not read) or not such a throw at all.
+// Only for the crash handler: the exception becomes this thread's current one, as before std::terminate.
+std::string uncaughtCppException (const EXCEPTION_RECORD& record)
+{
+    constexpr DWORD itaniumThrow = 0x20474343u;                     // (the unwinder's code: "GCC" + 0x20)
+    constexpr std::uint64_t libcxxabiClass = 0x434C4E47432B2B00ull; // "CLNGC++\0" (the low byte is 1 for a rethrown copy)
+    if (record.ExceptionCode != itaniumThrow || record.NumberParameters < 1)
+        return {};
+    auto* thrown = reinterpret_cast<void*> (record.ExceptionInformation[0]);
+    MEMORY_BASIC_INFORMATION memory {};
+    if (thrown == nullptr || VirtualQuery (thrown, &memory, sizeof (memory)) == 0 || memory.State != MEM_COMMIT
+        || (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+        return {};
+    std::uint64_t exceptionClass = 0;
+    std::memcpy (&exceptionClass, thrown, sizeof (exceptionClass)); // (the unwinder's exception object starts with it)
+    if ((exceptionClass & ~std::uint64_t (0xFF)) != libcxxabiClass)
+        return {};
+    abi::__cxa_begin_catch (thrown); // (what libc++abi does itself at the end of the stack, before std::terminate)
+    const auto* type = abi::__cxa_current_exception_type();
+    HMODULE module = nullptr;
+    if (type == nullptr
+        || ! GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 reinterpret_cast<LPCWSTR> (type), &module)
+        || module != GetModuleHandleW (nullptr))
+        return {};
+    return currentException();
+}
+} // namespace
+#endif
+
 std::string exceptionBacktrace (void* exceptionPointers)
 {
     try
@@ -1159,6 +1199,10 @@ std::string exceptionBacktrace (void* exceptionPointers)
             std::snprintf (head, sizeof (head), "exception 0x%08lx (%s) at ", (unsigned long) ep->ExceptionRecord->ExceptionCode,
                            describe ((std::uint32_t) ep->ExceptionRecord->ExceptionCode));
             text = head + describeAddress (ep->ExceptionRecord->ExceptionAddress) + "\n";
+ #if defined(LYNX_CXXABI)
+            if (const auto exception = uncaughtCppException (*ep->ExceptionRecord); ! exception.empty())
+                text += "uncaught exception " + exception + "\n";
+ #endif
         }
         std::uintptr_t frames[96] = {};
         auto n = unwind (*ep->ContextRecord, frames, 96);

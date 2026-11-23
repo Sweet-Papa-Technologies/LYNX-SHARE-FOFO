@@ -175,6 +175,8 @@ void setUnwalkableFaultHandler (void (*handler) (void* exceptionPointers)) noexc
 // - std::set_terminate: an exception escaping a thread, a noexcept function or a destructor, or a bare terminate. The
 //   report names the exception's type and what() (Itanium ABI: any type; MSVC: std::exception and its subclasses);
 //   a pure virtual call (GCC / Clang: __cxa_pure_virtual ends in std::terminate) is told apart by its frame;
+//   (Zig's Windows build: an exception escaping a thread never reaches std::terminate, the C runtime's thread start
+//   hands it to the crash handler as exception 0x20474343; exceptionBacktrace names it there, "uncaught exception ...")
 // - Windows: a SIGABRT handler (abort() raises it before fast-failing), _set_purecall_handler and
 //   _set_invalid_parameter_handler. macOS / Linux: SIGABRT already reaches the crash handler (JUCE's signal handler).
 // `handler` gets the report ("fatal: <what happened>\n" + this thread's frames, as moduleBacktrace) on the failing
