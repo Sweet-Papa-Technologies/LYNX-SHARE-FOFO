@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Draws the GitHub social preview (docs/img/social-preview.png, 1280 x 640) from its text below, the app icon and a
-picture of the workspace (Pillow).
+"""Draws the GitHub social preview (docs/img/social-preview.png, 1280 x 640) from its text below, the app icon (the fork's
+Sweet Papa Studio badge, resources/lynx_badge.png) and a picture of the workspace (Pillow). The card must be uploaded in
+the repository's Settings > Social preview: GitHub has no API for it.
 
     python3 scripts/social-preview.py [--window PICTURE] [--out docs/img/social-preview.png]
 
@@ -25,7 +26,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 # --- the words ---------------------------------------------------------------------------------------------------------
 TEXT = {
-    "title": "LYNX SHARE",
+    "title": "LYNX SHARE FOFO",
     "headline": ["FL Studio-style patterns,", "Ableton Live-style clips."],
     "lines": [
         "Channel Rack · Piano Roll · Playlist · Mixer",
@@ -33,8 +34,8 @@ TEXT = {
         "VST3, CLAP, VST2, AU, LV2 · free and open source",
     ],
     "pills": ["Windows", "macOS", "Linux"],
-    "site": "lynx-share.com",
-    "url": "github.com/Ka1-S/LYNX-SHARE",
+    "site": "SPT fork",
+    "url": "github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO",
 }
 
 # --- the layout (1280 x 640) -------------------------------------------------------------------------------------------
@@ -118,8 +119,9 @@ def draw(win_src, out):
 
     d = ImageDraw.Draw(im)
     # the icon and the name, the name as large as fits before the window (at most TITLE_MAX), centred on the icon
-    import make_logo
-    im.alpha_composite(make_logo.Logo().icon(TILE), TILE_XY)
+    # the fork's Sweet Papa Studio badge (resources/lynx_badge.png), the same picture as the app icon
+    badge = Image.open(os.path.join(ROOT, "resources", "lynx_badge.png")).convert("RGBA").resize((TILE, TILE), Image.LANCZOS)
+    im.alpha_composite(badge, TILE_XY)
     size = TITLE_MAX
     while size > 40 and bold(size).getlength(TEXT["title"]) > WIN_X - 36 - TITLE_X:
         size -= 1
