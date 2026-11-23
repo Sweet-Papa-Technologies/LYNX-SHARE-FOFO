@@ -463,11 +463,17 @@ jobs:
     steps:
       - name: Build dependencies (Ubuntu 22.04 + GCC 13 from ppa:ubuntu-toolchain-r/test)
         run: |
-          apt-get update -q
-          apt-get install -y -q --no-install-recommends ca-certificates curl git gnupg software-properties-common
-          add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          apt-get update -q
-          apt-get install -y -q gcc-13 g++-13 cmake ninja-build pkg-config file binutils xvfb xauth x11-utils \
+          # Launchpad's PPA host answers 503 for a share of its requests at times (23 Nov 2026: about half of them, two
+          # release runs lost). apt tries every download again; a package list that did not arrive is an error
+          # (--error-on=any: apt-get update otherwise goes on without the PPA and gcc-13 is "not found"), and each step
+          # is tried again as a whole. Slow while it lasts (16 minutes that day), but it gets there.
+          retry() { n=0; until "$@"; do n=$((n + 1)); [ "$n" -lt 8 ] || { echo "::error::gave up after $n tries: $*"; return 1; }; echo "::warning::try $n failed, again in 30 s: $*"; sleep 30; done; }
+          echo 'Acquire::Retries "10";' > /etc/apt/apt.conf.d/80-retries
+          retry apt-get update -q --error-on=any
+          retry apt-get install -y -q --no-install-recommends ca-certificates curl git gnupg software-properties-common
+          retry add-apt-repository -y -n ppa:ubuntu-toolchain-r/test
+          retry apt-get update -q --error-on=any
+          retry apt-get install -y -q gcc-13 g++-13 cmake ninja-build pkg-config file binutils xvfb xauth x11-utils \
             fonts-dejavu-core libasound2-dev libjack-jackd2-dev libx11-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxext-dev libxcomposite-dev libfreetype-dev libfontconfig1-dev libgl-dev desktop-file-utils zsync
           ldd --version | head -1
