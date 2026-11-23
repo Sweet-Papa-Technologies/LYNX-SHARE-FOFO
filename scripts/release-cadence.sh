@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # release-cadence.sh nightly|weekly — what the Nightly beta and Sunday release workflows should tag, if anything.
+# release-cadence.sh next <version> [YYYY-MM-DD] — only prints the version that follows <version> (no git, no gh).
 #
 # Picks the newest commit on main (first parent, last 20) whose required checks all passed, then:
 #   nightly  tag v<version>-beta.<YYYYMMDD> when that commit is newer than the last v* tag
-#   weekly   tag v<version> when there is anything since the last final release; next = the following patch version
-# <version> is CMakeLists.txt's. When v<version> is already released, nothing is tagged until main is bumped.
+#   weekly   tag v<version> when there is anything since the last final release; next = the version of the week after
+# <version> is CMakeLists.txt's: <year - 2000>.<ISO week>.<patch> (docs/RELEASE.md > Version numbers). When v<version>
+# is already released, nothing is tagged until main is bumped.
 #
 # Writes tag=, sha= (and next= for weekly) to $GITHUB_OUTPUT, a summary to $GITHUB_STEP_SUMMARY. An empty tag means
 # "nothing to do" and is not an error. Run locally (with gh signed in) to preview: scripts/release-cadence.sh nightly
 set -euo pipefail
-mode="${1:?usage: release-cadence.sh nightly|weekly}"
+mode="${1:?usage: release-cadence.sh nightly|weekly|next <version> [YYYY-MM-DD]}"
 repo="${GITHUB_REPOSITORY:-Sweet-Papa-Technologies/LYNX-SHARE-FOFO}"
 ignore_checks="${IGNORE_CHECKS:-false}"
 required=("Server limits" "App (ubuntu-24.04)" "App (macos-15)")   # main's required status checks
@@ -28,6 +30,27 @@ green() { # all required checks of commit $1 concluded success
     grep -q -x -F "$name"$'\t'"success" <<< "$runs" || return 1
   done
 }
+
+# The version after $1: the first coming Sunday (the release day; its ISO week ends on it) whose <yy>.<week>.0 is newer
+# than $1. $2 (optional): today as YYYY-MM-DD, for tests. A version set far ahead by hand gets the next patch.
+next_version() {
+  python3 - "$1" "${2:-}" <<'PY'
+import datetime, sys
+current = tuple(int(x) for x in sys.argv[1].split("."))
+today = datetime.date.fromisoformat(sys.argv[2]) if sys.argv[2] else datetime.datetime.now(datetime.timezone.utc).date()
+sunday = today + datetime.timedelta(days=(6 - today.weekday()) % 7 or 7)   # strictly after today
+for _ in range(4):
+    year, week, _day = sunday.isocalendar()
+    candidate = (year % 100, week, 0)
+    if candidate > current:
+        print("%d.%d.%d" % candidate)
+        break
+    sunday += datetime.timedelta(days=7)
+else:
+    print("%d.%d.%d" % (current[0], current[1], current[2] + 1))
+PY
+}
+if [[ "$mode" == next ]]; then next_version "${2:?usage: release-cadence.sh next <version> [YYYY-MM-DD]}" "${3:-}"; exit 0; fi
 
 sha=""
 if [[ "$ignore_checks" == true ]]; then
@@ -66,9 +89,10 @@ case "$mode" in
       nothing "Nothing merged since $final; no release this week."
     fi
     tag="v$version"
-    IFS=. read -r major minor patch <<< "$version"
-    out next "$major.$minor.$((patch + 1))"
+    out next "$(next_version "$version")"
     say "## Proposed release: $tag at \`${sha::9}\`"
+    this_week="$(python3 -c 'import datetime; y, w, _ = datetime.datetime.now(datetime.timezone.utc).date().isocalendar(); print("%d.%d" % (y % 100, w))')"
+    [[ "$version" == "$this_week".* ]] || say "Note: main's version $version does not name this week ($this_week.x): the release keeps the number main carries."
     say "Commits since ${final:-the beginning}: $(git rev-list --count ${final:+$final..}"$sha")."
     say "Approve the **release** job to tag and publish it; then open and merge the version bump pull request it links."
     git checkout -q "$sha"

@@ -225,6 +225,29 @@ TEST (update_channel_stable_and_beta)
     CHECK (newest ("0.1.28-beta.20261117", Channel::stable) == "0.1.28");
     CHECK (newest ("0.1.28-beta.20261121", Channel::stable) == "0.1.28");
 
+    // the fork's week numbers (docs/RELEASE.md > Version numbers): newer than every 0.1.x release, weeks and years in order
+    {
+        auto lt = [] (const char* a, const char* b) { return compare (parseVersion (a), parseVersion (b)) < 0; };
+        CHECK (lt ("0.1.27", "26.47.0") && lt ("0.1.30-alpha", "26.47.0"));
+        CHECK (lt ("26.47.0", "26.47.1") && lt ("26.47.1", "26.48.0") && lt ("26.9.0", "26.10.0") && lt ("26.53.0", "27.1.0"));
+        CHECK (lt ("26.47.0", "26.48.0-beta.20261124") && lt ("26.48.0-beta.20261124", "26.48.0-beta.20261125"));
+        std::vector<Release> weeks (3);
+        weeks[0].tag = "v26.48.0-beta.20261124"; weeks[0].prerelease = true;
+        weeks[1].tag = "v26.47.0";
+        weeks[2].tag = "v0.1.27";
+        for (auto& r : weeks)
+            r.version = parseVersion (r.tag);
+        auto offered = [&] (const char* running, Channel c) {
+            const auto i = newestIndex (weeks, parseVersion (running), c);
+            return i < 0 ? std::string ("-") : weeks[(std::size_t) i].version.text();
+        };
+        CHECK (offered ("0.1.27", Channel::stable) == "26.47.0");
+        CHECK (offered ("0.1.27", Channel::byVersion) == "26.47.0");
+        CHECK (offered ("26.47.0", Channel::stable) == "-");
+        CHECK (offered ("26.47.0", Channel::beta) == "26.48.0-beta.20261124");
+        CHECK (offered ("26.48.0-beta.20261124", Channel::byVersion) == "-");
+    }
+
     // the default channel comes from the running build's own version
     CHECK (defaultChannel (parseVersion ("0.1.28-beta.20261117")) == Channel::beta);
     CHECK (defaultChannel (parseVersion ("0.1.21-alpha")) == Channel::beta);

@@ -385,7 +385,7 @@ LYNX SHARE ships **native** plugins inspired by the third-party plugins producer
 ## Download
 
 Every release on the [latest release page](https://github.com/Sweet-Papa-Technologies/LYNX-SHARE-FOFO/releases/latest) has builds for all three
-platforms (`<v>` is the version, e.g. `0.1.10-alpha`):
+platforms (`<v>` is the version, e.g. `26.47.0`: the release of week 47 of 2026):
 
 | System | File | Notes |
 |---|---|---|

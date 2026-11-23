@@ -3,7 +3,10 @@ cmake_minimum_required(VERSION 3.22)
 # macOS: Big Sur or newer (universal builds pass -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"); set before project()
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 
-project(LYNX VERSION 0.1.28 LANGUAGES C CXX)
+# The fork's version is the release's week: <year - 2000>.<ISO week>.<patch> (26.47.0 = the release of ISO week 47 of
+# 2026; a hotfix of it is 26.47.1). Upstream's 0.1.x numbers are not used here, so a number names one build only
+# (docs/RELEASE.md > Version numbers). Three numbers, no suffix: the Windows build, the installer and release.yml read it.
+project(LYNX VERSION 26.47.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
