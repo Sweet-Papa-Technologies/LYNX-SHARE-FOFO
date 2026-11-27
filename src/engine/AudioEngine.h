@@ -56,6 +56,10 @@
 namespace lynx
 {
 class AudioLogger;
+namespace edisonfx
+{
+class Session;
+}
 
 // Owns the audio device, the processing graph and the document (Song).
 // Sits between the driver and the AudioProcessorPlayer to advance the transport
@@ -1082,6 +1086,27 @@ public:
     // with the same settings (the rack keeps them).
     void keepRunningPlugins (PreparedFlp& prepared);
     bool finishFlpImport (PreparedFlp&& prepared, bool asEdit);
+
+    // A LYNX project (.lynx) opened in the same steps: it used to be read, its samples and recordings decoded and its
+    // plugins created in one block on the message thread, with the window frozen meanwhile (108 s for a project with
+    // long Edison recordings). The song comes from ProjectFile::load (any thread).
+    struct PreparedSong
+    {
+        Song song;
+        bool withoutPlugins = false;                                // File › Open without third-party plugins
+        std::vector<std::shared_ptr<const SampleData>> decoded;     // kept alive until the rack is built
+        std::vector<std::shared_ptr<edisonfx::Session>> edison;     // the Edison slots' recordings, read ahead
+        std::vector<PluginRef> pluginQueue;                         // hosted plugins to create, in rack order
+        std::size_t pluginsDone = 0;
+        bool adopted = false;
+    };
+    // Any thread: the song's samples decoded in parallel, its Edison slots' recordings read (no plugin, nothing the
+    // engine plays is touched).
+    static void prepareSong (SampleLibrary& library, PreparedSong& prepared);
+    // Message thread: the substitutes applied (first call), then one hosted plugin of the queue per call; false when done.
+    bool preloadNextSongPlugin (PreparedSong& prepared);
+    // Message thread: the prepared song becomes the open project (as setSong / setSongWithPluginsOff).
+    void finishSong (PreparedSong&& prepared);
 
     // --- real-time bounce (round 165c: Export › "Render through the hardware in real time") ---
     // The song plays through the audio device from `startTick` (song mode; past its end and through the loop region,
