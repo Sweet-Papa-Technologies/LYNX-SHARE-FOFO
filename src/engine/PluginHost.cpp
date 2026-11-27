@@ -755,6 +755,24 @@ int PluginInstrument::takeMidiOutput (MidiOutNote* out, int max) noexcept
     return count;
 }
 
+namespace
+{
+// A hosted plugin released and deleted under the crash guard: its teardown (VST3 terminate, effClose, CLAP destroy) ran
+// unguarded, so a plugin that crashed there ended LYNX as a project closed or another one opened. One that faults is
+// left as it is (never called again); a release that faulted is not followed by the delete.
+void releaseGuarded (std::unique_ptr<juce::AudioPluginInstance> plugin, const std::string& name) noexcept
+{
+    auto* raw = plugin.release();
+    if (raw == nullptr)
+        return;
+    auto code = crashguard::run ([raw] { raw->releaseResources(); });
+    if (code == 0)
+        code = crashguard::run ([raw] { delete raw; });
+    if (code != 0)
+        crashguard::note ("plugin " + name + " crashed while it was closed (" + crashguard::describe (code) + "): left as it is");
+}
+} // namespace
+
 PluginInstrument::~PluginInstrument()
 {
     forgetAdapter (plugin.get());
@@ -762,7 +780,7 @@ PluginInstrument::~PluginInstrument()
     if (crashed.load())
         (void) plugin.release();
     else
-        crashguard::run ([this] { plugin->releaseResources(); });
+        releaseGuarded (std::move (plugin), name);
 }
 
 void PluginInstrument::failed (std::uint32_t code) noexcept
@@ -1428,7 +1446,7 @@ PluginEffect::~PluginEffect()
     if (crashed.load())
         (void) plugin.release();
     else
-        crashguard::run ([this] { plugin->releaseResources(); });
+        releaseGuarded (std::move (plugin), name);
 }
 
 void PluginEffect::failed (std::uint32_t code) noexcept

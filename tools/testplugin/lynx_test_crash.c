@@ -11,6 +11,7 @@
  *   "state"   - a null-pointer write when a saved state is loaded into it (state extension load)
  *   "init"    - a null-pointer write in clap_plugin.init: while the host creates it (LYNX --crashguardtest ... init)
  *   "activate" - a null-pointer write in clap_plugin.activate: while the host prepares it (LYNX --crashguardtest ... activate)
+ *   "destroy" - a null-pointer write in clap_plugin.destroy: while the host deletes it (LYNX --crashguardtest ... destroy)
  *   "thread"  - (Linux / macOS; round 190gg) in the Nth process() call it starts a thread of its own that writes to a
  *               null pointer: a fault outside every call the host makes (LYNX --crashguardtest ... thread)
  *   "editor-create" - (Linux / macOS; round 190gg) it offers an editor (CLAP gui, X11 / Cocoa) and writes to a null
@@ -64,7 +65,12 @@ static bool p_init (const clap_plugin_t* p)
         null_write();
     return true;
 }
-static void p_destroy (const clap_plugin_t* p) { free ((void*) p); }
+static void p_destroy (const clap_plugin_t* p)
+{
+    if (crash_mode ("destroy"))
+        null_write();
+    free ((void*) p);
+}
 static bool p_activate (const clap_plugin_t* p, double r, uint32_t a, uint32_t b)
 {
     (void) p; (void) r; (void) a; (void) b;

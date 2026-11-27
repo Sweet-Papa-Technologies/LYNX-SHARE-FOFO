@@ -1838,7 +1838,7 @@ public:
 
         if (args.contains ("--crashguardtest"))
         {
-            // LYNX --crashguardtest "LYNX Test Crash.vst3|.clap" report.txt [process|memcpy|init|activate] (round 190dt,
+            // LYNX --crashguardtest "LYNX Test Crash.vst3|.clap" report.txt [process|memcpy|init|activate|destroy] (round 190dt,
             // tools/testplugin/lynx_test_crash*.{c,cpp}): the plugin crashes in its 40th block on insert 1; LYNX must
             // catch it, mark the slot, keep playing the other inserts, save the project, reload the plugin; then the
             // saved project opens with the plugin crashing on its state; and LYNX's own faults are still crashes
@@ -11534,7 +11534,7 @@ private:
             runCrashGuardThreadOrUiTest (pluginPath, reportPath, mode);
             return;
         }
-        if (mode == "init" || mode == "activate")
+        if (mode == "init" || mode == "activate" || mode == "destroy")
         {
             runCrashGuardCreateTest (pluginPath, reportPath, mode);
             return;
@@ -11742,10 +11742,23 @@ private:
             song.mixer[1].effects.push_back (slot);
             const auto before = lynx::pluginCrashCount();
             offline.setSong (song); // (the plugin is created and prepared here)
+            if (mode == "destroy")
+            {
+                // made and played, then deleted as another project opens: its crash there must not end LYNX
+                expect ("plugin_loaded", dynamic_cast<lynx::PluginEffect*> (offline.getEffect (1, 0).get()) != nullptr);
+                offline.setSong (lynx::Song::makeDefault());
+                offline.dispatchPendingMessages();
+                expect ("teardown_survived", offline.getEffect (1, 0) == nullptr);
+                expect ("no_crash_prompt", lynx::pluginCrashCount() == before); // (closed: nothing to tell about it)
+            }
             const auto crashes = lynx::pluginCrashes();
-            expect ("crash_caught", lynx::pluginCrashCount() == before + 1 && ! crashes.empty() && crashes.back().onLoad);
-            expect ("plugin_left_out", dynamic_cast<lynx::PluginEffect*> (offline.getEffect (1, 0).get()) == nullptr);
-            expect ("slot_kept", offline.getSong().mixer[1].effects.size() == 1 && offline.getSong().mixer[1].effects[0].plugin.id == slot.plugin.id);
+            if (mode != "destroy")
+            {
+                expect ("crash_caught", lynx::pluginCrashCount() == before + 1 && ! crashes.empty() && crashes.back().onLoad);
+                expect ("plugin_left_out", dynamic_cast<lynx::PluginEffect*> (offline.getEffect (1, 0).get()) == nullptr);
+            }
+            if (mode != "destroy")
+                expect ("slot_kept", offline.getSong().mixer[1].effects.size() == 1 && offline.getSong().mixer[1].effects[0].plugin.id == slot.plugin.id);
             lynx::AudioEngine::RenderOptions o;
             o.seconds = 1.0;
             o.sampleRate = 48000.0;
