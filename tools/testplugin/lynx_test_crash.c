@@ -9,6 +9,8 @@
  *               (LYNX --plugintest / --crashguardtest: the slot must be switched off, the render must finish)
  *   "memcpy"  - the same, but as a memcpy from a null pointer (the fault is inside the C library, issue #155)
  *   "state"   - a null-pointer write when a saved state is loaded into it (state extension load)
+ *   "init"    - a null-pointer write in clap_plugin.init: while the host creates it (LYNX --crashguardtest ... init)
+ *   "activate" - a null-pointer write in clap_plugin.activate: while the host prepares it (LYNX --crashguardtest ... activate)
  *   "thread"  - (Linux / macOS; round 190gg) in the Nth process() call it starts a thread of its own that writes to a
  *               null pointer: a fault outside every call the host makes (LYNX --crashguardtest ... thread)
  *   "editor-create" - (Linux / macOS; round 190gg) it offers an editor (CLAP gui, X11 / Cocoa) and writes to a null
@@ -53,9 +55,23 @@ static bool ports_get (const clap_plugin_t* p, uint32_t index, bool in, clap_aud
 }
 static const clap_plugin_audio_ports_t audio_ports = { ports_count, ports_get };
 
-static bool p_init (const clap_plugin_t* p) { (void) p; return true; }
+static int crash_mode (const char* what);
+static void null_write (void);
+static bool p_init (const clap_plugin_t* p)
+{
+    (void) p;
+    if (crash_mode ("init"))
+        null_write();
+    return true;
+}
 static void p_destroy (const clap_plugin_t* p) { free ((void*) p); }
-static bool p_activate (const clap_plugin_t* p, double r, uint32_t a, uint32_t b) { (void) p; (void) r; (void) a; (void) b; return true; }
+static bool p_activate (const clap_plugin_t* p, double r, uint32_t a, uint32_t b)
+{
+    (void) p; (void) r; (void) a; (void) b;
+    if (crash_mode ("activate"))
+        null_write();
+    return true;
+}
 static void p_deactivate (const clap_plugin_t* p) { (void) p; }
 static bool p_start (const clap_plugin_t* p) { (void) p; return true; }
 static void p_stop (const clap_plugin_t* p) { (void) p; }

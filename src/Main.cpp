@@ -1838,7 +1838,7 @@ public:
 
         if (args.contains ("--crashguardtest"))
         {
-            // LYNX --crashguardtest "LYNX Test Crash.vst3|.clap" report.txt [process|memcpy] (round 190dt,
+            // LYNX --crashguardtest "LYNX Test Crash.vst3|.clap" report.txt [process|memcpy|init|activate] (round 190dt,
             // tools/testplugin/lynx_test_crash*.{c,cpp}): the plugin crashes in its 40th block on insert 1; LYNX must
             // catch it, mark the slot, keep playing the other inserts, save the project, reload the plugin; then the
             // saved project opens with the plugin crashing on its state; and LYNX's own faults are still crashes
@@ -11534,6 +11534,11 @@ private:
             runCrashGuardThreadOrUiTest (pluginPath, reportPath, mode);
             return;
         }
+        if (mode == "init" || mode == "activate")
+        {
+            runCrashGuardCreateTest (pluginPath, reportPath, mode);
+            return;
+        }
         juce::String report;
         bool ok = true;
         const auto expect = [&] (const char* name, bool value) {
@@ -11689,6 +11694,75 @@ private:
         for (const auto& c : lynx::pluginCrashes())
             report << "  crashed: " << c.plugin << " (" << lynx::crashguard::describe (c.code) << (c.onLoad ? ", loading its state" : "") << ")\n";
         tmp.deleteRecursively();
+        report << "result=" << (ok ? "OK" : "FAILED") << "\n";
+        juce::File (reportPath).replaceWithText (report);
+        setApplicationReturnValue (ok ? 0 : 1);
+        quit();
+    }
+
+    // --crashguardtest "LYNX Test Crash.clap" report.txt init | activate: the plugin crashes while LYNX creates it (CLAP
+    // init) or prepares it (activate) as the project opens. Only its saved settings were loaded under the guard, so such a
+    // plugin ended LYNX, and the project could not be opened again. It must be left out (a crash on load: no Reload),
+    // its slot keeps its settings, and the project plays.
+    void runCrashGuardCreateTest (const juce::String& pluginPath, const juce::String& reportPath, const juce::String& mode)
+    {
+        juce::String report;
+        bool ok = true;
+        const auto expect = [&] (const char* name, bool value) {
+            report << name << "=" << (value ? 1 : 0) << "\n";
+            ok = ok && value;
+        };
+        const auto setEnv = [] (const char* name, const char* value) {
+           #if JUCE_WINDOWS
+            _putenv_s (name, value);
+           #else
+            setenv (name, value, 1);
+           #endif
+        };
+        report << "guard=" << (lynx::crashguard::pluginFaultsCaught() ? "on" : "off") << "\nmode=" << mode << "\n";
+        {
+            lynx::AudioEngine offline (false);
+            auto& host = offline.getPluginHost();
+            host.addPluginFile (juce::File (pluginPath)); // (scanned before the crash is switched on)
+            juce::PluginDescription effect;
+            bool found = false;
+            for (const auto& type : host.getKnownPlugins().getTypes())
+                if (! found && ! type.isInstrument && juce::File (type.fileOrIdentifier).getFileName() == juce::File (pluginPath).getFileName())
+                {
+                    effect = type;
+                    found = true;
+                }
+            expect ("plugin_found", found);
+            setEnv ("LYNX_TEST_CRASH", mode.toRawUTF8());
+            auto song = lynx::Song::makeDefault();
+            lynx::EffectSlot slot;
+            slot.kind = lynx::EffectKind::plugin;
+            slot.plugin.id = effect.createIdentifierString().toStdString();
+            slot.plugin.name = effect.name.toStdString();
+            song.mixer[1].effects.push_back (slot);
+            const auto before = lynx::pluginCrashCount();
+            offline.setSong (song); // (the plugin is created and prepared here)
+            const auto crashes = lynx::pluginCrashes();
+            expect ("crash_caught", lynx::pluginCrashCount() == before + 1 && ! crashes.empty() && crashes.back().onLoad);
+            expect ("plugin_left_out", dynamic_cast<lynx::PluginEffect*> (offline.getEffect (1, 0).get()) == nullptr);
+            expect ("slot_kept", offline.getSong().mixer[1].effects.size() == 1 && offline.getSong().mixer[1].effects[0].plugin.id == slot.plugin.id);
+            lynx::AudioEngine::RenderOptions o;
+            o.seconds = 1.0;
+            o.sampleRate = 48000.0;
+            o.pluginWarmUp = false;
+            float peak = 0.0f;
+            o.capture = [&peak] (const float* l, const float* r, int n) {
+                for (int k = 0; k < n; ++k)
+                    peak = std::max (peak, std::max (std::abs (l[k]), std::abs (r[k])));
+            };
+            offline.renderOffline (o);
+            expect ("project_plays", peak > 0.01f);
+            if (offline.getPluginHost().getLoadFailures().size() > 0)
+                report << "load_failures=" << offline.getPluginHost().getLoadFailures().joinIntoString (" | ") << "\n";
+        }
+        setEnv ("LYNX_TEST_CRASH", "");
+        for (const auto& c : lynx::pluginCrashes())
+            report << "  crashed: " << c.plugin << " (" << lynx::crashguard::describe (c.code) << (c.onLoad ? ", while loading" : "") << ")\n";
         report << "result=" << (ok ? "OK" : "FAILED") << "\n";
         juce::File (reportPath).replaceWithText (report);
         setApplicationReturnValue (ok ? 0 : 1);
