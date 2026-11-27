@@ -281,6 +281,7 @@ public:
     juce::Rectangle<int> trackLaneArrowForSnapshot (int track) const { return trackLaneArrow (track); }
     double xOfTickForSnapshot (double tick) const { return tickToX (tick); }
     juce::Rectangle<int> clipBoundsForSnapshot (int clip) const { return clipBounds (clip); } // (round 190gi)
+    bool dragActiveForTests() const noexcept { return drag != Drag::none; }
     juce::Rectangle<float> curveBodyForSnapshot (int clip) const; // (round 190gi: where an envelope / automation curve is drawn)
     double warpStripSecondsForSnapshot (int clip, juce::Point<int> p) const { return warpStripSeconds (clip, p); }
     std::size_t warpMarkerCountForSnapshot (int clip) const { return clipWarpMarkers (clip).size(); }
