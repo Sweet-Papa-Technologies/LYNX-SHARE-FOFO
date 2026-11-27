@@ -7043,15 +7043,83 @@ void AudioEngine::pumpEdisonRecordings()
     edisonRecording = std::move (recordingNow);
     if (finished)
         flushEdisonAudio();
+    writeEdisonSafetyFiles();
 }
 
-juce::File AudioEngine::newEdisonRecordingFile() const
+void AudioEngine::writeEdisonSafetyFiles()
+{
+    // the takes still recording: what came in since the last pump is appended to their safety file
+    for (const auto& s : edisonRecording)
+    {
+        auto it = std::find_if (edisonSafety.begin(), edisonSafety.end(), [&s] (const EdisonSafetyFile& f) { return f.live && f.session == s; });
+        if (it != edisonSafety.end() && s->takeFrames() < it->written) // (a new take of the same slot: the old one's file is closed)
+        {
+            if (it->writer != nullptr)
+                it->writer->close();
+            it->writer.reset();
+            it->live = false;
+            it = edisonSafety.end();
+        }
+        if (it == edisonSafety.end())
+        {
+            if (s->takeFrames() == 0)
+                continue; // (nothing recorded yet: no file)
+            EdisonSafetyFile f;
+            f.session = s;
+            f.file = newEdisonRecordingFile (" (recording)");
+            f.writer = std::make_unique<WavTakeWriter>();
+            if (! f.writer->open (f.file.getFullPathName().toStdString(), s->takeSampleRate(), 2, SampleFormat::float32))
+                f.writer.reset(); // (not tried again for this take)
+            edisonSafety.push_back (std::move (f));
+            it = edisonSafety.end() - 1;
+        }
+        if (it->writer == nullptr)
+            continue;
+        const auto& left = s->takeChannel (0);
+        const auto& right = s->takeChannel (1);
+        const auto now = std::min<std::int64_t> ((std::int64_t) left.size(), (std::int64_t) right.size());
+        while (it->written < now)
+        {
+            const auto n = (int) std::min<std::int64_t> (now - it->written, 1 << 16);
+            const float* planes[] = { left.data() + it->written, right.data() + it->written };
+            if (! it->writer->write (planes, n))
+            {
+                it->writer->close();
+                it->writer.reset();
+                break;
+            }
+            it->written += n;
+        }
+    }
+    // the takes that ended: closed; their file goes once the take is in its own file (nothing unsaved in the session)
+    for (auto it = edisonSafety.begin(); it != edisonSafety.end();)
+    {
+        if (it->live && std::find (edisonRecording.begin(), edisonRecording.end(), it->session) != edisonRecording.end())
+        {
+            ++it;
+            continue;
+        }
+        if (it->writer != nullptr)
+            it->writer->close();
+        it->writer.reset();
+        it->live = false;
+        if (! it->session->recording() && ! it->session->dirty())
+        {
+            it->file.deleteFile();
+            it = edisonSafety.erase (it);
+        }
+        else
+            ++it;
+    }
+}
+
+juce::File AudioEngine::newEdisonRecordingFile (const juce::String& suffix) const
 {
     auto folder = recordingFolder;
     if (! folder.createDirectory()) // e.g. a read-only project folder: the global recordings folder
         folder = defaultRecordingFolder(), folder.createDirectory();
     const auto name = (recordingStem.isNotEmpty() ? recordingStem + "_" : juce::String())
-                      + juce::Time::getCurrentTime().formatted ("%Y-%m-%d %H-%M-%S") + "_Edison";
+                      + juce::Time::getCurrentTime().formatted ("%Y-%m-%d %H-%M-%S") + "_Edison" + suffix;
     return folder.getNonexistentChildFile (name, ".wav", false);
 }
 

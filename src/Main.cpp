@@ -22893,13 +22893,24 @@ private:
                     sinceTick = 0;
                     const auto t0 = juce::Time::getMillisecondCounterHiRes();
                     lynx::tickAudioEditorForTest (*window);
+                    if (tickMs.size() % 5 == 0)
+                        engine.pumpEdisonRecordings(); // (the engine's timer, 6 times a second: the take's safety file)
                     tickMs.push_back (juce::Time::getMillisecondCounterHiRes() - t0);
                     longest = juce::jmax (longest, tickMs.back());
                     if (longest > 2000.0) // (as before the fix: no need to wait for the rest)
                         break;
                 }
+                const auto recorded = folder.getChildFile ("Audio").getChildFile ("Recorded");
+                const auto safety = recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav");
+                // (stereo float: 8 bytes a frame; it lags by the last pump and the writer's one-second flush at most)
+                const auto safeFrames = safety.size() == 1 ? (safety[0].getSize() - 44) / 8 : (juce::int64) 0;
+                check ("long_take_written_to_a_safety_file_as_it_records", safety.size() == 1 && safeFrames <= fed && fed - safeFrames < (std::int64_t) (2.5 * rate),
+                       juce::String (safety.size()) + " file(s), about " + juce::String (safeFrames) + " frames of " + juce::String (fed));
                 session->stop();
-                lynx::tickAudioEditorForTest (*window);
+                lynx::tickAudioEditorForTest (*window); // (the take ends in the window: written to its own file)
+                engine.pumpEdisonRecordings();
+                check ("long_take_safety_file_goes_once_the_take_is_saved", recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav").isEmpty()
+                                                                             && ! session->dirty());
                 const auto average = [&tickMs] (std::size_t from, std::size_t to) {
                     double sum = 0.0;
                     for (auto i = from; i < to && i < tickMs.size(); ++i)

@@ -245,6 +245,9 @@ public:
     bool recording() const noexcept { return active; }
     Phase phase() const;
     std::int64_t takeFrames() const noexcept { return (std::int64_t) takeL.size(); }
+    // The take so far (channel 0 / 1) and its rate: the engine writes it to a safety file as it grows.
+    const std::vector<float>& takeChannel (int channel) const noexcept { return channel == 0 ? takeL : takeR; }
+    double takeSampleRate() const noexcept { return takeRate; }
     std::int64_t droppedFrames() const noexcept { return lost; }
     // The document as it will be when the recording stops now.
     audioedit::Document preview() const;

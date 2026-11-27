@@ -1691,7 +1691,20 @@ private:
     bool audioArmed = false;
     juce::String recordingError;
     std::vector<std::shared_ptr<edisonfx::Session>> edisonRecording; // (pumpEdisonRecordings: recording in this song)
-    juce::File newEdisonRecordingFile() const;
+    // An Edison take lives in memory until it stops: while it records it is also written to "<name> (recording).wav"
+    // next to the project's recordings, so a crash or a forced end leaves it on disk. The file goes once the take is
+    // in its own file (the flush), and stays when that never happened.
+    struct EdisonSafetyFile
+    {
+        std::shared_ptr<edisonfx::Session> session;
+        std::unique_ptr<WavTakeWriter> writer;
+        juce::File file;
+        std::int64_t written = 0;
+        bool live = true; // the take of its session being written (false: it ended, or the session began another)
+    };
+    std::vector<EdisonSafetyFile> edisonSafety;
+    void writeEdisonSafetyFiles();
+    juce::File newEdisonRecordingFile (const juce::String& suffix = {}) const;
     void keepOrphanedEdisonTake (edisonfx::Session& session);
     juce::File recordingFolder = defaultRecordingFolder();
     juce::String recordingStem;
