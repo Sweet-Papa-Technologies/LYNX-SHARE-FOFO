@@ -12049,3 +12049,6 @@ countries: br
 "Insert a wildcard at the cursor" = "Inserir um curinga no cursor"
 "File:" = "Arquivo:"
 "Stems:" = "Stems:"
+
+# A .lynx opened behind the progress panel
+"Reading the samples and recordings..." = "Lendo os samples e as gravações..."
