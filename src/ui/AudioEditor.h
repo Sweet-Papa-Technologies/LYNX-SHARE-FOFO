@@ -99,6 +99,8 @@ std::unique_ptr<juce::Component> makeAudioEditorForTest (AudioEngine& engine);
 std::unique_ptr<juce::Component> makeAudioEditorForInsertForTest (AudioEngine& engine, int insert, int slot = -1);
 void startAudioEditorLoopRecordForTest (juce::Component& editor, int source);
 void drainAudioEditorRecordForTest (juce::Component& editor);
+// One turn of the editor's timer (what it does 30 times a second: follow a recording, the song's document).
+void tickAudioEditorForTest (juce::Component& editor);
 void stopAudioEditorRecordForTest (juce::Component& editor);
 audioedit::Document getAudioEditorDocumentForTest (const juce::Component& editor);
 audioedit::Range getAudioEditorSelectionForTest (const juce::Component& editor);

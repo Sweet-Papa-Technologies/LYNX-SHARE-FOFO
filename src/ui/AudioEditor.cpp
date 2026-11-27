@@ -7171,6 +7171,12 @@ void drainAudioEditorRecordForTest (juce::Component& editor)
         e->drainRecordForTest();
 }
 
+void tickAudioEditorForTest (juce::Component& editor)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+        e->syncFromSongForTest();
+}
+
 void stopAudioEditorRecordForTest (juce::Component& editor)
 {
     if (auto* e = dynamic_cast<AudioEditor*> (&editor))
