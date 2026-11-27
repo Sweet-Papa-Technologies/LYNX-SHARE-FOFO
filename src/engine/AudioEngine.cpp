@@ -7017,13 +7017,54 @@ void AudioEngine::pumpGrossBeatPicks()
 void AudioEngine::pumpEdisonRecordings()
 {
     bool finished = false;
+    std::vector<std::shared_ptr<edisonfx::Session>> recordingNow;
     for (const auto& track : song.mixer)
         for (const auto& fx : track.effects)
             if (fx.kind == EffectKind::edison)
-                if (const auto session = edisonfx::findSession (fx.instance.id); session != nullptr && session->recording() && ! session->pump())
-                    finished = true; // (the maximum recording time, or its effect is gone)
+                if (auto session = edisonfx::findSession (fx.instance.id); session != nullptr && session->recording())
+                {
+                    if (session->pump())
+                        recordingNow.push_back (std::move (session));
+                    else
+                        finished = true; // (the maximum recording time, or its effect is gone)
+                }
+    // A recording whose slot is no longer in the song: the take went with the slot before (the session died with its
+    // effect and window). Held here from one pump to the next, it is stopped and kept in a file instead.
+    for (const auto& s : edisonRecording)
+    {
+        if (! s->recording() || std::find (recordingNow.begin(), recordingNow.end(), s) != recordingNow.end())
+            continue;
+        const auto inSong = std::any_of (song.mixer.begin(), song.mixer.end(), [id = s->id()] (const MixerTrack& t) {
+            return std::any_of (t.effects.begin(), t.effects.end(), [id] (const EffectSlot& fx) { return fx.kind == EffectKind::edison && fx.instance.id == id; });
+        });
+        if (! inSong)
+            keepOrphanedEdisonTake (*s);
+    }
+    edisonRecording = std::move (recordingNow);
     if (finished)
         flushEdisonAudio();
+}
+
+juce::File AudioEngine::newEdisonRecordingFile() const
+{
+    auto folder = recordingFolder;
+    if (! folder.createDirectory()) // e.g. a read-only project folder: the global recordings folder
+        folder = defaultRecordingFolder(), folder.createDirectory();
+    const auto name = (recordingStem.isNotEmpty() ? recordingStem + "_" : juce::String())
+                      + juce::Time::getCurrentTime().formatted ("%Y-%m-%d %H-%M-%S") + "_Edison";
+    return folder.getNonexistentChildFile (name, ".wav", false);
+}
+
+void AudioEngine::keepOrphanedEdisonTake (edisonfx::Session& session)
+{
+    session.stop(); // (the take joins the session's document)
+    if (! session.dirty() || session.document().audio.empty())
+        return;
+    const auto file = newEdisonRecordingFile();
+    if (session.save (file.getFullPathName().toStdString()))
+        notify (InputIssue::takeKept, 0, file.getFullPathName()); // (not a session recording: never offered for deletion)
+    else
+        notify (InputIssue::failed, 0, tr ("Could not write {0}", { file.getFullPathName() }));
 }
 
 void AudioEngine::flushEdisonAudio()
@@ -7050,12 +7091,7 @@ void AudioEngine::flushEdisonAudio()
                     session->save ({});
                 else
                 {
-                    auto folder = recordingFolder;
-                    if (! folder.createDirectory()) // e.g. a read-only project folder: the global recordings folder
-                        folder = defaultRecordingFolder(), folder.createDirectory();
-                    const auto name = (recordingStem.isNotEmpty() ? recordingStem + "_" : juce::String())
-                                      + juce::Time::getCurrentTime().formatted ("%Y-%m-%d %H-%M-%S") + "_Edison";
-                    const auto file = folder.getNonexistentChildFile (name, ".wav", false);
+                    const auto file = newEdisonRecordingFile();
                     if (! session->save (file.getFullPathName().toStdString()))
                     {
                         recordingError = tr ("Could not write {0}", { file.getFullPathName() });

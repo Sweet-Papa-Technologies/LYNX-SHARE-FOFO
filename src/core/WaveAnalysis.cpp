@@ -8,41 +8,7 @@ namespace lynx::wave
 {
 namespace
 {
-// 2nd-order Butterworth section (RBJ cookbook, Q = 1/sqrt 2), transposed direct form II, mono
-struct Section
-{
-    double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
-
-    static Section make (double hz, double rate, bool highPass) noexcept
-    {
-        const auto w = 2.0 * 3.14159265358979323846 * std::min (hz, rate * 0.45) / rate;
-        const auto cw = std::cos (w), alpha = std::sin (w) / (2.0 * 0.70710678118654752);
-        const auto a0 = 1.0 + alpha;
-        Section s;
-        if (highPass)
-        {
-            s.b0 = (1.0 + cw) / 2.0 / a0;
-            s.b1 = -(1.0 + cw) / a0;
-        }
-        else
-        {
-            s.b0 = (1.0 - cw) / 2.0 / a0;
-            s.b1 = (1.0 - cw) / a0;
-        }
-        s.b2 = s.b0;
-        s.a1 = -2.0 * cw / a0;
-        s.a2 = (1.0 - alpha) / a0;
-        return s;
-    }
-
-    double process (double x) noexcept
-    {
-        const auto y = b0 * x + z1;
-        z1 = b1 * x - a1 * y + z2;
-        z2 = b2 * x - a2 * y;
-        return y;
-    }
-};
+using detail::Section;
 
 std::int16_t quantiseSigned (float v, float scale) noexcept
 {
@@ -108,6 +74,28 @@ bool get (const std::uint8_t*& p, const std::uint8_t* end, T& v)
 constexpr std::uint32_t magic = 0x5657594c; // "LYWV"
 static_assert (sizeof (Column) == 18, "Column is written raw to the disk cache");
 } // namespace
+
+Section Section::make (double hz, double rate, bool highPass) noexcept
+{
+    const auto w = 2.0 * 3.14159265358979323846 * std::min (hz, rate * 0.45) / rate;
+    const auto cw = std::cos (w), alpha = std::sin (w) / (2.0 * 0.70710678118654752);
+    const auto a0 = 1.0 + alpha;
+    Section s;
+    if (highPass)
+    {
+        s.b0 = (1.0 + cw) / 2.0 / a0;
+        s.b1 = -(1.0 + cw) / a0;
+    }
+    else
+    {
+        s.b0 = (1.0 - cw) / 2.0 / a0;
+        s.b1 = (1.0 - cw) / a0;
+    }
+    s.b2 = s.b0;
+    s.a1 = -2.0 * cw / a0;
+    s.a2 = (1.0 - alpha) / a0;
+    return s;
+}
 
 std::size_t Summary::bucketOf (std::size_t level) const noexcept
 {
@@ -297,6 +285,152 @@ Summary analyse (const float* left, const float* right, std::size_t frames, doub
     }
 
     return s;
+}
+
+// --- the summary of audio still arriving ---------------------------------------------------------------------
+
+Builder::Builder (double sampleRate, int channels, std::size_t maxCols) : maxColumns (std::max<std::size_t> (2, maxCols & ~(std::size_t) 1))
+{
+    s.sampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    s.channels = channels > 1 ? 2 : 1;
+    s.levels.emplace_back();
+    for (int i = 0; i < 2; ++i)
+    {
+        lowLp[i] = Section::make (lowCrossoverHz, s.sampleRate, false);
+        midHp[i] = Section::make (lowCrossoverHz, s.sampleRate, true);
+        midLp[i] = Section::make (highCrossoverHz, s.sampleRate, false);
+        highHp[i] = Section::make (highCrossoverHz, s.sampleRate, true);
+    }
+}
+
+void Builder::append (const float* left, const float* right, std::size_t frames)
+{
+    if (left == nullptr || frames == 0)
+        return;
+    if (s.channels == 1 || right == nullptr)
+        right = left;
+
+    // a louder sample than the scale holds: the columns so far are quantised again first (analyse() knows the peak
+    // before it starts; this learns it as the audio comes)
+    auto peak = s.peak;
+    for (std::size_t i = 0; i < frames; ++i)
+        peak = std::max ({ peak, std::abs (left[i]), std::abs (right[i]) });
+    auto firstChanged = closedColumns; // (the open column, or the first new one)
+    if (std::max (1.0f, peak) > s.scale)
+    {
+        rescale (std::max (1.0f, peak));
+        firstChanged = 0;
+    }
+    s.peak = peak;
+
+    for (std::size_t i = 0; i < frames; ++i)
+    {
+        if (inColumn == 0)
+        {
+            if (closedColumns >= maxColumns) // (level 0 is full: two columns become one, the bucket doubles)
+            {
+                doubleBucket();
+                firstChanged = 0;
+            }
+            lo[0] = hi[0] = left[i];
+            lo[1] = hi[1] = right[i];
+            sq[0] = sq[1] = 0.0;
+            band[0] = band[1] = band[2] = 0.0;
+        }
+        const auto l = left[i], r = right[i];
+        lo[0] = std::min (lo[0], l);
+        hi[0] = std::max (hi[0], l);
+        lo[1] = std::min (lo[1], r);
+        hi[1] = std::max (hi[1], r);
+        sq[0] += (double) l * l;
+        sq[1] += (double) r * r;
+        const auto mono = 0.5 * ((double) l + (double) r);
+        const auto lowBand = lowLp[1].process (lowLp[0].process (mono));
+        const auto midBand = midLp[1].process (midLp[0].process (midHp[1].process (midHp[0].process (mono))));
+        const auto highBand = highHp[1].process (highHp[0].process (mono));
+        band[0] += lowBand * lowBand;
+        band[1] += midBand * midBand;
+        band[2] += highBand * highBand;
+        ++inColumn;
+        ++s.frames;
+        if (inColumn == s.bucket)
+        {
+            writeOpenColumn();
+            ++closedColumns;
+            inColumn = 0;
+        }
+    }
+    if (inColumn > 0)
+        writeOpenColumn();
+    refreshLevels (firstChanged);
+}
+
+void Builder::writeOpenColumn()
+{
+    auto& base = s.levels[0];
+    if (base.size() < closedColumns + 1)
+        base.resize (closedColumns + 1);
+    auto& col = base[closedColumns];
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        col.lo[ch] = quantiseSigned (lo[ch], s.scale);
+        col.hi[ch] = quantiseSigned (hi[ch], s.scale);
+        col.rms[ch] = quantiseUnsigned (rms16 (sq[ch], inColumn), s.scale);
+    }
+    for (int k = 0; k < 3; ++k)
+        col.band[k] = quantiseUnsigned (rms16 (band[k], inColumn), s.scale);
+}
+
+void Builder::doubleBucket()
+{
+    auto& base = s.levels[0];
+    std::vector<Column> merged ((closedColumns + 1) / 2);
+    for (std::size_t i = 0; i < merged.size(); ++i)
+        merged[i] = merge (base.data() + 2 * i, std::min<std::size_t> (2, closedColumns - 2 * i));
+    base = std::move (merged);
+    closedColumns = base.size();
+    s.bucket *= 2;
+}
+
+void Builder::rescale (float newScale)
+{
+    const auto factor = (double) s.scale / (double) newScale;
+    for (auto& level : s.levels)
+        for (auto& col : level)
+        {
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                col.lo[ch] = (std::int16_t) std::lround ((double) col.lo[ch] * factor);
+                col.hi[ch] = (std::int16_t) std::lround ((double) col.hi[ch] * factor);
+                col.rms[ch] = (std::uint16_t) std::lround ((double) col.rms[ch] * factor);
+            }
+            for (int k = 0; k < 3; ++k)
+                col.band[k] = (std::uint16_t) std::lround ((double) col.band[k] * factor);
+        }
+    s.scale = newScale;
+}
+
+void Builder::refreshLevels (std::size_t firstChanged)
+{
+    // the coarser levels again from the first column that changed on (analyse()'s merge, so the same columns)
+    std::size_t level = 0;
+    while (s.levels[level].size() > 1)
+    {
+        if (level + 1 == s.levels.size())
+            s.levels.emplace_back();
+        const auto& below = s.levels[level];
+        auto& next = s.levels[level + 1];
+        const auto count = (below.size() + levelFactor - 1) / levelFactor;
+        firstChanged /= levelFactor;
+        next.resize (count);
+        for (auto i = std::min (firstChanged, count); i < count; ++i)
+        {
+            const auto from = i * levelFactor;
+            next[i] = merge (below.data() + from, std::min (levelFactor, below.size() - from));
+        }
+        ++level;
+    }
+    s.levels.resize (level + 1);
 }
 
 std::vector<std::uint8_t> serialise (const Summary& s)

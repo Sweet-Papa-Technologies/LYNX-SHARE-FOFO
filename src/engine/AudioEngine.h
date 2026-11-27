@@ -56,6 +56,10 @@
 namespace lynx
 {
 class AudioLogger;
+namespace edisonfx
+{
+class Session;
+}
 
 // Owns the audio device, the processing graph and the document (Song).
 // Sits between the driver and the AudioProcessorPlayer to advance the transport
@@ -200,6 +204,8 @@ public:
     void flushEdisonAudio();
     // Recordings into Edison slots go on while their windows are closed (as FL's plugin does): this moves what the
     // audio thread recorded into the takes (the engine's timer calls it) and flushes a take that ended by itself.
+    // A recording whose slot left the song while it went on (Undo of the slot it was added with, the slot or its insert
+    // deleted, another project opened) is stopped and written to the recordings folder (InputIssue::takeKept).
     void pumpEdisonRecordings();
     // Round 190gk: slots a Gross Beat picked from MIDI notes become its Time slot / Volume slot parameters, as FL's
     // click does (not an undo step); the engine's timer calls it.
@@ -668,6 +674,7 @@ public:
         lowDisk,           // little room left on the recordings drive (detail = minutes)
         recordSafe,        // the insert (track) is record safe: not armed
         framesLost,        // the disk could not keep up: frames became silence (detail = how many)
+        takeKept,          // an Edison recording lost its slot while it went on: written to a file (detail = the file)
         failed             // the driver refused (detail = its message) or a file could not be written
     };
     struct RecordingNotice
@@ -1683,6 +1690,9 @@ private:
     // audio recording
     bool audioArmed = false;
     juce::String recordingError;
+    std::vector<std::shared_ptr<edisonfx::Session>> edisonRecording; // (pumpEdisonRecordings: recording in this song)
+    juce::File newEdisonRecordingFile() const;
+    void keepOrphanedEdisonTake (edisonfx::Session& session);
     juce::File recordingFolder = defaultRecordingFolder();
     juce::String recordingStem;
     std::vector<juce::File> sessionRecordings;

@@ -8371,6 +8371,9 @@ juce::String issueText (const AudioEngine::RecordingNotice& notice)
         case I::framesLost:
             return tr ("The disk could not keep up while recording: {0} sample(s) became silence (the timing of the take was kept). "
                        "Record to a faster drive or close other programs that use the disk.", { notice.detail });
+        case I::takeKept:
+            return tr ("An Edison slot was removed while it was still recording (an undo, a deleted slot or insert, or another project). "
+                       "The recording was kept in {0}.", { notice.detail });
         case I::none: break;
     }
     return {};
@@ -8389,7 +8392,8 @@ void explain (const AudioEngine::RecordingNotice& notice)
         return;
 
     using I = AudioEngine::InputIssue;
-    const auto aboutRecording = notice.issue == I::lowDisk || notice.issue == I::recordSafe || notice.issue == I::framesLost || notice.issue == I::silentTake;
+    const auto aboutRecording = notice.issue == I::lowDisk || notice.issue == I::recordSafe || notice.issue == I::framesLost || notice.issue == I::silentTake
+                                || notice.issue == I::takeKept;
     auto options = juce::MessageBoxOptions()
                        .withIconType (juce::MessageBoxIconType::WarningIcon)
                        .withTitle (aboutRecording ? tr ("Recording") : tr ("Audio input needed"))

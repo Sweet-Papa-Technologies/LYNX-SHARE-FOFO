@@ -61,6 +61,54 @@ struct Summary
 // right == nullptr: mono. cancel (optional) is polled; a cancelled analysis returns an empty Summary.
 Summary analyse (const float* left, const float* right, std::size_t frames, double sampleRate, const std::atomic<bool>* cancel = nullptr);
 
+namespace detail
+{
+// 2nd-order Butterworth section (RBJ cookbook, Q = 1/sqrt 2), transposed direct form II, mono
+struct Section
+{
+    double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+    static Section make (double hz, double rate, bool highPass) noexcept;
+    double process (double x) noexcept
+    {
+        const auto y = b0 * x + z1;
+        z1 = b1 * x - a1 * y + z2;
+        z2 = b2 * x - a2 * y;
+        return y;
+    }
+};
+} // namespace detail
+
+// A Summary built while the audio arrives (Edison following a recording): append() costs what the new frames cost,
+// however much is in already. Analysing the whole recording again each time made a long take slower and slower to
+// follow, until the window stopped answering while the recording went on.
+// Its columns are analyse()'s of everything appended, exactly, as long as the level-0 bucket did not have to grow
+// (frames <= maxColumns * minBucket) and no sample went past full scale. Past maxColumns the bucket doubles
+// (neighbouring columns merged); a louder peak quantises the columns again for the new scale. Both cost O(columns).
+class Builder
+{
+public:
+    Builder (double sampleRate, int channels, std::size_t maxColumns = maxBaseColumns);
+
+    // right == nullptr (or a mono builder): mono
+    void append (const float* left, const float* right, std::size_t frames);
+    const Summary& summary() const noexcept { return s; }
+    std::size_t frames() const noexcept { return s.frames; }
+
+private:
+    void writeOpenColumn();
+    void doubleBucket();
+    void rescale (float newScale);
+    void refreshLevels (std::size_t firstChanged);
+
+    Summary s;
+    std::size_t maxColumns;
+    detail::Section lowLp[2], midHp[2], midLp[2], highHp[2];
+    // the column being filled (the last one of level 0 once it has frames)
+    float lo[2] {}, hi[2] {};
+    double sq[2] {}, band[3] {};
+    std::size_t inColumn = 0, closedColumns = 0;
+};
+
 // Disk cache format (little-endian, versioned). deserialise() rejects anything inconsistent.
 constexpr std::uint32_t formatVersion = 1;
 std::vector<std::uint8_t> serialise (const Summary& s);

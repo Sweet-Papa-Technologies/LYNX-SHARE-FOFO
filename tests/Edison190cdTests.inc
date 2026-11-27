@@ -827,3 +827,79 @@ TEST (edison190ct_remove_all_edison_instances)
     CHECK (song.mixer[2].effects.empty());
     CHECK (lynx::mixerops::removeEffectsOfKind (song, lynx::EffectKind::edison) == 0); // none left: nothing happens
 }
+
+// The Edison window follows a recording with Session::follow: what it shows after each pump is preview() (the
+// document when the recording stops now), but each call only takes in what was recorded since. Building preview()
+// whole five times a second copied the document and the take, and a long recording froze the window.
+TEST (edison_follow_shows_the_preview_one_stretch_at_a_time)
+{
+    namespace ef = lynx::edisonfx;
+    namespace ae = lynx::audioedit;
+    auto same = [] (const ae::Document& a, const ae::Document& b) {
+        if (a.audio.channels != b.audio.channels || a.audio.sampleRate != b.audio.sampleRate || a.title != b.title || a.markers.size() != b.markers.size())
+            return false;
+        for (std::size_t m = 0; m < a.markers.size(); ++m)
+            if (a.markers[m].start != b.markers[m].start || a.markers[m].name != b.markers[m].name)
+                return false;
+        return true;
+    };
+    for (const bool append : { true, false })
+    {
+        auto slot = lynx::makeEffectSlot (lynx::EffectKind::edison);
+        slot.params[ef::recordMode] = ef::modeValue (ef::Mode::now);
+        const auto fx = ef::make (slot, 44100.0);
+        const auto p = std::dynamic_pointer_cast<ef::Processor> (fx);
+        auto session = ef::findSession (slot.instance.id);
+        CHECK (p != nullptr && session != nullptr);
+        if (p == nullptr || session == nullptr)
+            return;
+        auto base = edison190cd::ramp (3000);
+        base.title = "Before";
+        session->setDocument (base);
+
+        CHECK (session->start (p, append));
+        ae::Document shown;
+        ef::Session::Follow follow;
+        CHECK (session->follow (shown, follow)); // (made whole: the document as it is before anything came in)
+        CHECK (same (shown, session->preview()));
+        CHECK (follow.frames == 0 && follow.at == (append ? 3000 : 0));
+        CHECK (! session->follow (shown, follow)); // nothing new
+        bool everyStep = true;
+        for (int round = 0; round < 12; ++round)
+        {
+            edison190cd::run (*p, slot.params, 0.1f * (float) (round + 1), 3 + round % 4, 441 - round * 7);
+            CHECK (session->pump());
+            everyStep = session->follow (shown, follow) && everyStep;
+            everyStep = same (shown, session->preview()) && everyStep;
+            everyStep = follow.frames == session->takeFrames() && everyStep;
+        }
+        CHECK (everyStep);
+        session->stop();
+        CHECK (session->follow (shown, follow) && same (shown, session->document()) && follow.frames < 0); // (after it: the document)
+    }
+
+    // a take at another rate than the document it is appended to: converted, about as long as preview()'s
+    auto slot = lynx::makeEffectSlot (lynx::EffectKind::edison);
+    slot.params[ef::recordMode] = ef::modeValue (ef::Mode::now);
+    const auto fx = ef::make (slot, 22050.0);
+    const auto p = std::dynamic_pointer_cast<ef::Processor> (fx);
+    auto session = ef::findSession (slot.instance.id);
+    if (p == nullptr || session == nullptr)
+        return;
+    session->setDocument (edison190cd::ramp (3000, 44100.0));
+    CHECK (session->start (p, true));
+    ae::Document shown;
+    ef::Session::Follow follow;
+    session->follow (shown, follow);
+    for (int round = 0; round < 6; ++round)
+    {
+        edison190cd::run (*p, slot.params, 0.5f, 4);
+        session->pump();
+        session->follow (shown, follow);
+    }
+    const auto whole = session->preview();
+    CHECK (shown.audio.sampleRate == 44100.0 && whole.audio.sampleRate == 44100.0);
+    CHECK (std::abs (shown.audio.frames() - whole.audio.frames()) <= 6);
+    CHECK (follow.scale == 2.0);
+    session->stop();
+}

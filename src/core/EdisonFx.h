@@ -207,6 +207,10 @@ private:
 // every jump of the song).
 audioedit::Document withTake (const audioedit::Document& base, const audioedit::Audio& take, const std::vector<std::int64_t>& jumps,
                               bool appendTake);
+// The same with a take that is not needed afterwards (the end of a recording): without Append, it becomes the audio as it
+// is, no copy (a long take was copied four times as the recording stopped).
+audioedit::Document withTake (const audioedit::Document& base, audioedit::Audio&& take, const std::vector<std::int64_t>& jumps,
+                              bool appendTake);
 
 // Message thread only.
 class Session
@@ -246,6 +250,20 @@ public:
     audioedit::Document preview() const;
     // Where the take starts in preview().
     std::int64_t takeStart() const noexcept;
+
+    // preview() kept up to date for a window that follows the recording (Edison, ~5 times a second): `shown` gets
+    // only what was recorded since the last call (converted to its format, with the new "Song jump" markers). A
+    // fresh `Follow` (or a take that started again) makes `shown` whole once. Building preview() each time copied
+    // the document and the take, so a long recording got slower to follow until the window stopped answering.
+    // Returns false when nothing changed.
+    struct Follow
+    {
+        std::int64_t frames = -1; // take frames in `shown` (-1: not built yet)
+        std::size_t jumps = 0;    // "Song jump" markers placed
+        std::int64_t at = 0;      // where the take starts in `shown`
+        double scale = 1.0;       // `shown` frames per take frame
+    };
+    bool follow (audioedit::Document& shown, Follow& f) const;
 
 private:
     void changedDocument();
