@@ -266,7 +266,8 @@ TEST (wave_builder_grows_its_bucket_and_scale)
     CHECK (f.summary().scale == 1.0f);
     f.append (loud.data(), nullptr, loud.size());
     CHECK (std::abs (f.summary().scale - 2.0f) < 0.01f);
-    const auto q = f.summary().query (1000.0, 20000.0, 0), w = f.summary().query (31000.0, 50000.0, 0);
+    // (ranges well inside each part: a wide query reads coarser columns, which may reach into the other part)
+    const auto q = f.summary().query (5000.0, 6000.0, 0), w = f.summary().query (40000.0, 41000.0, 0);
     CHECK (std::abs (q.hi - 0.5f) < 0.01f && std::abs (q.lo + 0.5f) < 0.01f);
     CHECK (std::abs (w.hi - 2.0f) < 0.02f && std::abs (w.lo + 2.0f) < 0.02f);
 }

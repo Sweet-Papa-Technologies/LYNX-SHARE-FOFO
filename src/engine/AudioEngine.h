@@ -1697,7 +1697,7 @@ private:
     struct EdisonSafetyFile
     {
         std::shared_ptr<edisonfx::Session> session;
-        std::unique_ptr<WavTakeWriter> writer;
+        std::unique_ptr<takes::WavTakeWriter> writer;
         juce::File file;
         std::int64_t written = 0;
         bool live = true; // the take of its session being written (false: it ended, or the session began another)

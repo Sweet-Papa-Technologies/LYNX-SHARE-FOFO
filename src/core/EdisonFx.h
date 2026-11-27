@@ -256,7 +256,8 @@ public:
 
     // preview() kept up to date for a window that follows the recording (Edison, ~5 times a second): `shown` gets
     // only what was recorded since the last call (converted to its format, with the new "Song jump" markers). A
-    // fresh `Follow` (or a take that started again) makes `shown` whole once. Building preview() each time copied
+    // fresh `Follow` (or a take that started again) makes `shown` whole once its first frames are in; before that
+    // nothing changes (`shown` keeps the document as it was, as preview() of an empty take is). Building preview() each time copied
     // the document and the take, so a long recording got slower to follow until the window stopped answering.
     // Returns false when nothing changed.
     struct Follow

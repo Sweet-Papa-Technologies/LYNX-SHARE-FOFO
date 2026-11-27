@@ -734,9 +734,16 @@ bool Session::follow (ae::Document& shown, Follow& f) const
         f = {};
         return true;
     }
-    if (f.frames < 0 || now < f.frames) // (first call, or the take began again)
+    if (now == 0) // nothing recorded yet (or a take that began again): as preview(), the document as it is
     {
-        // withTake (preview) with what is in so far; an empty take still has the take's format when it replaces
+        if (f.frames < 0)
+            return false;
+        shown = *doc;
+        f = {};
+        return true;
+    }
+    if (f.frames < 0 || now < f.frames) // (first frames, or the take began again)
+    {
         shown = withTake (*doc, take(), jumps, appending);
         f.frames = now;
         f.jumps = jumps.size();

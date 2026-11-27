@@ -858,12 +858,10 @@ TEST (edison_follow_shows_the_preview_one_stretch_at_a_time)
         session->setDocument (base);
 
         CHECK (session->start (p, append));
-        ae::Document shown;
+        auto shown = session->document(); // (what the window shows as the recording starts)
         ef::Session::Follow follow;
-        CHECK (session->follow (shown, follow)); // (made whole: the document as it is before anything came in)
-        CHECK (same (shown, session->preview()));
-        CHECK (follow.frames == 0 && follow.at == (append ? 3000 : 0));
-        CHECK (! session->follow (shown, follow)); // nothing new
+        CHECK (! session->follow (shown, follow)); // nothing recorded yet: the document stays as it is (= preview())
+        CHECK (same (shown, session->preview()) && follow.frames < 0);
         bool everyStep = true;
         for (int round = 0; round < 12; ++round)
         {
@@ -871,7 +869,9 @@ TEST (edison_follow_shows_the_preview_one_stretch_at_a_time)
             CHECK (session->pump());
             everyStep = session->follow (shown, follow) && everyStep;
             everyStep = same (shown, session->preview()) && everyStep;
-            everyStep = follow.frames == session->takeFrames() && everyStep;
+            everyStep = follow.frames == session->takeFrames() && follow.at == (append ? 3000 : 0) && everyStep;
+            if (round == 0)
+                CHECK (! session->follow (shown, follow)); // nothing new
         }
         CHECK (everyStep);
         session->stop();

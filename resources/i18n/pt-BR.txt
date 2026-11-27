@@ -12049,3 +12049,6 @@ countries: br
 "Insert a wildcard at the cursor" = "Inserir um curinga no cursor"
 "File:" = "Arquivo:"
 "Stems:" = "Stems:"
+
+# Edison: a recording whose slot was removed is kept
+"An Edison slot was removed while it was still recording (an undo, a deleted slot or insert, or another project). The recording was kept in {0}." = "Um slot do Edison foi removido enquanto ainda gravava (um desfazer, um slot ou insert apagado, ou outro projeto). A gravação foi guardada em {0}."

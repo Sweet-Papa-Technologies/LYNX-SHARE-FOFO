@@ -7067,8 +7067,8 @@ void AudioEngine::writeEdisonSafetyFiles()
             EdisonSafetyFile f;
             f.session = s;
             f.file = newEdisonRecordingFile (" (recording)");
-            f.writer = std::make_unique<WavTakeWriter>();
-            if (! f.writer->open (f.file.getFullPathName().toStdString(), s->takeSampleRate(), 2, SampleFormat::float32))
+            f.writer = std::make_unique<takes::WavTakeWriter>();
+            if (! f.writer->open (f.file.getFullPathName().toStdString(), s->takeSampleRate(), 2, takes::SampleFormat::float32))
                 f.writer.reset(); // (not tried again for this take)
             edisonSafety.push_back (std::move (f));
             it = edisonSafety.end() - 1;
