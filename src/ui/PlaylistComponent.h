@@ -931,6 +931,9 @@ private:
     int dragClip = -1;
     std::vector<int> dragIndices;
     std::vector<Clip> dragOriginals;
+    bool clipDragStillValid() const; // the drag's clip indices still name clips of the playlist
+    void cancelStaleClipDrag();
+    void pruneSelection();           // selected indices past the end of the playlist dropped
     std::vector<int> selection, selectionBefore;
     juce::Rectangle<int> rubberBand;
     std::int64_t loopAnchor = 0;

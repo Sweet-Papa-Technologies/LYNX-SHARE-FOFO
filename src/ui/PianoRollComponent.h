@@ -441,6 +441,8 @@ private:
     bool isSelected (int index) const;
     std::vector<int> channelNotes() const;           // indices of the channel's notes
     std::vector<int> selectionOrAll() const;         // selection, or all of the channel's notes if empty
+    bool dragStillValid() const;                     // the drag's note indices still name notes of its pattern
+    void cancelStaleDrag();
     void setSelection (std::vector<int> indices);
     void sortNotes();                                // sorts while keeping the selection (no undo step)
     void editNotes (const std::function<void (Pattern&)>& edit, bool undoable = true);
@@ -701,6 +703,7 @@ private:
 
     Drag drag = Drag::none;
     int dragNote = -1;              // grabbed note (reference for snap and preview)
+    int dragPattern = -1;           // the pattern the press was in (the drag's note indices are of it)
     std::vector<int> dragIndices;   // notes that follow the drag
     std::vector<Note> dragOriginals;
     std::int64_t grabOffset = 0;    // note tick - mouse tick at drag start
