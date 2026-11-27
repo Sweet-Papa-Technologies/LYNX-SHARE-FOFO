@@ -22918,7 +22918,7 @@ private:
                     return to > from ? sum / (double) (to - from) : 0.0;
                 };
                 const auto n = tickMs.size();
-                const auto early = average (0, juce::jmin<std::size_t> (n, 600)), late = average (n > 600 ? n - 600 : 0, n);
+                const auto early = average (0, std::min<std::size_t> (n, 600)), late = average (n > 600 ? n - 600 : 0, n);
                 const auto note = juce::String (n) + " ticks, first 600 " + juce::String (early, 3) + " ms, last 600 " + juce::String (late, 3)
                                   + " ms, longest " + juce::String (longest, 1) + " ms";
                 check ("long_take_followed_at_the_same_cost", fed >= frames && late < 4.0 * juce::jmax (early, 0.25) && longest < 250.0, note);
