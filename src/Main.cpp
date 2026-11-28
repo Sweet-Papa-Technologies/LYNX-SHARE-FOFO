@@ -23165,7 +23165,7 @@ private:
                 recordFor (1.0);
                 const auto pending = recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav");
                 session->stop();
-                lynx::tickAudioEditorForTest (*window); // (written to its own file; no pump after it)
+                engine.flushEdisonAudio(); // (what Save does first: the take in its own file; no pump after it)
                 const auto stillThere = pending.size() == 1 && pending[0].existsAsFile();
                 engine.closeEdisonSafetyFilesForTest();
                 check ("saved_take_leaves_no_safety_file_when_lynx_closes", stillThere && ! session->dirty()
