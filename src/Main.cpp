@@ -2598,6 +2598,17 @@ public:
             return;
         }
 
+        if (args.contains ("--dragundotest"))
+        {
+            // LYNX.exe --dragundotest report.txt: Undo while the mouse button still holds a dragged note (Piano Roll) or
+            // clip (Playlist); the next mouse move must end the drag (it wrote past the end of the list: heap corruption)
+            const auto i = args.indexOf ("--dragundotest");
+            const auto ok = runDragUndoTest (args[i + 1].unquoted());
+            setApplicationReturnValue (ok ? 0 : 1);
+            quit();
+            return;
+        }
+
         if (args.contains ("--edisonslottest"))
         {
             // LYNX.exe --edisonslottest folder [project.flp]: round 190cd — the audio editor as a mixer-slot plugin through
@@ -22628,6 +22639,94 @@ private:
                 if (w->getName().startsWith ("Formula") && w->getContentComponent() != nullptr)
                     savePng (lynx::shot::snapshot (*w->getContentComponent()), prefix + "-formula-controller.png");
         lynx::FormulaControllerWindows::closeAll();
+    }
+
+    // --dragundotest: a note / clip drag whose note / clip Undo took away while the button was held. The drag kept the
+    // indices of what it moved, and the next mouse move wrote a Note / Clip past the end of the list (the heap was
+    // corrupted, LYNX crashed later somewhere else). The drag must end there, the song as Undo left it.
+    bool runDragUndoTest (const juce::String& reportPath)
+    {
+        juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
+        juce::String report;
+        bool all = true;
+        auto check = [&] (const juce::String& name, bool ok, const juce::String& note = {}) {
+            report << name << "=" << (ok ? "ok" : "FAIL") << (note.isNotEmpty() ? "  (" + note + ")" : juce::String()) << "\n";
+            all = all && ok;
+        };
+        {
+            lynx::AudioEngine offline (false);
+            lynx::MainComponent ui (offline, false);
+            ui.setSize (1600, 900);
+            offline.dispatchPendingMessages();
+            const juce::ModifierKeys left (juce::ModifierKeys::leftButtonModifier);
+            const auto held = juce::ModifierKeys::currentModifiers;
+
+            // Piano Roll: the Pencil on an empty cell adds a note and drags it at once
+            ui.selectTabForSnapshot (1);
+            offline.dispatchPendingMessages();
+            auto& roll = ui.getPianoRollForSnapshot();
+            roll.setToolForSnapshot (lynx::EditTool::pencil);
+            offline.editSong ([] (lynx::Song& s) { s.activePattern().notes.clear(); }); // (every cell is empty)
+            offline.dispatchPendingMessages();
+            const auto notes = [&offline] { return offline.getSong().activePattern().notes.size(); };
+            const auto before = notes();
+            const juce::Point<int> at { lynx::PianoRollComponent::keyboardWidth + 420, lynx::PianoRollComponent::headerHeight + 140 };
+            juce::ModifierKeys::currentModifiers = left; // (the button is down for the engine too: one undo step per press)
+            roll.pressForSnapshot (at, left);
+            const auto added = notes();
+            check ("roll_press_adds_a_note_and_drags_it", added == before + 1 && roll.dragActiveForTests(),
+                   juce::String ((int) before) + " -> " + juce::String ((int) added) + " notes");
+            offline.undo();
+            offline.dispatchPendingMessages();
+            check ("roll_undo_takes_the_note_away", notes() == before);
+            roll.dragForSnapshot (at.translated (60, -36), left);
+            roll.dragForSnapshot (at.translated (120, -60), left);
+            check ("roll_drag_ends_with_its_note_gone", ! roll.dragActiveForTests() && notes() == before);
+            juce::ModifierKeys::currentModifiers = held;
+            roll.releaseForSnapshot (at.translated (120, -60));
+            offline.dispatchPendingMessages();
+
+            // Playlist: a pattern clip grabbed with the Pencil, the edit that added it undone while it is held
+            ui.selectTabForSnapshot (2);
+            offline.dispatchPendingMessages();
+            auto& playlist = ui.getPlaylistForSnapshot();
+            playlist.setToolForSnapshot (lynx::EditTool::pencil);
+            offline.editSong ([] (lynx::Song& s) {
+                lynx::Clip c;
+                c.pattern = s.currentPattern;
+                c.track = 0;
+                c.start = 0;
+                c.length = 4 * 4 * lynx::ppq;
+                s.playlist.push_back (c);
+            });
+            offline.dispatchPendingMessages();
+            ui.resized();
+            const auto clips = offline.getSong().playlist.size();
+            const auto box = playlist.clipBoundsForSnapshot ((int) clips - 1);
+            check ("playlist_clip_on_screen", ! box.isEmpty(), box.toString());
+            auto source = juce::Desktop::getInstance().getMainMouseSource();
+            const auto now = juce::Time::getCurrentTime();
+            const auto grab = box.getCentre().toFloat();
+            const auto event = [&] (juce::Point<float> p, juce::ModifierKeys m, bool dragged) {
+                return juce::MouseEvent (source, p, m, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, &playlist, &playlist, now, grab, now, 1, dragged);
+            };
+            juce::ModifierKeys::currentModifiers = left;
+            playlist.mouseDown (event (grab, left, false));
+            check ("playlist_press_grabs_the_clip", playlist.dragActiveForTests());
+            offline.undo();
+            offline.dispatchPendingMessages();
+            check ("playlist_undo_takes_the_clip_away", offline.getSong().playlist.size() == clips - 1);
+            playlist.mouseDrag (event (grab.translated (80.0f, 0.0f), left, true));
+            playlist.mouseDrag (event (grab.translated (160.0f, 0.0f), left, true));
+            check ("playlist_drag_ends_with_its_clip_gone", ! playlist.dragActiveForTests() && offline.getSong().playlist.size() == clips - 1);
+            juce::ModifierKeys::currentModifiers = held;
+            playlist.mouseUp (event (grab.translated (160.0f, 0.0f), {}, true));
+            offline.dispatchPendingMessages();
+        }
+        report << "result=" << (all ? "OK" : "FAILED") << "\n";
+        juce::File (reportPath).replaceWithText (report);
+        juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
+        return all;
     }
 
     bool runEdisonSlotTest (const juce::String& folderPath, const juce::String& flp)
