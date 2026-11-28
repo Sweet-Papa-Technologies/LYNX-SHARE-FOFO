@@ -202,6 +202,11 @@ public:
     // --savetest: File › Save to `file` without the dialog, and whether its file is still being written
     void saveForTest (const juce::File& file, std::function<void()> saved) { saveProjectTo (file, true, std::move (saved)); }
     bool isSavingForTest() const noexcept { return saving; }
+    // --opencopytest: the Versions panel's "Open as a copy" and Revert to last backup (without its question)
+    void openProjectAsCopyForTest (const juce::File& file, const juce::String& name) { openProjectAsCopy (file, name); }
+    void revertToBackupForTest (const juce::File& backup) { revertTo (backup); }
+    const juce::File& currentFileForTest() const noexcept { return currentFile; }
+    const juce::String& projectNameForTest() const noexcept { return projectName; }
     void waitForBrowserForSnapshot() { browser.waitForListing (5000); }
     // --no-plugins project.lynx (round 190ap): the next .lynx project opens with its third-party plugins off
     void openNextWithoutPlugins (bool on) { nextOpenWithoutPlugins = on; }
@@ -569,6 +574,7 @@ private:
     // project safety (REA round 118, FL's backup folder / save new version / project data files interpreted)
     void saveNewVersion();
     void revertToLastBackup();
+    void revertTo (const juce::File& backup); // (the open project becomes that backup, behind the progress panel)
     // round 190ap: the Versions panel (saved versions and backups of this project) and its "Open as a copy"
     void showVersions();
     void openProjectAsCopy (const juce::File& file, const juce::String& name);

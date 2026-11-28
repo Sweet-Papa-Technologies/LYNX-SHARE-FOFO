@@ -214,6 +214,7 @@
 #include "core/TrackIconScale.h"
 #include "core/EscClose.h"
 #include "ui/MainComponent.h"
+#include "ui/ProjectLoading.h"
 #include "ui/SimpleDock.h"
 #include "core/ScaleKeys.h"
 #include "core/KeyFollow.h"
@@ -1271,6 +1272,17 @@ public:
             juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
             runSaveTest (juce::File (args[i + 1].unquoted()),
                          args.size() > i + 2 && ! args[i + 2].startsWith ("--") ? juce::jlimit (0.1, 1800.0, args[i + 2].getDoubleValue()) : 60.0);
+            return;
+        }
+
+        if (args.contains ("--opencopytest"))
+        {
+            // LYNX --opencopytest report.txt [seconds of recording]: Versions › Open as a copy and File › Revert to last
+            // backup open their file behind the progress panel while the window keeps answering (off screen)
+            const auto i = args.indexOf ("--opencopytest");
+            juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
+            runOpenCopyTest (juce::File (args[i + 1].unquoted()),
+                             args.size() > i + 2 && ! args[i + 2].startsWith ("--") ? juce::jlimit (0.1, 1800.0, args[i + 2].getDoubleValue()) : 60.0);
             return;
         }
 
@@ -13579,6 +13591,193 @@ private:
         test->check ("the same file, byte for byte", saved && reference.loadFileAsData (a) && test->second.loadFileAsData (b) && a == b && a.getSize() > 0);
         test->second.deleteFile();
         // (once the new window's own start-up work is through the message loop: it is not the save's)
+        juce::Timer::callAfterDelay (1000, [test] { test->first(); });
+    }
+
+    // --opencopytest: the Versions panel's "Open as a copy" and File › Revert to last backup read their file on the
+    // message thread and froze the window as long as File › Open did before it went behind the progress panel. Both
+    // open a project holding a recording of `seconds` (60 s of stereo noise is a 31 MB file), off screen, and the
+    // report says
+    //  - how long the old way held the message thread (ProjectFile::load there), beside how long the call holds it now
+    //    and the longest time between two turns of the message loop while the file is read;
+    //  - that the call returns while the file is still being read, with the open project untouched until then;
+    //  - that "Open as a copy" leaves an unsaved project under the name given, unmodified, the version file untouched;
+    //  - that the revert keeps the project's own file and name and leaves it modified (Save writes it back there).
+    void runOpenCopyTest (const juce::File& report, double seconds)
+    {
+        struct Test final : juce::Timer
+        {
+            lynx::AudioEngine* engine = nullptr;
+            std::unique_ptr<lynx::MainComponent> ui;
+            juce::File report, project, version;
+            std::int64_t frames = 0;
+            juce::String text, what;
+            int failures = 0, turns = 0;
+            double started = 0.0, lastTurn = 0.0, longestGapMs = 0.0;
+            bool loading = false;
+            std::function<void()> whenLoaded;
+            std::function<void (bool)> done;
+
+            static double now() { return juce::Time::getMillisecondCounterHiRes(); }
+            void check (const juce::String& name, bool ok)
+            {
+                failures += ok ? 0 : 1;
+                text << name << ": " << (ok ? "ok" : "FAILED") << "\n";
+            }
+            void timerCallback() override // a turn of the message loop
+            {
+                if (loading)
+                {
+                    ++turns;
+                    longestGapMs = juce::jmax (longestGapMs, now() - lastTurn);
+                    if (! lynx::projectLoadRunning())
+                    {
+                        loading = false;
+                        text << what << "_ms=" << juce::String (now() - started, 1) << "\n"
+                             << what << "_message_loop_turns=" << turns << "\n"
+                             << what << "_longest_message_loop_gap_ms=" << juce::String (longestGapMs, 1) << "\n";
+                        check (what + ": the message loop turned while the file was read", turns >= 2);
+                        // (the panel hands its result over through the message queue: after that)
+                        juce::MessageManager::callAsync ([this, next = std::move (whenLoaded)] { next(); });
+                    }
+                }
+                lastTurn = now();
+                if (now() - started > 300000.0)
+                {
+                    check ("finished within 5 minutes", false);
+                    finish();
+                }
+            }
+            std::optional<lynx::Song> load (const juce::File& file)
+            {
+                juce::String error;
+                auto song = lynx::ProjectFile::load (file, error);
+                if (! song)
+                    text << "  could not load " << file.getFileName() << ": " << error << "\n";
+                return song;
+            }
+            bool isTheVersion() const
+            {
+                const auto& song = engine->getSong();
+                return song.bpm == 120.0 && song.recorderDocument != nullptr && song.recorderDocument->audio.frames() == frames;
+            }
+            // one of the two opens: `call` starts it, `then` runs once its project is the open one
+            void open (const juce::String& name, double bpmBefore, std::function<void()> call, std::function<void()> then)
+            {
+                what = name;
+                turns = 0;
+                longestGapMs = 0.0;
+                started = lastTurn = now();
+                call();
+                text << what << "_message_thread_held_at_start_ms=" << juce::String (now() - started, 1) << "\n";
+                check (what + ": the file is still being read when the call returns", lynx::projectLoadRunning());
+                check (what + ": the open project is untouched meanwhile", engine->getSong().bpm == bpmBefore);
+                lastTurn = now();
+                loading = true;
+                whenLoaded = std::move (then);
+            }
+
+            void first()
+            {
+                startTimer (5);
+                // the project that is open: saved, so it has a file of its own
+                ui->saveForTest (project, [this] {
+                    check ("the open project has its file", ui->currentFileForTest() == project && ! engine->isModified());
+                    const auto versionTime = version.getLastModificationTime();
+                    const auto versionSize = version.getSize();
+                    // 1. Versions › Open as a copy
+                    open ("open_as_copy", 99.0, [this] { ui->openProjectAsCopyForTest (version, "opencopytest (copy)"); },
+                          [this, versionTime, versionSize] {
+                              check ("open_as_copy: the version is the open project", isTheVersion());
+                              check ("open_as_copy: an unsaved project (no file)", ui->currentFileForTest() == juce::File());
+                              check ("open_as_copy: under the name given", ui->projectNameForTest() == "opencopytest (copy)");
+                              check ("open_as_copy: not modified", ! engine->isModified());
+                              check ("open_as_copy: the version file is untouched",
+                                     version.getLastModificationTime() == versionTime && version.getSize() == versionSize);
+                              second();
+                          });
+                });
+            }
+            void second()
+            {
+                // the project, edited, is saved under its own file again
+                engine->editSong ([] (lynx::Song& s) { s.bpm = 140.0; }, true);
+                ui->saveForTest (project, [this] {
+                    check ("the project has its file again", ui->currentFileForTest() == project && ! engine->isModified());
+                    // 2. File › Revert to last backup (its question answered)
+                    open ("revert", 140.0, [this] { ui->revertToBackupForTest (version); }, [this] {
+                        check ("revert: the backup is the open project", isTheVersion());
+                        check ("revert: the project keeps its own file", ui->currentFileForTest() == project);
+                        check ("revert: and its name", ui->projectNameForTest() == project.getFileNameWithoutExtension());
+                        check ("revert: modified (Save writes it back to the project's file)", engine->isModified());
+                        const auto onDisk = load (project);
+                        check ("revert: the project file itself is unchanged", onDisk && onDisk->bpm == 140.0);
+                        finish();
+                    });
+                });
+            }
+            void finish()
+            {
+                stopTimer();
+                juce::MessageManager::callAsync ([this] {
+                    text << "failures: " << failures << "\nresult=" << (failures == 0 ? "OK" : "FAIL") << "\n";
+                    report.replaceWithText (text);
+                    ui = nullptr;
+                    done (failures == 0);
+                });
+            }
+        };
+
+        engine = std::make_unique<lynx::AudioEngine>();
+        auto test = std::make_shared<Test>();
+        test->engine = engine.get();
+        test->report = report;
+        test->project = report.getSiblingFile ("opencopytest.lynx");
+        test->version = report.getSiblingFile ("opencopytest (version 2).lynx");
+        for (const auto& f : { test->project, test->version })
+            f.deleteFile();
+        for (const auto& f : lynx::platform::settingsFile ("autosave").findChildFiles (juce::File::findFiles, false, "opencopytest*"))
+            f.deleteFile();
+
+        // the version / backup: a recording of `seconds`
+        {
+            auto song = lynx::makeNewProject();
+            song.bpm = 120.0;
+            auto doc = std::make_shared<lynx::audioedit::Document>();
+            doc->title = "opencopytest";
+            doc->audio.sampleRate = 48000.0;
+            doc->audio.channels.assign (2, std::vector<float> ((std::size_t) (seconds * 48000.0)));
+            std::uint32_t seed = 12345; // noise: nothing in it repeats
+            for (auto& channel : doc->audio.channels)
+                for (auto& v : channel)
+                {
+                    seed = seed * 1664525u + 1013904223u;
+                    v = (float) (seed >> 8) / 8388608.0f - 1.0f;
+                }
+            test->frames = doc->audio.frames();
+            song.recorderDocument = std::move (doc);
+            juce::String error;
+            test->check ("the version file is written", lynx::ProjectFile::save (song, test->version, error));
+        }
+        test->text << "recording_seconds=" << juce::String (seconds, 1) << "\n"
+                   << "project_file_mb=" << juce::String ((double) test->version.getSize() / 1.0e6, 1) << "\n";
+        // the old way: the whole file read on the message thread
+        const auto start = Test::now();
+        const auto old = test->load (test->version);
+        test->text << "old_load_on_the_message_thread_ms=" << juce::String (Test::now() - start, 1) << "\n";
+        test->check ("the version file reads back", old && old->recorderDocument != nullptr && old->recorderDocument->audio.frames() == test->frames);
+
+        // the project that is open meanwhile: small
+        auto open = lynx::makeNewProject();
+        open.bpm = 99.0;
+        engine->setSong (std::move (open));
+        test->ui = std::make_unique<lynx::MainComponent> (*engine, false);
+        test->ui->setSize (1280, 800);
+        test->done = [this, test] (bool ok) {
+            setApplicationReturnValue (ok ? 0 : 1);
+            quit();
+        };
+        // (once the new window's own start-up work is through the message loop: it is not the open's)
         juce::Timer::callAfterDelay (1000, [test] { test->first(); });
     }
 

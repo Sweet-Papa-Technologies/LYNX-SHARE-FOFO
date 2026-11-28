@@ -8009,24 +8009,28 @@ void MainComponent::openProjectAsCopy (const juce::File& file, const juce::Strin
 {
     // A version or a backup opened to look at or to carry on from: it becomes an unsaved project under `name`, so
     // neither that file nor the project that was open is written over (Save asks where to put it).
-    juce::String error;
-    auto song = ProjectFile::load (file, error);
-    if (! song)
-    {
-        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
+    // Behind the progress panel, as File › Open: a backup of a project with long recordings froze the window as long.
+    if (projectLoadRunning())
         return;
-    }
-    engine.getPluginHost().applySubstitutes (*song);
-    engine.stop();
-    engine.rewind();
-    engine.setSong (std::move (*song));
-    currentFile = juce::File();
-    importedFlpFile = juce::File();
-    projectName = name;
-    importedSuffix = {};
-    updateTitle();
-    playlist.showSongAfterOpen();
-    ui::postHint ({ tr ("Opened as a copy: {0}", { file.getFileName() }), tr ("Save asks where to keep it; the original file is untouched") }, 7000);
+    openLynxWithProgress (*this, engine, file, false,
+                          [safe = juce::Component::SafePointer<MainComponent> (this), file, name] (bool ok, const juce::String& error,
+                                                                                                   const juce::String&, const ProjectFile::WindowLayout&) {
+                              if (safe == nullptr)
+                                  return;
+                              if (! ok)
+                              {
+                                  juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
+                                  return;
+                              }
+                              safe->currentFile = juce::File();
+                              safe->importedFlpFile = juce::File();
+                              safe->projectName = name;
+                              safe->importedSuffix = {};
+                              safe->updateTitle();
+                              safe->playlist.showSongAfterOpen();
+                              ui::postHint ({ tr ("Opened as a copy: {0}", { file.getFileName() }), tr ("Save asks where to keep it; the original file is untouched") },
+                                            7000);
+                          });
 }
 
 void MainComponent::revertToLastBackup()
@@ -8049,24 +8053,31 @@ void MainComponent::revertToLastBackup()
     w->addButton (tr ("Revert"), 1, juce::KeyPress (juce::KeyPress::returnKey));
     w->addButton (tr ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
     w->enterModalState (true, juce::ModalCallbackFunction::create ([safe = juce::Component::SafePointer<MainComponent> (this), backup] (int result) {
-                            if (safe == nullptr || result != 1)
-                                return;
-                            juce::String error;
-                            auto song = ProjectFile::load (backup, error);
-                            if (! song)
-                            {
-                                juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
-                                return;
-                            }
-                            safe->engine.getPluginHost().applySubstitutes (*song);
-                            safe->engine.stop();
-                            safe->engine.rewind();
-                            safe->engine.setSong (std::move (*song));
-                            safe->engine.markModified(); // Save writes it back to the project's own file
-                            safe->updateTitle();
-                            safe->playlist.showSongAfterOpen();
+                            if (safe != nullptr && result == 1)
+                                safe->revertTo (backup);
                         }),
                         true);
+}
+
+void MainComponent::revertTo (const juce::File& backup)
+{
+    // behind the progress panel, as File › Open (the backup of a project with long recordings is as big as it)
+    if (projectLoadRunning())
+        return;
+    openLynxWithProgress (*this, engine, backup, false,
+                          [safe = juce::Component::SafePointer<MainComponent> (this)] (bool ok, const juce::String& error, const juce::String&,
+                                                                                       const ProjectFile::WindowLayout&) {
+                              if (safe == nullptr)
+                                  return;
+                              if (! ok)
+                              {
+                                  juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
+                                  return;
+                              }
+                              safe->engine.markModified(); // Save writes it back to the project's own file
+                              safe->updateTitle();
+                              safe->playlist.showSongAfterOpen();
+                          });
 }
 
 sessionui::Context MainComponent::sessionContext()
