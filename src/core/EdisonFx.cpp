@@ -261,7 +261,8 @@ void Processor::writePreRoll() noexcept
     prePos = 0;
 }
 
-int Processor::drain (std::vector<float>& l, std::vector<float>& r, std::vector<std::int64_t>& jumps, std::int64_t takeFrames)
+int Processor::drain (std::vector<float>& l, std::vector<float>& r, std::vector<std::int64_t>& jumps, std::int64_t takeFrames,
+                      std::vector<double>* jumpBeats)
 {
     const auto w = writeIndex.load (std::memory_order_acquire);
     const auto rd = readIndex.load (std::memory_order_relaxed);
@@ -283,7 +284,11 @@ int Processor::drain (std::vector<float>& l, std::vector<float>& r, std::vector<
     const auto jw = jumpWrite.load (std::memory_order_acquire);
     auto jr = jumpRead.load (std::memory_order_relaxed);
     for (; jr != jw; ++jr)
+    {
         jumps.push_back (std::min<std::int64_t> (jumpAt[jr % jumpSlots], takeFrames + n));
+        if (jumpBeats != nullptr)
+            jumpBeats->push_back (jumpBeatsAt[jr % jumpSlots]);
+    }
     jumpRead.store (jr, std::memory_order_release);
     return n;
 }
@@ -304,7 +309,7 @@ void Processor::play (std::shared_ptr<const ae::Audio> newClip, bool loop, float
         shownPosition.store (-1.0, std::memory_order_relaxed);
 }
 
-void Processor::setContent (std::shared_ptr<const ae::Audio> newContent, std::int64_t offset)
+void Processor::setContent (std::shared_ptr<const ae::Audio> newContent, std::int64_t offset, double anchorBeats, std::int64_t anchorFrame)
 {
     Source old;
     while (! tryLock()) {}
@@ -312,6 +317,8 @@ void Processor::setContent (std::shared_ptr<const ae::Audio> newContent, std::in
     retiredContent = {};
     pendingContent.audio = std::move (newContent);
     pendingContent.offset = offset;
+    pendingContent.anchorBeats = anchorBeats;
+    pendingContent.anchorFrame = anchorFrame;
     hasPendingContent = true;
     unlock();
 }
@@ -416,6 +423,7 @@ void Processor::process (float* left, float* right, int n, const EffectParams& p
                 if (jw - jumpRead.load (std::memory_order_acquire) < (std::uint32_t) jumpSlots)
                 {
                     jumpAt[jw % jumpSlots] = written;
+                    jumpBeatsAt[jw % jumpSlots] = songTicks / (double) ppq;
                     jumpWrite.store (jw + 1, std::memory_order_release);
                 }
             }
@@ -468,8 +476,16 @@ void Processor::process (float* left, float* right, int n, const EffectParams& p
     {
         const auto& a = *content.audio;
         if (! slaveEngaged || reseek)
-            slavePosition = songTicks / ((double) ppq * std::max (1.0, bpm) / 60.0) * a.sampleRate
-                            + (params[ignoreOwnSelection] >= 0.5f ? 0.0 : (double) content.offset);
+        {
+            // the editor's selection starts at song time 0 (FL); without one, the take sounds where it was recorded:
+            // its first "Song jump" marker at the song position written with it (before that marker: silence). A take
+            // from before LYNX kept that position has its marker at song beat 0, as slave playback always played it.
+            const auto framesPerBeat = 60.0 / std::max (1.0, bpm) * a.sampleRate;
+            const auto songBeats = songTicks / (double) ppq;
+            const auto bySelection = params[ignoreOwnSelection] < 0.5f && content.offset > 0;
+            slavePosition = bySelection ? songBeats * framesPerBeat + (double) content.offset
+                                        : (songBeats - content.anchorBeats) * framesPerBeat + (double) content.anchorFrame;
+        }
         slaveEngaged = true;
         render (content, slavePosition, a.sampleRate / sr, left, right, n, true);
         shownPosition.store (slavePosition < (double) a.frames() ? slavePosition : -1.0, std::memory_order_relaxed);
@@ -491,7 +507,46 @@ void Processor::process (float* left, float* right, int n, const EffectParams& p
 }
 
 // --- the slot's document -------------------------------------------------------------------------------------------
-ae::Document withTake (const ae::Document& base, const ae::Audio& take, const std::vector<std::int64_t>& jumps, bool appendTake)
+namespace
+{
+// a "Song jump" marker at `frame`, with the song position it was written at (beats; 0 when not known)
+void addSongJump (ae::Document& d, std::int64_t frame, const std::vector<double>& jumpBeats, std::size_t index)
+{
+    ae::Marker m;
+    m.start = m.end = std::clamp<std::int64_t> (frame, 0, d.audio.frames());
+    m.name = "Song jump";
+    m.time = index < jumpBeats.size() ? std::max (0.0, jumpBeats[index]) : 0.0;
+    d.markers.push_back (std::move (m));
+    ae::sortMarkers (d);
+}
+} // namespace
+
+bool songAnchor (const ae::Document& doc, double& beats, std::int64_t& frame)
+{
+    for (const auto& m : doc.markers) // (sorted by start)
+        if (! m.isRegion() && m.name == "Song jump")
+        {
+            beats = std::max (0.0, m.time);
+            frame = m.start;
+            return true;
+        }
+    return false;
+}
+
+bool songPositionOf (const ae::Document& doc, std::int64_t frame, double bpm, double& beats)
+{
+    const ae::Marker* from = nullptr;
+    for (const auto& m : doc.markers) // (sorted by start)
+        if (! m.isRegion() && m.name == "Song jump" && m.start <= frame)
+            from = &m;
+    if (from == nullptr || doc.audio.sampleRate <= 0.0)
+        return false;
+    beats = std::max (0.0, from->time) + (double) (frame - from->start) / doc.audio.sampleRate * std::max (1.0, bpm) / 60.0;
+    return true;
+}
+
+ae::Document withTake (const ae::Document& base, const ae::Audio& take, const std::vector<std::int64_t>& jumps, bool appendTake,
+                       const std::vector<double>& jumpBeats)
 {
     ae::Document d;
     std::int64_t at = 0;
@@ -508,20 +563,21 @@ ae::Document withTake (const ae::Document& base, const ae::Audio& take, const st
         d.title = base.title;
         d.audio = take;
     }
-    for (const auto j : jumps)
-        ae::addMarker (d, std::clamp<std::int64_t> (at + (std::int64_t) std::llround ((double) j * scale), 0, d.audio.frames()), "Song jump");
+    for (std::size_t i = 0; i < jumps.size(); ++i)
+        addSongJump (d, at + (std::int64_t) std::llround ((double) jumps[i] * scale), jumpBeats, i);
     return d;
 }
 
-ae::Document withTake (const ae::Document& base, ae::Audio&& take, const std::vector<std::int64_t>& jumps, bool appendTake)
+ae::Document withTake (const ae::Document& base, ae::Audio&& take, const std::vector<std::int64_t>& jumps, bool appendTake,
+                       const std::vector<double>& jumpBeats)
 {
     if (appendTake && ! base.audio.empty())
-        return withTake (base, static_cast<const ae::Audio&> (take), jumps, appendTake); // (converted into a copy of the audio)
+        return withTake (base, static_cast<const ae::Audio&> (take), jumps, appendTake, jumpBeats); // (converted into a copy of the audio)
     ae::Document d;
     d.title = base.title;
     d.audio = std::move (take);
-    for (const auto j : jumps)
-        ae::addMarker (d, std::clamp<std::int64_t> (j, 0, d.audio.frames()), "Song jump");
+    for (std::size_t i = 0; i < jumps.size(); ++i)
+        addSongJump (d, jumps[i], jumpBeats, i);
     return d;
 }
 
@@ -554,7 +610,15 @@ void Session::changedDocument()
     players.erase (std::remove_if (players.begin(), players.end(), [] (const std::weak_ptr<Processor>& p) { return p.expired(); }), players.end());
     for (const auto& weak : players)
         if (const auto p = weak.lock())
-            p->setContent (audioOf (doc), slaveOffset);
+            setContentOf (*p);
+}
+
+void Session::setContentOf (Processor& p) const
+{
+    double beats = 0.0;
+    std::int64_t frame = 0;
+    songAnchor (*doc, beats, frame);
+    p.setContent (audioOf (doc), slaveOffset, beats, frame);
 }
 
 void Session::setDocument (ae::Document d)
@@ -573,14 +637,14 @@ void Session::setSlaveOffset (std::int64_t selectionStart)
     const std::lock_guard<std::mutex> guard (registryMutex());
     for (const auto& weak : players)
         if (const auto p = weak.lock())
-            p->setContent (audioOf (doc), slaveOffset);
+            setContentOf (*p);
 }
 
 void Session::attach (const std::shared_ptr<Processor>& p)
 {
     const std::lock_guard<std::mutex> guard (registryMutex());
     players.push_back (p);
-    p->setContent (audioOf (doc), slaveOffset);
+    setContentOf (*p);
 }
 
 void Session::load (const std::string& path, const std::function<std::shared_ptr<const SampleData> (const std::string&)>& fallback)
@@ -642,6 +706,7 @@ bool Session::start (const std::shared_ptr<Processor>& p, bool appendTake)
     takeL.clear();
     takeR.clear();
     jumps.clear();
+    jumpBeats.clear();
     lost = 0;
     active = true;
     p->play (nullptr, false);
@@ -659,7 +724,7 @@ bool Session::pump()
         stop();
         return false;
     }
-    p->drain (takeL, takeR, jumps, takeFrames());
+    p->drain (takeL, takeR, jumps, takeFrames(), &jumpBeats);
     lost = p->droppedFrames();
     if (! p->isRecording()) // (the maximum recording time)
     {
@@ -677,7 +742,7 @@ void Session::stop()
     if (const auto p = recorder.lock())
     {
         p->setRecording (false);
-        p->drain (takeL, takeR, jumps, takeFrames());
+        p->drain (takeL, takeR, jumps, takeFrames(), &jumpBeats);
         lost = p->droppedFrames();
     }
     recorder.reset();
@@ -688,13 +753,14 @@ void Session::stop()
         recorded.channels.reserve (2);
         recorded.channels.push_back (std::move (takeL));
         recorded.channels.push_back (std::move (takeR));
-        doc = std::make_shared<const ae::Document> (withTake (*doc, std::move (recorded), jumps, appending));
+        doc = std::make_shared<const ae::Document> (withTake (*doc, std::move (recorded), jumps, appending, jumpBeats));
         changed = true;
         changedDocument();
     }
     takeL.clear();
     takeR.clear();
     jumps.clear();
+    jumpBeats.clear();
 }
 
 Phase Session::phase() const
@@ -717,7 +783,7 @@ ae::Audio Session::take() const
 
 ae::Document Session::preview() const
 {
-    return active && ! takeL.empty() ? withTake (*doc, take(), jumps, appending) : *doc;
+    return active && ! takeL.empty() ? withTake (*doc, take(), jumps, appending, jumpBeats) : *doc;
 }
 
 std::int64_t Session::takeStart() const noexcept
@@ -744,7 +810,7 @@ bool Session::follow (ae::Document& shown, Follow& f) const
     }
     if (f.frames < 0 || now < f.frames) // (first frames, or the take began again)
     {
-        shown = withTake (*doc, take(), jumps, appending);
+        shown = withTake (*doc, take(), jumps, appending, jumpBeats);
         f.frames = now;
         f.jumps = jumps.size();
         f.at = takeStart();
@@ -769,7 +835,7 @@ bool Session::follow (ae::Document& shown, Follow& f) const
         }
     }
     for (auto j = f.jumps; j < jumps.size(); ++j)
-        ae::addMarker (shown, std::clamp<std::int64_t> (f.at + (std::int64_t) std::llround ((double) jumps[j] * f.scale), 0, shown.audio.frames()), "Song jump");
+        addSongJump (shown, f.at + (std::int64_t) std::llround ((double) jumps[j] * f.scale), jumpBeats, j);
     f.frames = now;
     f.jumps = jumps.size();
     return true;

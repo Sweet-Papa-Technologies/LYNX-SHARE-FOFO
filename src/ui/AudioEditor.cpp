@@ -252,6 +252,27 @@ private:
 };
 
 
+// What an Edison slot's window last dragged out: the file and the slot (edisonTakeDropped). Message thread.
+struct DraggedTake
+{
+    juce::File file;
+    std::uint64_t instance = 0;
+};
+DraggedTake draggedTake;
+
+// The slot `instance`'s "Slave playback to host" off in `song`; false when it was off already (or the slot is gone).
+bool slaveOff (Song& song, std::uint64_t instance)
+{
+    for (auto& track : song.mixer)
+        for (auto& fx : track.effects)
+            if (fx.kind == EffectKind::edison && fx.instance.id == instance && fx.params[(std::size_t) edisonfx::slave] >= 0.5f)
+            {
+                fx.params[(std::size_t) edisonfx::slave] = 0.0f;
+                return true;
+            }
+    return false;
+}
+
 // --- the editor --------------------------------------------------------------------------------------------------
 struct Source
 {
@@ -2277,6 +2298,7 @@ public:
         const auto file = writePartFile (selection);
         if (file == juce::File {})
             return;
+        draggedTake = { file, slotMode() ? source.instance : 0 }; // (dropped on the Playlist: edisonTakeDropped)
         container->startDragging (juce::String (BrowserComponent::dragDescription) + "|" + file.getFullPathName(), &dragButton, juce::ScaledImage(), true);
     }
 
@@ -4829,6 +4851,8 @@ private:
 
     void sendToPlaylist (ae::Range range = {})
     {
+        if (slotMode() && recState != RecState::idle)
+            stopRecording(); // (an Edison still recording: what is sent is the take as it ends)
         if (doc.audio.empty())
             return;
         if (range.empty())
@@ -4840,7 +4864,18 @@ private:
         const auto activeFrames = range.empty() ? doc.audio.frames() : range.length();
         const auto seconds = doc.audio.sampleRate > 0.0 ? (double) activeFrames / doc.audio.sampleRate : 0.0;
         const auto length = juce::jmax<std::int64_t> (ppq / 4, (std::int64_t) (seconds * song.bpm / 60.0 * ppq));
-        const auto start = (std::int64_t) (engine.getTransport().positionTicks.load() / ppq) * ppq; // at the beat of the song position
+        auto start = (std::int64_t) (engine.getTransport().positionTicks.load() / ppq) * ppq; // at the beat of the song position
+        // An Edison take goes where it was recorded: its "Song jump" marker holds the song position of that frame
+        // (the playhead had moved on by then, so the clip landed somewhere else and the slot played the take too).
+        auto whereRecorded = false;
+        if (double beats = 0.0; slotMode() && edisonfx::songPositionOf (doc, range.empty() ? std::int64_t (0) : range.start, song.bpm, beats))
+        {
+            start = (std::int64_t) std::llround (beats * (double) ppq);
+            whereRecorded = true;
+        }
+        // and the slot no longer plays it along with the song (Slave playback to host): the clip does
+        const auto instance = slotMode() ? source.instance : std::uint64_t (0);
+        const auto slaveWasOn = slotMode() && slotParam (edisonfx::slave) >= 0.5f;
         // the first track with room for it
         int track = 0;
         for (;; ++track)
@@ -4868,9 +4903,16 @@ private:
             clip.length = length;
             s.playlist.push_back (clip);
             s.mode = PlayMode::song;
+            if (instance != 0)
+                slaveOff (s, instance);
         });
         modified = false;
-        setStatus (tr ("Sent to the Playlist (track {0})", { juce::String (track + 1) }), false);
+        if (slaveWasOn)
+            syncSlotControls();
+        setStatus ((whereRecorded ? tr ("Sent to the Playlist (track {0}) where it was recorded", { juce::String (track + 1) })
+                                  : tr ("Sent to the Playlist (track {0})", { juce::String (track + 1) }))
+                       + (slaveWasOn ? ". " + tr ("Slave playback is off: the clip plays the take now") : juce::String()),
+                   false);
         updateTitle();
     }
 
@@ -6380,6 +6422,8 @@ public:
     {
         timerCallback();
     }
+
+    void sendToPlaylistForTest() { sendToPlaylist ({ 0, doc.audio.frames() }); }
 };
 
 juce::PopupMenu AudioEditor::editMenu (bool contextual)
@@ -6972,6 +7016,29 @@ std::unique_ptr<juce::Component> makeEdisonSlotEditor (AudioEngine& engine, int 
     return std::make_unique<AudioEditor> (engine, *source);
 }
 
+void edisonTakeDropped (AudioEngine& engine, const juce::File& file)
+{
+    if (draggedTake.instance == 0 || file != draggedTake.file)
+        return;
+    const auto instance = std::exchange (draggedTake.instance, std::uint64_t (0));
+    const auto path = file.getFullPathName().toStdString();
+    const auto& song = engine.getSong();
+    const auto placed = std::any_of (song.playlist.begin(), song.playlist.end(), [&song, &path] (const Clip& c) {
+        return c.kind == ClipKind::audio && c.channel >= 0 && c.channel < (int) song.channels.size() && song.channels[(std::size_t) c.channel].samplePath == path;
+    });
+    if (! placed)
+        return;
+    const auto slaveOn = std::any_of (song.mixer.begin(), song.mixer.end(), [instance] (const MixerTrack& t) {
+        return std::any_of (t.effects.begin(), t.effects.end(), [instance] (const EffectSlot& fx) {
+            return fx.kind == EffectKind::edison && fx.instance.id == instance && fx.params[(std::size_t) edisonfx::slave] >= 0.5f;
+        });
+    });
+    if (! slaveOn) // (an undo step only when there is something to switch off)
+        return;
+    engine.editSong ([instance] (Song& s) { slaveOff (s, instance); });
+    ui::postHint ({ tr ("Slave playback is off: the clip plays the take now"), {}, false, false }, 5000);
+}
+
 int addEdisonSlot (AudioEngine& engine, int track, bool openAndRecord)
 {
     int at = -1;
@@ -7175,6 +7242,12 @@ void tickAudioEditorForTest (juce::Component& editor)
 {
     if (auto* e = dynamic_cast<AudioEditor*> (&editor))
         e->syncFromSongForTest();
+}
+
+void sendAudioEditorToPlaylistForTest (juce::Component& editor)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+        e->sendToPlaylistForTest();
 }
 
 void stopAudioEditorRecordForTest (juce::Component& editor)

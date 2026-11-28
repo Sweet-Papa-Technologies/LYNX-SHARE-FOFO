@@ -574,6 +574,129 @@ TEST (edison190cd_slave_playback_plays_the_content_at_the_song_time)
     CHECK (l[0] == 0.0f && l[440] == 0.0f);
 }
 
+// A take recorded On play from bar 9 kept frame 0 = song time 0: slave playback played it from the start of the song,
+// and Send to the Playlist put it at the playhead, so the take was heard where no clip was. Each "Song jump" marker now
+// keeps the song position it was written at (beats), in the document and in the slot's WAV.
+TEST (edison_a_take_keeps_the_song_position_it_was_recorded_at)
+{
+    namespace ef = lynx::edisonfx;
+    namespace ae = lynx::audioedit;
+    ef::Processor p;
+    p.prepare (44100.0);
+    auto params = edison190cd::defaults();
+    params[ef::recordMode] = ef::modeValue (ef::Mode::onPlay);
+    p.setRecording (true);
+    const auto ticksPerBlock = 441.0 / 44100.0 * (120.0 / 60.0) * (double) lynx::ppq;
+    double tick = 32.0 * lynx::ppq; // the song plays from bar 9 (beat 32)
+    auto block = [&] (float level) {
+        p.setSongPosition (tick);
+        p.setPlaying (true);
+        edison190cd::run (p, params, level, 1);
+        tick += ticksPerBlock;
+    };
+    for (int i = 0; i < 10; ++i)
+        block (0.25f);
+    tick = 4.0 * lynx::ppq; // and jumps back to beat 4
+    for (int i = 0; i < 10; ++i)
+        block (0.75f);
+    std::vector<float> l, r;
+    std::vector<std::int64_t> jumps;
+    std::vector<double> beats;
+    p.drain (l, r, jumps, 0, &beats);
+    p.setRecording (false);
+    CHECK (jumps.size() == 2 && beats.size() == 2);
+    if (beats.size() == 2)
+        CHECK (beats[0] == 32.0 && beats[1] == 4.0);
+
+    ae::Audio take;
+    take.sampleRate = 44100.0;
+    take.channels = { l, r };
+    const auto doc = ef::withTake (ae::Document {}, take, jumps, false, beats);
+    double at = -1.0;
+    std::int64_t frame = -1;
+    CHECK (ef::songAnchor (doc, at, frame) && at == 32.0 && frame == 0);
+    CHECK (doc.markers.size() == 2 && doc.markers[1].start == 10 * 441 && doc.markers[1].time == 4.0);
+    // without the song positions (the call as it was): the markers at beat 0, as slave playback always took them
+    const auto old = ef::withTake (ae::Document {}, take, jumps, false);
+    CHECK (ef::songAnchor (old, at, frame) && at == 0.0 && frame == 0);
+    // nothing that marks a take start: no anchor
+    CHECK (! ef::songAnchor (edison190cd::ramp (100), at, frame));
+    // where a frame was recorded (Send to the Playlist puts a selection there): from the last jump before it
+    double pos = -1.0;
+    CHECK (ef::songPositionOf (doc, 0, 120.0, pos) && pos == 32.0);
+    CHECK (ef::songPositionOf (doc, 441, 120.0, pos) && std::abs (pos - (32.0 + 0.02)) < 1.0e-9); // (10 ms at 120 BPM)
+    CHECK (ef::songPositionOf (doc, 10 * 441 + 882, 120.0, pos) && std::abs (pos - (4.0 + 0.04)) < 1.0e-9); // (after the jump)
+    CHECK (! ef::songPositionOf (edison190cd::ramp (100), 0, 120.0, pos));
+
+    // the slot keeps its audio in a WAV: the positions go with the markers
+    const auto bytes = ae::encodeWav (doc, ae::WavFormat::float32);
+    ae::Document back;
+    CHECK (ae::decodeWav (bytes.data(), bytes.size(), back));
+    CHECK (back.markers.size() == 2 && back.markers[0].name == "Song jump" && back.markers[0].time == 32.0 && back.markers[1].time == 4.0);
+    // a document without positions is written as before (no chunk of them)
+    auto plain = doc;
+    for (auto& m : plain.markers)
+        m.time = 0.0;
+    const auto plainBytes = ae::encodeWav (plain, ae::WavFormat::float32);
+    const char tag[] = "lxbt";
+    CHECK (std::search (plainBytes.begin(), plainBytes.end(), tag, tag + 4) == plainBytes.end());
+    CHECK (std::search (bytes.begin(), bytes.end(), tag, tag + 4) != bytes.end());
+}
+
+TEST (edison_slave_playback_plays_a_take_where_it_was_recorded)
+{
+    namespace ef = lynx::edisonfx;
+    namespace ae = lynx::audioedit;
+    auto slot = lynx::makeEffectSlot (lynx::EffectKind::edison);
+    slot.params[ef::slave] = 1.0f;
+    const auto fx = ef::make (slot, 44100.0);
+    const auto p = std::dynamic_pointer_cast<ef::Processor> (fx);
+    const auto session = ef::findSession (slot.instance.id);
+    CHECK (p != nullptr && session != nullptr);
+    if (p == nullptr || session == nullptr)
+        return;
+    // a take recorded from beat 8 (4 s at 120 BPM): its "Song jump" marker at frame 0 says so
+    auto doc = edison190cd::ramp (44100);
+    ae::Marker jump;
+    jump.name = "Song jump";
+    jump.time = 8.0;
+    doc.markers.push_back (jump);
+    session->setDocument (doc);
+
+    std::vector<float> l (441, 0.0f), r (441, 0.0f);
+    auto at = [&] (double beats, const lynx::EffectParams& params) {
+        std::fill (l.begin(), l.end(), 0.0f);
+        std::fill (r.begin(), r.end(), 0.0f);
+        p->setPlaying (true);
+        p->setSongPosition (beats * lynx::ppq);
+        p->process (l.data(), r.data(), 441, params, 120.0);
+    };
+    // the song from its start: nothing (the take was not recorded there)
+    at (0.0, slot.params);
+    CHECK (l[0] == 0.0f && l[440] == 0.0f && r[200] == 0.0f);
+    at (6.0, slot.params);
+    CHECK (l[0] == 0.0f && l[440] == 0.0f);
+    // at beat 8: the take from its first frame
+    at (8.0, slot.params);
+    bool same = true;
+    for (int i = 1; i < 441; ++i) // (frame 0 of the ramp is 0 as well)
+        same = same && std::abs (l[(std::size_t) i] - doc.audio.channels[0][(std::size_t) i]) < 1.0e-6f;
+    CHECK (same);
+    // half a beat later: half a beat into the take
+    at (8.5, slot.params);
+    CHECK (std::abs (l[0] - doc.audio.channels[0][11025]) < 1.0e-6f);
+    // the editor's selection still starts at song time 0 (FL), and Ignore own selection goes back to the take's place
+    session->setSlaveOffset (1000);
+    at (0.0, slot.params);
+    CHECK (std::abs (l[0] - doc.audio.channels[0][1000]) < 1.0e-6f);
+    auto ignoring = slot.params;
+    ignoring[ef::ignoreOwnSelection] = 1.0f;
+    at (0.0, ignoring);
+    CHECK (l[0] == 0.0f && l[440] == 0.0f);
+    at (8.0, ignoring);
+    CHECK (std::abs (l[7] - doc.audio.channels[0][7]) < 1.0e-6f);
+}
+
 TEST (edison190cd_the_audio_of_a_slot_round_trips_through_its_project_file)
 {
     namespace ef = lynx::edisonfx;

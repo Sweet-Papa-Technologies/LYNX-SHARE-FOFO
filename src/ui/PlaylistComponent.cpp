@@ -15379,7 +15379,10 @@ void PlaylistComponent::itemDropped (const SourceDetails& details)
     }
 
     if (const auto file = BrowserComponent::draggedFile (details); file.existsAsFile())
+    {
         filesDropped ({ file.getFullPathName() }, details.localPosition.x, details.localPosition.y);
+        edisonTakeDropped (engine, file); // (an Edison slot's take: the slot stops playing it along)
+    }
 }
 // ---------------------------------------------------------------------------
 
