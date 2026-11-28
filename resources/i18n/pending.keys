@@ -12,3 +12,5 @@
 "Reload starts them again with the settings from the last save or backup (a plugin that crashed on its saved settings stays off)."
 "Plugins crashed"
 "Always run them in a separate process"
+"Sent to the Playlist (track {0}) where it was recorded"
+"Slave playback is off: the clip plays the take now"

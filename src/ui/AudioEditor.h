@@ -55,6 +55,10 @@ void openAudioEditorForInsert (AudioEngine& engine, int insert, int slot = -1);
 void openEdisonSlot (AudioEngine& engine, int track, int slot, bool record = false);
 // The same editor without a window (thumbnails, snapshots); nullptr when the slot is not an Edison.
 std::unique_ptr<juce::Component> makeEdisonSlotEditor (AudioEngine& engine, int track, int slot);
+// A file dragged out of an Edison slot's window was dropped on the Playlist: once a clip plays it, that slot's "Slave
+// playback to host" goes off, so the take is heard from the clip alone (the slot played it as well, from where it was
+// recorded). Any other file: nothing.
+void edisonTakeDropped (AudioEngine& engine, const juce::File& file);
 // Loads an Edison into the first empty slot of mixer track `track` (FL's "Open audio editor" of a mixer track).
 // `openAndRecord`: FL's "Open audio editor and record" settings (edisonfx::setOpenAndRecord: On play, 5 min, Append off,
 // Slave on); otherwise a fresh Edison. Returns the effect's index, or -1 when the track is full.
@@ -101,6 +105,8 @@ void startAudioEditorLoopRecordForTest (juce::Component& editor, int source);
 void drainAudioEditorRecordForTest (juce::Component& editor);
 // One turn of the editor's timer (what it does 30 times a second: follow a recording, the song's document).
 void tickAudioEditorForTest (juce::Component& editor);
+// The File menu's "Send to the Playlist as an audio clip" with the whole document (--edisonslottest).
+void sendAudioEditorToPlaylistForTest (juce::Component& editor);
 void stopAudioEditorRecordForTest (juce::Component& editor);
 audioedit::Document getAudioEditorDocumentForTest (const juce::Component& editor);
 audioedit::Range getAudioEditorSelectionForTest (const juce::Component& editor);

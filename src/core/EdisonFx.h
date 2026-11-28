@@ -142,9 +142,11 @@ public:
     Phase phase() const noexcept { return (Phase) shownPhase.load (std::memory_order_relaxed); }
     // The take reached the maximum recording time and Record went off by itself.
     bool reachedLimit() const noexcept { return limitHit.load (std::memory_order_relaxed); }
-    // Appends what was recorded since the last call; `jumps`: the take frames where the song position jumped.
-    // `takeFrames`: how many frames the take held before this call. Returns the frames appended.
-    int drain (std::vector<float>& l, std::vector<float>& r, std::vector<std::int64_t>& jumps, std::int64_t takeFrames);
+    // Appends what was recorded since the last call; `jumps`: the take frames where the song position jumped, and
+    // `jumpBeats` (when given) the song position there, in beats. `takeFrames`: how many frames the take held before
+    // this call. Returns the frames appended.
+    int drain (std::vector<float>& l, std::vector<float>& r, std::vector<std::int64_t>& jumps, std::int64_t takeFrames,
+               std::vector<double>* jumpBeats = nullptr);
     std::int64_t droppedFrames() const noexcept { return dropped.load (std::memory_order_relaxed); }
     float inputPeak() const noexcept { return meter.exchange (0.0f, std::memory_order_relaxed); }
 
@@ -153,8 +155,11 @@ public:
     void play (std::shared_ptr<const audioedit::Audio> clip, bool loop, float gain = 1.0f);
     // The frame of the clip being played, or −1.
     double playPosition() const noexcept { return shownPosition.load (std::memory_order_relaxed); }
-    // What slave mode plays: the whole content, and the content frame that sounds at song time 0.
-    void setContent (std::shared_ptr<const audioedit::Audio> content, std::int64_t offset);
+    // What slave mode plays: the whole content, and `offset`, the content frame that sounds at song time 0 (the
+    // editor's selection). Without a selection (or with Ignore own selection on), content frame `anchorFrame` sounds at
+    // song beat `anchorBeats`: where the take was recorded (its first "Song jump" marker, songAnchor).
+    void setContent (std::shared_ptr<const audioedit::Audio> content, std::int64_t offset, double anchorBeats = 0.0,
+                     std::int64_t anchorFrame = 0);
 
     static constexpr std::size_t ringCapacity = std::size_t (1) << 19; // ~11 s at 48 kHz between two drains
 
@@ -165,6 +170,8 @@ private:
         bool loop = false;
         float gain = 1.0f;
         std::int64_t offset = 0;
+        double anchorBeats = 0.0;
+        std::int64_t anchorFrame = 0;
     };
     bool tryLock() noexcept { return ! lock.test_and_set (std::memory_order_acquire); }
     void unlock() noexcept { lock.clear (std::memory_order_release); }
@@ -180,6 +187,8 @@ private:
     // recording (audio thread, except the atomics)
     Gate gate;
     std::atomic<bool> wantRecord { false }, limitHit { false };
+    std::atomic<std::uint32_t> takesAsked { 0 }; // (each Record on: a new take, even when the audio thread saw no "off")
+    std::uint32_t takesSeen = 0;
     bool recording = false;
     std::atomic<int> shownPhase { 0 };
     std::int64_t written = 0;
@@ -190,6 +199,7 @@ private:
     int prePos = 0, preCount = 0;
     static constexpr int jumpSlots = 64;
     std::int64_t jumpAt[jumpSlots] {};
+    double jumpBeatsAt[jumpSlots] {}; // (the song position of each, in beats)
     std::atomic<std::uint32_t> jumpWrite { 0 }, jumpRead { 0 };
     mutable std::atomic<float> meter { 0.0f };
 
@@ -206,11 +216,19 @@ private:
 // frames that get a "Song jump" marker (On play: where each stretch of playback starts, so frame 0 / the join too, and
 // every jump of the song).
 audioedit::Document withTake (const audioedit::Document& base, const audioedit::Audio& take, const std::vector<std::int64_t>& jumps,
-                              bool appendTake);
+                              bool appendTake, const std::vector<double>& jumpBeats = {});
 // The same with a take that is not needed afterwards (the end of a recording): without Append, it becomes the audio as it
 // is, no copy (a long take was copied four times as the recording stopped).
 audioedit::Document withTake (const audioedit::Document& base, audioedit::Audio&& take, const std::vector<std::int64_t>& jumps,
-                              bool appendTake);
+                              bool appendTake, const std::vector<double>& jumpBeats = {});
+// Where the document's audio was recorded in the song: its first "Song jump" marker (On play writes one where each
+// take starts, with the song position in Marker::time, in beats). False without one.
+bool songAnchor (const audioedit::Document& doc, double& beats, std::int64_t& frame);
+// The song position (beats) frame `frame` of the document was recorded at: counted from the last "Song jump" marker at
+// or before it (each take's start, and every jump of the song while it recorded); before the first one, counted back
+// from it (where slave playback plays that audio). False with no marker, or before the song's start; `bpm`: the
+// song's tempo then.
+bool songPositionOf (const audioedit::Document& doc, std::int64_t frame, double bpm, double& beats);
 
 // Message thread only.
 class Session
@@ -271,6 +289,7 @@ public:
 
 private:
     void changedDocument();
+    void setContentOf (Processor& p) const; // (what slave playback plays: the document, the selection, the anchor)
     audioedit::Audio take() const;
 
     std::uint64_t instance;
@@ -286,6 +305,7 @@ private:
     double takeRate = 44100.0;
     std::vector<float> takeL, takeR;
     std::vector<std::int64_t> jumps;
+    std::vector<double> jumpBeats; // (the song position at each jump, in beats)
     std::int64_t lost = 0;
 };
 

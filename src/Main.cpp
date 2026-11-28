@@ -23111,6 +23111,55 @@ private:
                 check ("long_take_is_the_document", session->document().audio.frames() == fed, juce::String (session->document().audio.frames()) + " frames of " + juce::String (fed));
             }
 
+            // Send to the Playlist (26.47.1: a take sent there was heard "where it is not"). A take recorded On play from bar
+            // 9 goes where it was recorded, and the slot stops playing it along with the song (Slave playback to host,
+            // which the mixer's "Open audio editor and record" turns on, played it from the song's start as well).
+            if (auto window = lynx::makeEdisonSlotEditor (engine, 1, at))
+            {
+                window->setSize (1120, 600);
+                engine.editSong ([at] (lynx::Song& s) {
+                    auto& fx = s.mixer[1].effects[(std::size_t) at];
+                    fx.params[ef::recordMode] = ef::modeValue (ef::Mode::onPlay);
+                    fx.params[ef::slave] = 1.0f;
+                    fx.params[ef::append] = 0.0f;
+                });
+                engine.dispatchPendingMessages();
+                const auto onPlay = slotOf().params;
+                check ("send_take_record_starts", session->start (p, false));
+                const auto bar9 = 32.0 * lynx::ppq;
+                const auto ticksPerBlock = 512.0 / rate * 2.0 * (double) lynx::ppq; // (120 BPM)
+                auto songAt = bar9;
+                for (int block = 0; block < (int) (rate * 2.0 / 512.0); ++block)
+                {
+                    fill (block);
+                    p->setSongPosition (songAt);
+                    p->setPlaying (true);
+                    p->process (l.data(), r.data(), 512, onPlay, 120.0);
+                    songAt += ticksPerBlock;
+                    if (block % 3 == 2) // (the window's timer, ~30 times a second: it follows the take)
+                        lynx::tickAudioEditorForTest (*window);
+                    if (block % 8 == 7)
+                        engine.pumpEdisonRecordings();
+                }
+                p->setPlaying (false);
+                session->stop();
+                lynx::tickAudioEditorForTest (*window);
+                engine.pumpEdisonRecordings();
+                double anchorBeats = -1.0;
+                std::int64_t anchorFrame = -1;
+                check ("send_take_knows_where_it_was_recorded", ef::songAnchor (session->document(), anchorBeats, anchorFrame) && anchorBeats == 32.0 && anchorFrame == 0,
+                       juce::String (anchorBeats) + " beats at frame " + juce::String (anchorFrame));
+                const auto clipsBefore = engine.getSong().playlist.size();
+                lynx::sendAudioEditorToPlaylistForTest (*window);
+                const auto& sent = engine.getSong();
+                const auto* clip = sent.playlist.size() == clipsBefore + 1 ? &sent.playlist.back() : nullptr;
+                check ("sent_take_goes_where_it_was_recorded", clip != nullptr && clip->start == (std::int64_t) bar9,
+                       clip != nullptr ? "at tick " + juce::String (clip->start) + ", bar 9 is " + juce::String ((std::int64_t) bar9) : juce::String ("no clip"));
+                check ("sent_take_is_not_played_by_the_slot_as_well", slotOf().params[ef::slave] < 0.5f);
+                engine.undo();
+                check ("undo_takes_the_clip_away_and_slave_playback_back", engine.getSong().playlist.size() == clipsBefore && slotOf().params[ef::slave] >= 0.5f);
+            }
+
             // deleting the slot leaves the song without it (the file stays for the unused-recordings prompt)
             engine.editSong ([at] (lynx::Song& s) { s.mixer[1].effects.erase (s.mixer[1].effects.begin() + at); });
             engine.dispatchPendingMessages();

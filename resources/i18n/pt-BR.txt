@@ -12063,3 +12063,7 @@ countries: br
 "Reload starts them again with the settings from the last save or backup (a plugin that crashed on its saved settings stays off)." = "Recarregar inicia os plugins de novo com os ajustes do último salvamento ou backup (um plugin que travou com os ajustes salvos fica desligado)."
 "Plugins crashed" = "Plugins travaram"
 "Always run them in a separate process" = "Sempre rodá-los em um processo separado"
+
+# Edison: a take on the Playlist plays from its clip (AudioEditor sendToPlaylist / edisonTakeDropped)
+"Sent to the Playlist (track {0}) where it was recorded" = "Enviado para a Playlist (trilha {0}) onde foi gravado"
+"Slave playback is off: the clip plays the take now" = "A sincronização da reprodução com o host foi desligada: agora o clipe toca o take"

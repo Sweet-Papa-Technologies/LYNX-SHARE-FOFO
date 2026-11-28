@@ -974,6 +974,7 @@ bool parseMarkers (const std::uint8_t* data, std::size_t size, Document& out, st
         std::uint32_t id = 0, position = 0, length = 0;
         std::string name;
         int key = -1;
+        double time = 0.0;
     };
     std::vector<Cue> cues;
     gotAny = false;
@@ -1067,6 +1068,19 @@ bool parseMarkers (const std::uint8_t* data, std::size_t size, Document& out, st
                         c->key = t[13] < 128 ? (int) t[13] : -1;
                 }
             }
+            else if (pass == 1 && std::memcmp (tag, "lxbt", 4) == 0 && len >= 4) // the markers' song positions (Marker::time)
+            {
+                const auto count = (std::size_t) get32 (data + body);
+                for (std::size_t i = 0; i < count && 4 + (i + 1) * 12 <= len; ++i)
+                {
+                    const auto* t = data + body + 4 + i * 12;
+                    const auto bits = (std::uint64_t) get32 (t + 4) | ((std::uint64_t) get32 (t + 8) << 32);
+                    double beats = 0.0;
+                    std::memcpy (&beats, &bits, sizeof beats);
+                    if (auto* c = findCue (get32 (t)); c != nullptr && std::isfinite (beats))
+                        c->time = beats;
+                }
+            }
             else if (pass == 1 && std::memcmp (tag, "lxkn", 4) == 0) // round 190ee: LYNX 0.1.27's own chunk (read only)
             {
                 for (std::size_t q = body; q + 8 <= body + len; q += 8)
@@ -1087,6 +1101,7 @@ bool parseMarkers (const std::uint8_t* data, std::size_t size, Document& out, st
         m.end = std::min<std::int64_t> (m.start + c.length, (std::int64_t) frames);
         m.name = c.name;
         m.keyNum = c.key;
+        m.time = c.time;
         out.markers.push_back (std::move (m));
         gotAny = true;
     }
@@ -1269,6 +1284,24 @@ std::vector<std::uint8_t> encodeWav (const Document& doc, WavFormat format)
                     o.push_back (0);
                     put32 (o, 0);
                     put32 (o, 0);
+                }
+            endChunk (o, at);
+        }
+
+        // LYNX's own chunk: the markers' song positions (Marker::time, in beats; Edison's "Song jump" markers are where
+        // each take was recorded, which slave playback and Send to the Playlist follow). Only when one has a position.
+        if (std::any_of (doc.markers.begin(), doc.markers.end(), [] (const Marker& m) { return m.time != 0.0; }))
+        {
+            at = beginChunk (o, "lxbt");
+            put32 (o, (std::uint32_t) std::count_if (doc.markers.begin(), doc.markers.end(), [] (const Marker& m) { return m.time != 0.0; }));
+            for (std::size_t i = 0; i < doc.markers.size(); ++i)
+                if (doc.markers[i].time != 0.0)
+                {
+                    std::uint64_t bits = 0;
+                    std::memcpy (&bits, &doc.markers[i].time, sizeof bits);
+                    put32 (o, (std::uint32_t) i + 1); // the cue id
+                    put32 (o, (std::uint32_t) (bits & 0xffffffffu));
+                    put32 (o, (std::uint32_t) (bits >> 32));
                 }
             endChunk (o, at);
         }
