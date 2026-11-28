@@ -657,6 +657,16 @@ public:
     int placeRecoveredTakes (const std::vector<takes::Journal>& recovered);
     // Leaves them as files only (their journals are removed).
     void forgetInterruptedTakes (const std::vector<takes::Journal>& recovered);
+    // Edison takes that were still recording when LYNX stopped (a crash, a forced end, closed while recording): their
+    // "<name>_Edison (recording).wav" safety files, repaired. Those listed in the settings folder while they were
+    // written, and any in the given folders (the default recordings folder always); not this session's own. UI thread.
+    std::vector<juce::File> leftoverEdisonTakes (const std::vector<juce::File>& folders);
+    // One of them kept as an ordinary recording ("... (recovered).wav"), no longer offered: the file it is now.
+    juce::File keepLeftoverEdisonTake (const juce::File& safetyFile);
+    // --edisonslottest: the safety files as a crash leaves them (no final header, still listed; this engine forgets
+    // them), and as the engine's end closes them
+    void abandonEdisonSafetyFilesForTest();
+    void closeEdisonSafetyFilesForTest() { closeEdisonSafetyFiles(); }
 
     // --- external audio input through the mixer (REA_rodada88) ---
     // Names of the open device's input channels (all of them, open or not); empty without an input device.
@@ -1725,6 +1735,7 @@ private:
     };
     std::vector<EdisonSafetyFile> edisonSafety;
     void writeEdisonSafetyFiles();
+    void closeEdisonSafetyFiles(); // (the engine goes)
     juce::File newEdisonRecordingFile (const juce::String& suffix = {}) const;
     void keepOrphanedEdisonTake (edisonfx::Session& session);
     juce::File recordingFolder = defaultRecordingFolder();

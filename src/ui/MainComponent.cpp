@@ -8357,6 +8357,56 @@ void MainComponent::startSession()
         if (safe != nullptr)
             safe->checkInterruptedTakes();
     });
+    // and Edison takes that were recording then (after that offer: each waits while a dialog is open)
+    juce::Timer::callAfterDelay (4500, [safe = juce::Component::SafePointer<MainComponent> (this)] {
+        if (safe != nullptr)
+            safe->checkLeftoverEdisonTakes();
+    });
+}
+
+void MainComponent::checkLeftoverEdisonTakes()
+{
+    if (juce::Component::getCurrentlyModalComponent() != nullptr) // a dialog is open (the backup offer): ask later
+    {
+        juce::Timer::callAfterDelay (2000, [safe = juce::Component::SafePointer<MainComponent> (this)] {
+            if (safe != nullptr)
+                safe->checkLeftoverEdisonTakes();
+        });
+        return;
+    }
+    // An Edison take lives in memory until it stops; while it records it is also written to a safety file, which goes
+    // once the take is in its own file. One still there was recording when LYNX stopped: it is the take.
+    const auto files = engine.leftoverEdisonTakes ({ engine.getRecordingFolder() });
+    if (files.empty())
+        return;
+    juce::StringArray names;
+    for (const auto& f : files)
+        names.add (f.getFileName());
+    platform::testModeLog ("leftover Edison takes: " + names.joinIntoString (", "));
+    auto* w = new juce::AlertWindow (tr ("Edison recording recovered"),
+                                     tr ("LYNX SHARE stopped while Edison was recording. The take was kept and repaired:\n{0}\n\nOpen it in Edison?",
+                                         { names.joinIntoString ("\n") }),
+                                     juce::MessageBoxIconType::InfoIcon);
+    w->addButton (tr ("Open in Edison"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+    w->addButton (tr ("Show the folder"), 2);
+    w->addButton (tr ("Keep the files only"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    w->enterModalState (true, juce::ModalCallbackFunction::create ([safe = juce::Component::SafePointer<MainComponent> (this), files] (int result) {
+                            if (safe == nullptr)
+                                return;
+                            // whichever the answer, each becomes an ordinary recording: not offered again
+                            std::vector<juce::File> kept;
+                            for (const auto& f : files)
+                                kept.push_back (safe->engine.keepLeftoverEdisonTake (f));
+                            if (result == 1)
+                                for (const auto& f : kept)
+                                    openAudioEditor (safe->engine, f);
+                            else if (result == 2)
+                                kept.front().revealToUser();
+                            if (result != 1)
+                                ui::postHint ({ tr ("Kept as {0}", { kept.front().getFileName() }), kept.front().getParentDirectory().getFullPathName(), false, false },
+                                              8000);
+                        }),
+                        true);
 }
 
 void MainComponent::checkInterruptedTakes()

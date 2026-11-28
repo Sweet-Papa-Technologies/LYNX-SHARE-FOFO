@@ -726,6 +726,7 @@ AudioEngine::~AudioEngine()
         take->writer.close();
     }
     openTakes.clear();
+    closeEdisonSafetyFiles();
 
     recordThread.stopThread (2000);
     prefetcher = nullptr;
@@ -2200,6 +2201,23 @@ namespace
 {
 juce::File recordingSettingsFile() { return PluginHost::settingsFolder().getChildFile ("recording.txt"); }
 juce::File inProgressFile() { return PluginHost::settingsFolder().getChildFile ("recordings-in-progress.txt"); }
+// the Edison safety files being written (AudioEngine::writeEdisonSafetyFiles): found at the next start if LYNX stops
+juce::File edisonInProgressFile() { return PluginHost::settingsFolder().getChildFile ("edison-recordings-in-progress.txt"); }
+
+void listEdisonSafetyFile (const juce::File& file, bool add)
+{
+    const auto list = edisonInProgressFile();
+    juce::StringArray paths (juce::StringArray::fromLines (list.loadFileAsString()));
+    paths.removeEmptyStrings();
+    if (add)
+        paths.addIfNotAlreadyThere (file.getFullPathName());
+    else
+        paths.removeString (file.getFullPathName());
+    if (paths.isEmpty())
+        list.deleteFile();
+    else if (list.getParentDirectory().createDirectory().wasOk())
+        list.replaceWithText (paths.joinIntoString ("\n"));
+}
 
 AudioEngine::RecordingSettings loadRecordingSettings()
 {
@@ -7146,6 +7164,8 @@ void AudioEngine::writeEdisonSafetyFiles()
             f.writer = std::make_unique<takes::WavTakeWriter>();
             if (! f.writer->open (f.file.getFullPathName().toStdString(), s->takeSampleRate(), 2, takes::SampleFormat::float32))
                 f.writer.reset(); // (not tried again for this take)
+            else
+                listEdisonSafetyFile (f.file, true); // (the next start offers it if LYNX stops before it goes)
             edisonSafety.push_back (std::move (f));
             it = edisonSafety.end() - 1;
         }
@@ -7182,11 +7202,79 @@ void AudioEngine::writeEdisonSafetyFiles()
         if (! it->session->recording() && ! it->session->dirty())
         {
             it->file.deleteFile();
+            listEdisonSafetyFile (it->file, false);
             it = edisonSafety.erase (it);
         }
         else
             ++it;
     }
+}
+
+void AudioEngine::closeEdisonSafetyFiles()
+{
+    // LYNX closes: what came in since the last pump is written, and every file is closed with its final header. A take
+    // still recording keeps its file (the next start offers it); a take saved in its own file since the last pump
+    // (Save, then quit at once) has nothing left to keep.
+    writeEdisonSafetyFiles();
+    for (auto& f : edisonSafety)
+    {
+        if (f.writer != nullptr)
+            f.writer->close();
+        f.writer.reset();
+        if (! f.session->recording() && ! f.session->dirty())
+        {
+            f.file.deleteFile();
+            listEdisonSafetyFile (f.file, false);
+        }
+    }
+    edisonSafety.clear();
+}
+
+void AudioEngine::abandonEdisonSafetyFilesForTest()
+{
+    for (auto& f : edisonSafety)
+        if (f.writer != nullptr)
+            f.writer->abandon();
+    edisonSafety.clear();
+}
+
+std::vector<juce::File> AudioEngine::leftoverEdisonTakes (const std::vector<juce::File>& folders)
+{
+    juce::StringArray paths (juce::StringArray::fromLines (edisonInProgressFile().loadFileAsString()));
+    auto where = folders;
+    where.push_back (defaultRecordingFolder());
+    for (const auto& folder : where)
+        for (const auto& f : folder.findChildFiles (juce::File::findFiles, false, "*_Edison (recording)*.wav"))
+            paths.addIfNotAlreadyThere (f.getFullPathName());
+    paths.removeEmptyStrings();
+
+    std::vector<juce::File> out;
+    for (const auto& path : paths)
+    {
+        const juce::File file (path);
+        if (std::any_of (edisonSafety.begin(), edisonSafety.end(), [&file] (const EdisonSafetyFile& f) { return f.file == file; }))
+            continue; // (this session's own)
+        if (! file.existsAsFile())
+        {
+            listEdisonSafetyFile (file, false); // (deleted or moved by hand)
+            continue;
+        }
+        // (a crash leaves the header's lengths as they were at its last sync: set from the file's size)
+        std::int64_t frames = 0;
+        if (takes::repairWav (file.getFullPathName().toStdString(), &frames) && frames > 0)
+            out.push_back (file);
+    }
+    return out;
+}
+
+juce::File AudioEngine::keepLeftoverEdisonTake (const juce::File& safetyFile)
+{
+    listEdisonSafetyFile (safetyFile, false);
+    auto name = safetyFile.getFileNameWithoutExtension().replace (" (recording)", " (recovered)");
+    if (name == safetyFile.getFileNameWithoutExtension())
+        name << " (recovered)";
+    const auto kept = safetyFile.getParentDirectory().getNonexistentChildFile (name, ".wav", false);
+    return safetyFile.moveFileTo (kept) ? kept : safetyFile;
 }
 
 juce::File AudioEngine::newEdisonRecordingFile (const juce::String& suffix) const
