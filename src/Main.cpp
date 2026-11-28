@@ -13679,6 +13679,7 @@ private:
 
             void first()
             {
+                started = lastTurn = now(); // (the 5-minute limit counts from here, not from the computer's start)
                 startTimer (5);
                 // the project that is open: saved, so it has a file of its own
                 ui->saveForTest (project, [this] {
