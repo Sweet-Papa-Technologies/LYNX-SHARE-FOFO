@@ -12050,6 +12050,8 @@ countries: br
 "File:" = "Arquivo:"
 "Stems:" = "Stems:"
 
+# A .lynx opened behind the progress panel
+"Reading the samples and recordings..." = "Lendo os samples e as gravações..."
 # Plugin crashes gathered in one prompt
 "with {0}" = "com {0}"
 "These plugins crashed and were switched off (an effect is bypassed, an instrument stays silent): {0}." = "Estes plugins travaram e foram desligados (um efeito fica em bypass, um instrumento fica em silêncio): {0}."

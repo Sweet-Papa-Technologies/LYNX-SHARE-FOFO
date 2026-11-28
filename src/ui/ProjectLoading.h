@@ -6,6 +6,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "engine/AudioEngine.h"
+#include "engine/ProjectFile.h"
 
 namespace lynx
 {
@@ -25,7 +26,14 @@ namespace lynx
 void openFlpWithProgress (juce::Component& parent, AudioEngine& engine, const juce::File& file,
                           std::function<void (bool ok, const juce::String& error)> done);
 
-// True while an open started by openFlpWithProgress is running (a second open is refused meanwhile).
+// A LYNX project (.lynx) the same way: read and parsed, its samples decoded and its Edison recordings read on a thread,
+// its hosted plugins created one per message-loop turn, then the rack. It used to run in one block on the message thread
+// (the window froze for 108 s on a project with long Edison recordings). `withoutPlugins`: File › Open without
+// third-party plugins. `done` gets what ProjectFile::load read besides the song.
+void openLynxWithProgress (juce::Component& parent, AudioEngine& engine, const juce::File& file, bool withoutPlugins,
+                           std::function<void (bool ok, const juce::String& error, const juce::String& savedBy, const ProjectFile::WindowLayout& layout)> done);
+
+// True while an open started by openFlpWithProgress / openLynxWithProgress is running (a second open is refused meanwhile).
 bool projectLoadRunning();
 
 // Drops an open in progress (the main window is closing): its thread is joined before the engine goes away.

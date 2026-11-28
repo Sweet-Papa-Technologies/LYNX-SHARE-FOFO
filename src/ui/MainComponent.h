@@ -322,6 +322,7 @@ private:
     void importFlp (const juce::File& file);
     void flpImported (const juce::File& file); // after the import: title, recent files, missing files
     void openLynxProject (const juce::File& file, bool withoutPlugins = false);
+    void lynxProjectOpened (const juce::File& file, const juce::String& savedBy, const ProjectFile::WindowLayout& layout);
     // round 190ap: "Open without third-party plugins" (File menu; --no-plugins on the command line): the project opens
     // with every hosted plugin switched off, its settings kept; the panel switches them back on
     void chooseFileToOpenWithoutPlugins();

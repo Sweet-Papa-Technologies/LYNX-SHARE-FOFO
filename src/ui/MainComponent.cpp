@@ -9069,6 +9069,30 @@ void MainComponent::showPluginsOff()
 
 void MainComponent::openLynxProject (const juce::File& file, bool withoutPlugins)
 {
+    withoutPlugins = withoutPlugins || std::exchange (nextOpenWithoutPlugins, false);
+    if (persistent)
+    {
+        // behind the progress panel (as an FL project): the file is read and its samples and recordings decoded on a
+        // thread, the plugins are created one by one with their names shown. In one block on the message thread it
+        // froze the window for minutes on a project with long Edison recordings, and input reached the half-built rack.
+        if (projectLoadRunning())
+            return;
+        openLynxWithProgress (*this, engine, file, withoutPlugins,
+                              [safe = juce::Component::SafePointer<MainComponent> (this), file] (bool ok, const juce::String& error,
+                                                                                                 const juce::String& savedBy, const ProjectFile::WindowLayout& layout) {
+                                  if (safe == nullptr)
+                                      return;
+                                  if (! ok)
+                                  {
+                                      juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
+                                      return;
+                                  }
+                                  safe->lynxProjectOpened (file, savedBy, layout);
+                              });
+        return;
+    }
+
+    // (command-line modes open synchronously: they read the song right after)
     juce::String error, savedBy;
     ProjectFile::WindowLayout layout; // round 190mr (DF-141)
     auto song = ProjectFile::load (file, error, &savedBy, &layout);
@@ -9078,10 +9102,10 @@ void MainComponent::openLynxProject (const juce::File& file, bool withoutPlugins
         juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
         return;
     }
-    withoutPlugins = withoutPlugins || std::exchange (nextOpenWithoutPlugins, false);
 
     engine.stop();
     engine.rewind();
+    engine.getPluginHost().clearLoadFailures(); // (another project's failures are not this one's)
     if (withoutPlugins)
     {
         // round 190ap: no hosted plugin is created and no slot is changed (no substitutes either): each keeps the
@@ -9094,6 +9118,12 @@ void MainComponent::openLynxProject (const juce::File& file, bool withoutPlugins
         engine.getPluginHost().applySubstitutes (*song);
         engine.setSong (std::move (*song));
     }
+    lynxProjectOpened (file, savedBy, layout);
+}
+
+// The open project is the .lynx `file` now (either way of opening it): what follows an open.
+void MainComponent::lynxProjectOpened (const juce::File& file, const juce::String& savedBy, const ProjectFile::WindowLayout& layout)
+{
     currentFile = file;
     importedFlpFile = juce::File();
     projectName = file.getFileNameWithoutExtension();

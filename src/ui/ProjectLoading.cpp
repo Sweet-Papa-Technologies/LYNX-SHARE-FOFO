@@ -8,6 +8,7 @@
 #include "flp/Flp.h"
 #include "core/AlsImport.h"
 #include "core/DawProject.h"
+#include "engine/ProjectFile.h"
 #include "ui/I18n.h"
 #include "ui/Theme.h"
 #include "ui/Toolbar.h"
@@ -23,8 +24,25 @@ LoadPanel* current = nullptr; // message thread
 class LoadPanel final : public juce::Component, private juce::Timer
 {
 public:
+    using NativeDone = std::function<void (bool ok, const juce::String& error, const juce::String& savedBy, const ProjectFile::WindowLayout& layout)>;
+
     LoadPanel (juce::Component& parent, AudioEngine& e, juce::File f, std::function<void (bool, const juce::String&)> d)
         : engine (e), file (std::move (f)), done (std::move (d))
+    {
+        begin (parent);
+        startScan();
+    }
+
+    // a LYNX project (.lynx): read and decoded on a thread, its plugins one per turn, then the rack
+    LoadPanel (juce::Component& parent, AudioEngine& e, juce::File f, bool noPlugins, NativeDone d)
+        : engine (e), file (std::move (f)), native (true), nativeDone (std::move (d))
+    {
+        preparedSong.withoutPlugins = noPlugins;
+        begin (parent);
+        startNativeRead();
+    }
+
+    void begin (juce::Component& parent)
     {
         running = true;
         current = this;
@@ -42,7 +60,6 @@ public:
             skipButton.setVisible (false);
         };
         addChildComponent (skipButton);
-        startScan();
         startTimerHz (30);
     }
 
@@ -100,6 +117,8 @@ private:
     enum class Step
     {
         scanning,
+        reading,  // a .lynx: the file read and parsed (a thread)
+        decoding, // a .lynx: its samples and recordings (a thread)
         preparing,
         modules, // slow plugin modules still starting on their own thread (round 121)
         plugins,
@@ -198,6 +217,67 @@ private:
         });
     }
 
+    // a .lynx: 1. read and parse (a thread)
+    void startNativeRead()
+    {
+        PluginHost::newOpen();
+        step = Step::reading;
+        stageDone = false;
+        worker = std::thread ([this] {
+            try
+            {
+                juce::String error;
+                if (auto song = ProjectFile::load (file, error, &savedBy, &layout))
+                {
+                    preparedSong.song = std::move (*song);
+                    nativeOk = true;
+                }
+                else
+                    nativeError = error.isNotEmpty() ? error : juce::String ("could not read the project");
+            }
+            catch (const std::exception& e) // (a thread must not end LYNX: std::bad_alloc on a huge file, for one)
+            {
+                nativeError = juce::String ("could not read the project: ") + e.what();
+            }
+            stageDone = true;
+        });
+    }
+
+    // 2. the slow plugin modules start (message thread), the samples and recordings decode (a thread)
+    void startNativeDecode()
+    {
+        if (worker.joinable())
+            worker.join();
+        if (! preparedSong.withoutPlugins)
+        {
+            std::vector<PluginRef> refs;
+            for (const auto& c : preparedSong.song.channels)
+                if (c.instrument == InstrumentKind::plugin && ! c.plugin.id.empty())
+                    refs.push_back (c.plugin);
+            for (const auto& track : preparedSong.song.mixer)
+                for (const auto& fx : track.effects)
+                    if (fx.kind == EffectKind::plugin && ! fx.plugin.id.empty())
+                        refs.push_back (fx.plugin);
+            engine.getPluginHost().startModulesFor (refs);
+        }
+        step = Step::decoding;
+        stageDone = false;
+        loadtrace::stage (0.10, 0.55, TR_NOOP ("Reading the samples and recordings..."));
+        refresh();
+        worker = std::thread ([this] {
+            try
+            {
+                AudioEngine::prepareSong (engine.getSampleLibrary(), preparedSong);
+            }
+            catch (const std::exception& e)
+            {
+                nativeOk = false;
+                nativeError = juce::String ("could not read the project's audio: ") + e.what();
+            }
+            stageDone = true;
+        });
+    }
+
     void timerCallback() override
     {
         // round 169g (crash reports, 5 in 3 days): a plugin that runs the message loop while it is created or prepared
@@ -219,12 +299,23 @@ private:
             setBounds (parent->getLocalBounds()); // (the main window may still be settling its size at start-up)
         if (step == Step::scanning && stageDone)
             startPrepare();
-        else if (step == Step::preparing && stageDone)
+        else if (step == Step::reading && stageDone)
         {
             worker.join();
-            if (! prepared.ok)
+            if (! nativeOk)
             {
-                finish (false, prepared.error);
+                finish (false, nativeError);
+                return;
+            }
+            startNativeDecode();
+            return;
+        }
+        else if ((step == Step::preparing || step == Step::decoding) && stageDone)
+        {
+            worker.join();
+            if (native ? ! nativeOk : ! prepared.ok)
+            {
+                finish (false, native ? nativeError : prepared.error);
                 return;
             }
             step = Step::modules;
@@ -257,7 +348,8 @@ private:
             step = Step::plugins;
             // each hosted plugin named as it is created (also the ones the VST3 automation remap creates first)
             engine.getPluginHost().onInstantiate = [this] (const juce::String& name) {
-                const auto total = juce::jmax ((int) (prepared.adopted ? prepared.pluginQueue.size() : prepared.uses.size()), created + 1);
+                const auto queued = native ? preparedSong.pluginQueue.size() : prepared.adopted ? prepared.pluginQueue.size() : prepared.uses.size();
+                const auto total = juce::jmax ((int) queued, created + 1);
                 loadtrace::step (created, total, name.toStdString(), created + 1);
                 ++created;
                 refresh();
@@ -268,7 +360,7 @@ private:
         else if (step == Step::plugins)
         {
             // 3. one hosted plugin per turn, so the panel repaints between them
-            if (! engine.preloadNextPlugin (prepared))
+            if (! (native ? engine.preloadNextSongPlugin (preparedSong) : engine.preloadNextPlugin (prepared)))
             {
                 step = Step::finishing;
                 loadtrace::stage (0.90, 0.99, TR_NOOP ("Building the mixer..."));
@@ -279,6 +371,12 @@ private:
         else if (step == Step::finishing)
         {
             // 4. the rack (everything decoded and created already)
+            if (native)
+            {
+                engine.finishSong (std::move (preparedSong));
+                finish (true, {});
+                return;
+            }
             const auto ok = engine.finishFlpImport (std::move (prepared), false);
             finish (ok, ok ? juce::String() : juce::String ("could not import the project"));
             return;
@@ -319,10 +417,16 @@ private:
         writeLoadLog();
         auto callback = std::move (done);
         // the panel goes first (the callback may open dialogs over the main window)
-        juce::MessageManager::callAsync ([callback, ok, error] {
-            if (callback)
-                callback (ok, error);
-        });
+        if (native)
+            juce::MessageManager::callAsync ([callback = std::move (nativeDone), ok, error, savedBy = savedBy, layout = layout] {
+                if (callback)
+                    callback (ok, error, savedBy, layout);
+            });
+        else
+            juce::MessageManager::callAsync ([callback, ok, error] {
+                if (callback)
+                    callback (ok, error);
+            });
         running = false;
         delete this;
     }
@@ -331,6 +435,13 @@ private:
     juce::File file;
     std::function<void (bool, const juce::String&)> done;
     AudioEngine::PreparedFlp prepared;
+    // a .lynx
+    bool native = false;
+    NativeDone nativeDone;
+    AudioEngine::PreparedSong preparedSong;
+    juce::String savedBy, nativeError;           // (written by the worker, read after it is joined)
+    ProjectFile::WindowLayout layout;
+    std::atomic<bool> nativeOk { false };
     std::thread worker;
     std::atomic<bool> stageDone { false }, abort { false };
     bool resumeBackground = false;
@@ -352,6 +463,14 @@ void openFlpWithProgress (juce::Component& parent, AudioEngine& engine, const ju
     if (running)
         return;
     new LoadPanel (parent, engine, file, std::move (done)); // owned by itself (deleted when finished)
+}
+
+void openLynxWithProgress (juce::Component& parent, AudioEngine& engine, const juce::File& file, bool withoutPlugins,
+                           std::function<void (bool ok, const juce::String& error, const juce::String& savedBy, const ProjectFile::WindowLayout& layout)> done)
+{
+    if (running)
+        return;
+    new LoadPanel (parent, engine, file, withoutPlugins, std::move (done)); // owned by itself (deleted when finished)
 }
 
 bool projectLoadRunning()

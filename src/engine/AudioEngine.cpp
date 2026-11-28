@@ -3837,7 +3837,8 @@ std::vector<std::string> songSamplePaths (const Song& song)
     }
     for (const auto& track : song.mixer)
         for (const auto& fx : track.effects)
-            addPath (fx.samplePath);
+            if (fx.kind != EffectKind::edison) // (Edison reads its own WAV file: decoded here too, a long recording was read
+                addPath (fx.samplePath);       // twice and written to the stream cache as the project opened)
     return paths;
 }
 
@@ -5126,6 +5127,81 @@ bool AudioEngine::finishFlpImport (PreparedFlp&& prepared, bool asEdit)
     for (const auto& line : plugins.getLoadFailures())
         missingPluginDetails.push_back ({ line.toStdString(), {}, TR_NOOP ("Silence: the plugin is installed but did not load") });
     return true;
+}
+
+void AudioEngine::prepareSong (SampleLibrary& library, PreparedSong& prepared)
+{
+    {
+        const loadtrace::Scope timing ("samples");
+        prepared.decoded = decodeSamplesInParallel (library, prepared.song);
+    }
+    const loadtrace::Scope timing ("edison");
+    // (a session is made, read and only then registered; the rack build finds it instead of reading the file itself)
+    const auto fallback = [&library] (const std::string& path) { return library.load (juce::String::fromUTF8 (path.c_str())); };
+    for (const auto& track : prepared.song.mixer)
+        for (const auto& fx : track.effects)
+            if (fx.kind == EffectKind::edison)
+                if (auto session = edisonfx::sessionFor (fx, fallback))
+                    prepared.edison.push_back (std::move (session));
+}
+
+bool AudioEngine::preloadNextSongPlugin (PreparedSong& prepared)
+{
+    if (! prepared.adopted)
+    {
+        prepared.adopted = true;
+        const auto t = std::chrono::steady_clock::now();
+        // (another project's "without third-party plugins" hold ends in setSong, which then creates them all itself)
+        const auto preloading = ! prepared.withoutPlugins && ! pluginsHeld();
+        if (preloading)
+        {
+            plugins.clearPreloaded();
+            plugins.setPreloadRate (transport.sampleRate.load());
+        }
+        if (! prepared.withoutPlugins) // missing plugins get their LYNX substitute; substitutes whose original is installed go back to it
+            plugins.applySubstitutes (prepared.song);
+        loadtrace::add ("substitutes", loadtrace::msSince (t));
+        if (! preloading)
+            return false;
+        // the hosted plugins the rack will create, in its order (channels, then inserts)
+        for (const auto& c : prepared.song.channels)
+            if (c.instrument == InstrumentKind::plugin && ! c.plugin.id.empty() && ! plugins.playedElsewhere (c.plugin))
+                prepared.pluginQueue.push_back (c.plugin);
+        for (const auto& track : prepared.song.mixer)
+            for (std::size_t i = 0; i < track.effects.size() && i < (std::size_t) maxEffectSlots; ++i)
+                if (track.effects[i].kind == EffectKind::plugin && ! track.effects[i].plugin.id.empty() && ! plugins.playedElsewhere (track.effects[i].plugin))
+                    prepared.pluginQueue.push_back (track.effects[i].plugin);
+    }
+    if (prepared.pluginsDone >= prepared.pluginQueue.size())
+        return false;
+    const auto total = (int) prepared.pluginQueue.size();
+    const auto& ref = prepared.pluginQueue[prepared.pluginsDone];
+    auto wanted = 0;
+    for (std::size_t i = 0; i <= prepared.pluginsDone; ++i)
+        wanted += prepared.pluginQueue[i].id == ref.id && prepared.pluginQueue[i].state == ref.state ? 1 : 0;
+    plugins.preload (ref, wanted);
+    ++prepared.pluginsDone;
+    loadtrace::step ((int) prepared.pluginsDone, total, {});
+    return prepared.pluginsDone < prepared.pluginQueue.size();
+}
+
+void AudioEngine::finishSong (PreparedSong&& prepared)
+{
+    if (! prepared.adopted && ! prepared.withoutPlugins) // (nothing was preloaded: the substitutes still apply)
+        plugins.applySubstitutes (prepared.song);
+    plugins.clearLoadFailures(); // (what failed in the project open before is not this one's)
+    {
+        const loadtrace::Scope timing ("set_song");
+        stop();
+        rewind();
+        if (prepared.withoutPlugins)
+            setSongWithPluginsOff (std::move (prepared.song));
+        else
+            setSong (std::move (prepared.song));
+    }
+    plugins.clearPreloaded(); // (any left over: a slot the rack did not use)
+    prepared.decoded.clear();
+    prepared.edison.clear(); // (the slots hold their sessions now)
 }
 
 bool AudioEngine::importFlpFile (const juce::File& file, juce::String& error, const std::map<std::string, std::string>& relocations, bool asEdit)
