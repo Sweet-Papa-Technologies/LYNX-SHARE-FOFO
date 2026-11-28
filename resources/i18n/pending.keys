@@ -12,3 +12,7 @@
 "Reload starts them again with the settings from the last save or backup (a plugin that crashed on its saved settings stays off)."
 "Plugins crashed"
 "Always run them in a separate process"
+"Edison recording recovered"
+"LYNX SHARE stopped while Edison was recording. The take was kept and repaired:\n{0}\n\nOpen it in Edison?"
+"Open in Edison"
+"Kept as {0}"

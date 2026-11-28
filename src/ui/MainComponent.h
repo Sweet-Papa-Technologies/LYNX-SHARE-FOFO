@@ -588,6 +588,7 @@ private:
     void startSession();                              // crash detection: a marker that a clean exit removes
     void checkPreviousSession (juce::Time sessionStart);
     void checkInterruptedTakes(); // round 163: takes left by a crash while recording
+    void checkLeftoverEdisonTakes(); // Edison takes left by a crash while recording (their safety files)
     void quickRecordAudio();      // round 163: one key from "record" to a clip
     std::unique_ptr<juce::InterProcessLock> sessionLock;
     juce::File sessionMarker;

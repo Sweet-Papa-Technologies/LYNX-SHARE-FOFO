@@ -23109,6 +23109,69 @@ private:
                                   + " ms, longest " + juce::String (longest, 1) + " ms";
                 check ("long_take_followed_at_the_same_cost", fed >= frames && late < 4.0 * juce::jmax (early, 0.25) && longest < 250.0, note);
                 check ("long_take_is_the_document", session->document().audio.frames() == fed, juce::String (session->document().audio.frames()) + " frames of " + juce::String (fed));
+
+                // A take LYNX never stopped (a crash, a forced end): its safety file is listed while it is written, and
+                // the next start finds it, repaired, and keeps it as an ordinary recording once offered.
+                const auto inProgress = lynx::PluginHost::settingsFolder().getChildFile ("edison-recordings-in-progress.txt");
+                const auto listed = [&inProgress] (const juce::File& f) {
+                    return juce::StringArray::fromLines (inProgress.loadFileAsString()).contains (f.getFullPathName());
+                };
+                const auto recordFor = [&] (double seconds) {
+                    std::int64_t n = 0;
+                    for (int block = 0; n < (std::int64_t) (rate * seconds); ++block)
+                    {
+                        fill (block);
+                        p->process (l.data(), r.data(), 512, liveParams, 120.0);
+                        n += 512;
+                        if (block % 8 == 7)
+                            engine.pumpEdisonRecordings();
+                    }
+                    engine.pumpEdisonRecordings();
+                    return n;
+                };
+                check ("crashed_take_record_starts", session->start (p, false));
+                const auto crashedFed = recordFor (3.0);
+                const auto crashed = recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav");
+                check ("crashed_take_listed_while_it_records", crashed.size() == 1 && listed (crashed[0]), juce::String (crashed.size()) + " file(s)");
+                engine.abandonEdisonSafetyFilesForTest(); // (as a crash leaves it: no final header, still listed)
+                session->stop();
+                lynx::tickAudioEditorForTest (*window);
+                engine.pumpEdisonRecordings();
+                if (crashed.size() == 1)
+                {
+                    lynx::AudioEngine next (false); // the next start
+                    // (the default recordings folder is looked in too: what other runs left there may be found as well)
+                    const auto offered = [&next, &recorded] (const juce::File& f) {
+                        const auto found = next.leftoverEdisonTakes ({ recorded });
+                        return std::find (found.begin(), found.end(), f) != found.end();
+                    };
+                    const auto found = offered (crashed[0]);
+                    std::vector<std::vector<float>> audio;
+                    const auto readable = found && lynx::takes::readWav (crashed[0].getFullPathName().toStdString(), audio) && audio.size() == 2;
+                    const auto foundFrames = readable ? (std::int64_t) audio[0].size() : (std::int64_t) 0;
+                    check ("crashed_take_found_at_the_next_start", found && readable && foundFrames > 0 && foundFrames <= crashedFed
+                                                                       && crashedFed - foundFrames < (std::int64_t) (2.5 * rate),
+                           juce::String (foundFrames) + " frames of " + juce::String (crashedFed));
+                    const auto kept = found ? next.keepLeftoverEdisonTake (crashed[0]) : juce::File();
+                    check ("crashed_take_kept_as_a_recording", kept.existsAsFile() && kept.getFileName().contains ("(recovered)") && ! crashed[0].exists()
+                                                                   && ! listed (crashed[0]) && ! offered (crashed[0]) && ! offered (kept),
+                           kept.getFileName());
+                    kept.deleteFile();
+                }
+
+                // Save, then quit at once (before the engine's next turn): the take is in its own file, so the safety
+                // file goes as the engine closes.
+                check ("saved_take_record_starts", session->start (p, false));
+                recordFor (1.0);
+                const auto pending = recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav");
+                session->stop();
+                lynx::tickAudioEditorForTest (*window); // (written to its own file; no pump after it)
+                const auto stillThere = pending.size() == 1 && pending[0].existsAsFile();
+                engine.closeEdisonSafetyFilesForTest();
+                check ("saved_take_leaves_no_safety_file_when_lynx_closes", stillThere && ! session->dirty()
+                                                                                && recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav").isEmpty()
+                                                                                && ! listed (pending[0]),
+                       juce::String (pending.size()) + " file(s) before");
             }
 
             // deleting the slot leaves the song without it (the file stays for the unused-recordings prompt)
