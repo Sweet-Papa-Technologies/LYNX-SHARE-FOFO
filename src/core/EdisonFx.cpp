@@ -206,6 +206,7 @@ void Processor::setRecording (bool on) noexcept
         jumpRead.store (jumpWrite.load (std::memory_order_acquire), std::memory_order_release);
         dropped.store (0, std::memory_order_relaxed);
         limitHit.store (false, std::memory_order_relaxed);
+        takesAsked.fetch_add (1, std::memory_order_release);
     }
     wantRecord.store (on, std::memory_order_release);
     if (! on)
@@ -390,6 +391,13 @@ void Processor::process (float* left, float* right, int n, const EffectParams& p
 
     // --- recording: the slot's input, before anything else touches it ---
     const auto want = wantRecord.load (std::memory_order_acquire);
+    // Record off and on again between two blocks (a take stopped and the next one started at once) is a new take too:
+    // it was armed as the old one going on, so its start marker and the maximum time counted the old take's frames
+    if (const auto asked = takesAsked.load (std::memory_order_acquire); want && asked != takesSeen)
+    {
+        takesSeen = asked;
+        recording = false;
+    }
     if (want != recording)
     {
         recording = want;

@@ -187,6 +187,8 @@ private:
     // recording (audio thread, except the atomics)
     Gate gate;
     std::atomic<bool> wantRecord { false }, limitHit { false };
+    std::atomic<std::uint32_t> takesAsked { 0 }; // (each Record on: a new take, even when the audio thread saw no "off")
+    std::uint32_t takesSeen = 0;
     bool recording = false;
     std::atomic<int> shownPhase { 0 };
     std::int64_t written = 0;

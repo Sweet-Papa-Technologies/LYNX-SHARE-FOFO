@@ -643,6 +643,43 @@ TEST (edison_a_take_keeps_the_song_position_it_was_recorded_at)
     CHECK (std::search (bytes.begin(), bytes.end(), tag, tag + 4) != bytes.end());
 }
 
+// Record off and on again with no block between (Send ends a take; --edisonslottest starts the next at once): the
+// audio thread saw no "off", so the new take was armed as the old one going on. Its start marker said frame 1536 (the
+// old take's count) and the maximum recording time counted the old take's frames.
+TEST (edison_a_take_started_right_after_another_is_a_new_take)
+{
+    namespace ef = lynx::edisonfx;
+    ef::Processor p;
+    p.prepare (44100.0);
+    auto params = edison190cd::defaults();
+    params[ef::recordMode] = ef::modeValue (ef::Mode::onPlay);
+    const auto ticksPerBlock = 441.0 / 44100.0 * 2.0 * (double) lynx::ppq; // (120 BPM)
+    double tick = 0.0;
+    auto block = [&] {
+        p.setSongPosition (tick);
+        p.setPlaying (true);
+        edison190cd::run (p, params, 0.5f, 1);
+        tick += ticksPerBlock;
+    };
+    p.setRecording (true);
+    for (int i = 0; i < 5; ++i)
+        block();
+    p.setRecording (false);
+    p.setRecording (true);
+    tick = 32.0 * lynx::ppq;
+    for (int i = 0; i < 2; ++i)
+        block();
+    std::vector<float> l, r;
+    std::vector<std::int64_t> jumps;
+    std::vector<double> beats;
+    p.drain (l, r, jumps, 0, &beats);
+    p.setRecording (false);
+    CHECK (l.size() == 2 * 441); // (what the first take left in the ring went when Record came on again)
+    CHECK (jumps.size() == 1 && beats.size() == 1);
+    if (jumps.size() == 1 && beats.size() == 1)
+        CHECK (jumps[0] == 0 && beats[0] == 32.0);
+}
+
 TEST (edison_slave_playback_plays_a_take_where_it_was_recorded)
 {
     namespace ef = lynx::edisonfx;
