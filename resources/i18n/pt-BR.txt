@@ -12049,3 +12049,13 @@ countries: br
 "Insert a wildcard at the cursor" = "Inserir um curinga no cursor"
 "File:" = "Arquivo:"
 "Stems:" = "Stems:"
+
+# Plugin crashes gathered in one prompt
+"with {0}" = "com {0}"
+"These plugins crashed and were switched off (an effect is bypassed, an instrument stays silent): {0}." = "Estes plugins travaram e foram desligados (um efeito fica em bypass, um instrumento fica em silêncio): {0}."
+"These plugins crashed in their separate process and were muted: {0}." = "Estes plugins travaram no processo separado deles e foram silenciados: {0}."
+"The windows of these plugins crashed and were closed: {0}." = "As janelas destes plugins travaram e foram fechadas: {0}."
+"LYNX SHARE and your project kept running. Save your project (as a new file is safest)." = "O LYNX SHARE e o seu projeto continuaram funcionando. Salve o seu projeto (como um arquivo novo é o mais seguro)."
+"Reload starts them again with the settings from the last save or backup (a plugin that crashed on its saved settings stays off)." = "Recarregar inicia os plugins de novo com os ajustes do último salvamento ou backup (um plugin que travou com os ajustes salvos fica desligado)."
+"Plugins crashed" = "Plugins travaram"
+"Always run them in a separate process" = "Sempre rodá-los em um processo separado"

@@ -755,6 +755,24 @@ int PluginInstrument::takeMidiOutput (MidiOutNote* out, int max) noexcept
     return count;
 }
 
+namespace
+{
+// A hosted plugin released and deleted under the crash guard: its teardown (VST3 terminate, effClose, CLAP destroy) ran
+// unguarded, so a plugin that crashed there ended LYNX as a project closed or another one opened. One that faults is
+// left as it is (never called again); a release that faulted is not followed by the delete.
+void releaseGuarded (std::unique_ptr<juce::AudioPluginInstance> plugin, const std::string& name) noexcept
+{
+    auto* raw = plugin.release();
+    if (raw == nullptr)
+        return;
+    auto code = crashguard::run ([raw] { raw->releaseResources(); });
+    if (code == 0)
+        code = crashguard::run ([raw] { delete raw; });
+    if (code != 0)
+        crashguard::note ("plugin " + name + " crashed while it was closed (" + crashguard::describe (code) + "): left as it is");
+}
+} // namespace
+
 PluginInstrument::~PluginInstrument()
 {
     forgetAdapter (plugin.get());
@@ -762,7 +780,7 @@ PluginInstrument::~PluginInstrument()
     if (crashed.load())
         (void) plugin.release();
     else
-        crashguard::run ([this] { plugin->releaseResources(); });
+        releaseGuarded (std::move (plugin), name);
 }
 
 void PluginInstrument::failed (std::uint32_t code) noexcept
@@ -1428,7 +1446,7 @@ PluginEffect::~PluginEffect()
     if (crashed.load())
         (void) plugin.release();
     else
-        crashguard::run ([this] { plugin->releaseResources(); });
+        releaseGuarded (std::move (plugin), name);
 }
 
 void PluginEffect::failed (std::uint32_t code) noexcept
@@ -4025,7 +4043,22 @@ std::unique_ptr<juce::AudioPluginInstance> PluginHost::createInstance (const Plu
 
     crashguard::note (("loading plugin " + description->name + " (" + description->pluginFormatName + ", "
                        + juce::File (description->fileOrIdentifier).getFileName() + ")").toStdString());
-    auto instance = createRightInstance (formats, *description, sampleRate, maxBlockSize, message);
+    // Guarded like its saved settings below: a plugin that crashed while it was made or prepared (its module's start,
+    // its constructor, prepareToPlay) ended LYNX as the project opened, and the next open did the same again.
+    // It is left out instead (its slot keeps its settings, so the project saves them).
+    const auto leftOut = [&] (std::uint32_t code, const char* when) -> std::unique_ptr<juce::AudioPluginInstance> {
+        recordCrash (description->name.toStdString(), code, true);
+        crashguard::note (("plugin " + description->name + " crashed while " + when + " (" + crashguard::describe (code) + "): left out").toStdString());
+        if (error != nullptr)
+            *error = tr ("{0} crashed and was switched off.", { juce::String::fromUTF8 (ref.name.c_str()) }) + " (" + crashguard::describe (code) + ")";
+        return nullptr;
+    };
+    std::unique_ptr<juce::AudioPluginInstance> instance;
+    if (const auto code = crashguard::run ([&] { instance = createRightInstance (formats, *description, sampleRate, maxBlockSize, message); }); code != 0)
+    {
+        (void) instance.release(); // never called again, not even to delete it (as after a crash in process)
+        return leftOut (code, "it was created");
+    }
     crashguard::note (("loaded plugin " + description->name + (instance == nullptr ? juce::String (" (failed)") : juce::String())).toStdString());
 
     if (instance == nullptr)
@@ -4037,7 +4070,14 @@ std::unique_ptr<juce::AudioPluginInstance> PluginHost::createInstance (const Plu
     // round 190gg (B4): a fault on one of this plugin's own threads switches it off instead of ending LYNX (Linux / macOS)
     crashguard::watchPluginModule (description->fileOrIdentifier.toStdString());
 
-    preparePlugin (*instance, sampleRate, preparedBlock);
+    {
+        auto* raw = instance.get();
+        if (const auto code = crashguard::run ([&] { preparePlugin (*raw, sampleRate, preparedBlock); }); code != 0)
+        {
+            (void) instance.release();
+            return leftOut (code, "it was prepared");
+        }
+    }
 
     if (! ref.state.empty())
     {
