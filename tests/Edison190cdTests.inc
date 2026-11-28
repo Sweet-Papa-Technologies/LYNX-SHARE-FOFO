@@ -627,6 +627,17 @@ TEST (edison_a_take_keeps_the_song_position_it_was_recorded_at)
     CHECK (ef::songPositionOf (doc, 441, 120.0, pos) && std::abs (pos - (32.0 + 0.02)) < 1.0e-9); // (10 ms at 120 BPM)
     CHECK (ef::songPositionOf (doc, 10 * 441 + 882, 120.0, pos) && std::abs (pos - (4.0 + 0.04)) < 1.0e-9); // (after the jump)
     CHECK (! ef::songPositionOf (edison190cd::ramp (100), 0, 120.0, pos));
+    // audio before the first jump (a take appended to it): counted back from that jump, as slave playback plays it
+    auto appended = edison190cd::ramp (44100);
+    ae::Marker late;
+    late.start = late.end = 441;
+    late.name = "Song jump";
+    late.time = 8.0;
+    appended.markers.push_back (late);
+    CHECK (ef::songPositionOf (appended, 0, 120.0, pos) && std::abs (pos - (8.0 - 0.02)) < 1.0e-9);
+    late.time = 0.0; // (recorded from the song's start: what comes before it would start before the song)
+    appended.markers = { late };
+    CHECK (! ef::songPositionOf (appended, 0, 120.0, pos));
 
     // the slot keeps its audio in a WAV: the positions go with the markers
     const auto bytes = ae::encodeWav (doc, ae::WavFormat::float32);

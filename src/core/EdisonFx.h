@@ -225,8 +225,9 @@ audioedit::Document withTake (const audioedit::Document& base, audioedit::Audio&
 // take starts, with the song position in Marker::time, in beats). False without one.
 bool songAnchor (const audioedit::Document& doc, double& beats, std::int64_t& frame);
 // The song position (beats) frame `frame` of the document was recorded at: counted from the last "Song jump" marker at
-// or before it (each take's start, and every jump of the song while it recorded). False before the first one, or with
-// no marker; `bpm`: the song's tempo then.
+// or before it (each take's start, and every jump of the song while it recorded); before the first one, counted back
+// from it (where slave playback plays that audio). False with no marker, or before the song's start; `bpm`: the
+// song's tempo then.
 bool songPositionOf (const audioedit::Document& doc, std::int64_t frame, double bpm, double& beats);
 
 // Message thread only.

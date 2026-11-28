@@ -543,13 +543,18 @@ bool songAnchor (const ae::Document& doc, double& beats, std::int64_t& frame)
 
 bool songPositionOf (const ae::Document& doc, std::int64_t frame, double bpm, double& beats)
 {
+    // the last song jump at or before the frame; before the first one (audio a take was appended to), counted back
+    // from that one, as slave playback plays it
     const ae::Marker* from = nullptr;
     for (const auto& m : doc.markers) // (sorted by start)
-        if (! m.isRegion() && m.name == "Song jump" && m.start <= frame)
+        if (! m.isRegion() && m.name == "Song jump" && (from == nullptr || m.start <= frame))
             from = &m;
     if (from == nullptr || doc.audio.sampleRate <= 0.0)
         return false;
-    beats = std::max (0.0, from->time) + (double) (frame - from->start) / doc.audio.sampleRate * std::max (1.0, bpm) / 60.0;
+    const auto at = std::max (0.0, from->time) + (double) (frame - from->start) / doc.audio.sampleRate * std::max (1.0, bpm) / 60.0;
+    if (at < 0.0) // (it would start before the song does)
+        return false;
+    beats = at;
     return true;
 }
 
