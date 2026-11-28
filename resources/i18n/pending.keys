@@ -3,3 +3,12 @@
 # list it here so the tests pass — the table maintainers translate the pending keys and empty this file.
 # python3 tools/i18n_tool.py pending   rewrites this file with every key some table still lacks.
 "An Edison slot was removed while it was still recording (an undo, a deleted slot or insert, or another project). The recording was kept in {0}."
+"Reading the samples and recordings..."
+"with {0}"
+"These plugins crashed and were switched off (an effect is bypassed, an instrument stays silent): {0}."
+"These plugins crashed in their separate process and were muted: {0}."
+"The windows of these plugins crashed and were closed: {0}."
+"LYNX SHARE and your project kept running. Save your project (as a new file is safest)."
+"Reload starts them again with the settings from the last save or backup (a plugin that crashed on its saved settings stays off)."
+"Plugins crashed"
+"Always run them in a separate process"

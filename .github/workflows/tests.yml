@@ -153,6 +153,20 @@ jobs:
           cat selftest.txt
           grep -q '^result=OK' selftest.txt
 
+      # Undo while the mouse button still holds a dragged note (Piano Roll) or clip (Playlist): the next mouse move must
+      # end the drag (it wrote past the end of the list, corrupting the heap: a crash later, often without a crash file)
+      - name: Drag and Undo
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            bin=build/LYNX_artefacts/Release/LYNX; run=(xvfb-run -a)
+          else
+            bin=build/LYNX_artefacts/Release/LYNX.app/Contents/MacOS/LYNX; run=()
+          fi
+          "${run[@]}" "$bin" --dragundotest "$PWD/dragundo.txt" || true
+          cat dragundo.txt
+          grep -q '^result=OK' dragundo.txt
+
       # Round perfgate190id (community slice B12): the big-project performance gate on the synthetic projects
       # (core/PerfProjects.h): audio CPU per block size, load / rebuild time, memory, .lynx save / load, open time and
       # paint per frame of every view, against tests/perf/baseline-ci-ubuntu.json (scripts/perf-gate.sh; times are

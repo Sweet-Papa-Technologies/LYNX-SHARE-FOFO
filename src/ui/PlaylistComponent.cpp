@@ -6795,6 +6795,11 @@ void PlaylistComponent::mouseDrag (const juce::MouseEvent& e)
 {
     if (insertsMouseDrag (e)) // issue #154: an effect dragged from a linked header's list
         return;
+    if (! clipDragStillValid())
+    {
+        cancelStaleClipDrag();
+        return;
+    }
     if (drag == Drag::pen || drag == Drag::pointBand || drag == Drag::pointsMove) // issue #207 (round 190lw)
     {
         pointMouseDrag (e);
@@ -7954,6 +7959,7 @@ void PlaylistComponent::mouseUp (const juce::MouseEvent& e)
     touchedClips.clear();
     rubberBand = {};
     knownClipCount = engine.getSong().playlist.size();
+    pruneSelection(); // (clips taken away during the drag are not selected after it)
     hover = {};
     updateHover (e.getPosition(), e.mods); // the cursor of what is under the mouse now
     repaint();
@@ -11660,7 +11666,7 @@ juce::PopupMenu PlaylistComponent::fitToTempoMenu (int index, std::shared_ptr<co
 // Returns true while the drag is such a crossfade (the handle's own fade is then not changed).
 bool PlaylistComponent::crossfadeDragOver (std::int64_t tick)
 {
-    if (! theme::livelook::active() || dragClip < 0)
+    if (! theme::livelook::active() || dragClip < 0 || (std::size_t) dragClip >= engine.getSong().playlist.size())
         return false;
     const auto& song = engine.getSong();
     const auto out = drag == Drag::fadeOut;
@@ -12956,7 +12962,8 @@ void PlaylistComponent::copySelection()
     ++clipboardStamp;
 
     for (auto i : selection)
-        clipboard.push_back (engine.getSong().playlist[(std::size_t) i]);
+        if (i >= 0 && (std::size_t) i < engine.getSong().playlist.size())
+            clipboard.push_back (engine.getSong().playlist[(std::size_t) i]);
 }
 
 void PlaylistComponent::pasteClips (std::int64_t at)
@@ -14166,6 +14173,40 @@ void PlaylistComponent::scrollBarMoved (juce::ScrollBar* bar, double start)
     repaintScrolled();
 }
 
+// A drag of clips by their indices still about clips that exist? Undo, Delete or Ctrl+X pressed while the mouse button
+// was held (or a recording that replaced clips meanwhile) took clips away, and the next step of the drag wrote a clip past
+// the end of the list: the heap was corrupted and LYNX crashed later, somewhere else.
+bool PlaylistComponent::clipDragStillValid() const
+{
+    if (drag == Drag::none)
+        return true;
+    const auto count = engine.getSong().playlist.size();
+    if (dragClip >= 0 && (std::size_t) dragClip >= count)
+        return false;
+    if (std::any_of (dragIndices.begin(), dragIndices.end(), [count] (int i) { return i < 0 || (std::size_t) i >= count; }))
+        return false;
+    return dragOriginals.empty() || dragOriginals.size() >= dragIndices.size();
+}
+
+// such a drag ends where it is (what it did so far stays)
+void PlaylistComponent::cancelStaleClipDrag()
+{
+    drag = Drag::none;
+    dragClip = -1;
+    dragIndices.clear();
+    dragOriginals.clear();
+    touchedClips.clear();
+    rubberBand = {};
+    pruneSelection();
+    repaint();
+}
+
+void PlaylistComponent::pruneSelection()
+{
+    const auto count = engine.getSong().playlist.size();
+    selection.erase (std::remove_if (selection.begin(), selection.end(), [count] (int i) { return i < 0 || (std::size_t) i >= count; }), selection.end());
+}
+
 void PlaylistComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
 {
     updateDropLaneProbe();
@@ -14183,6 +14224,8 @@ void PlaylistComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
         knownClipCount = count;
         selection.clear();
     }
+    else if (count != knownClipCount && ! clipDragStillValid()) // (an undo, a cut or a recording took the dragged clips away)
+        cancelStaleClipDrag();
 
     // switching pattern (top bar, Channel Rack) sets the pencil back to the pattern
     if (engine.getSong().currentPattern != knownCurrentPattern)

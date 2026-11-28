@@ -7492,73 +7492,14 @@ void MainComponent::timerCallback()
     // of the plugin is switched off now (counted as crashes: the prompt below)
     switchOffPluginsOfThreadFaults();
 
-    // a hosted plugin crashed inside a call: it was switched off (bypassed / silent) and LYNX kept running
-    if (const auto crashes = pluginCrashCount(); crashes != pluginCrashesSeen)
-    {
-        pluginCrashesSeen = crashes;
-        juce::StringArray names, lines;
-        for (const auto& c : pluginCrashes())
-        {
-            const auto name = juce::String::fromUTF8 (c.plugin.c_str());
-            names.addIfNotAlreadyThere (name);
-            lines.add (juce::Time::getCurrentTime().toISO8601 (true) + "  " + name + "  " + crashguard::describe (c.code) + " 0x"
-                       + juce::String::toHexString ((juce::int64) c.code));
-        }
-        PluginHost::settingsFolder().getChildFile ("plugin-crashes.log").appendText (lines[lines.size() - 1] + "\n");
-        // round 190ao: "Reload" starts it again without reopening the project (only on request: a plugin that crashes
-        // again shows this again)
-        const auto crashedName = names[names.size() - 1];
-        // round 190dt: it crashed on its saved settings (it was left out as the project opened): the same settings would
-        // crash it again, so no Reload; the project keeps them for the save
-        const auto all = pluginCrashes();
-        const auto onLoad = ! all.empty() && all.back().onLoad;
-        // round 190gg (B1): Reload, or from now on in a process of its own, where its next crash cannot reach LYNX
-        const auto prompt = PluginWindows::crashPrompt (crashedName, onLoad);
-        auto options = juce::MessageBoxOptions().withIconType (juce::MessageBoxIconType::WarningIcon).withTitle (prompt.title).withMessage (prompt.message);
-        for (const auto& button : prompt.buttons)
-            options = options.withButton (button);
-        juce::AlertWindow::showAsync (options, [safe = juce::Component::SafePointer<MainComponent> (this), crashedName, prompt] (int result) {
-            // (JUCE: the first button is 1, the last one 0)
-            if (safe == nullptr || result == 0)
-                return;
-            if (result == 1 && prompt.reload)
-                safe->reloadCrashedPlugins (crashedName);
-            else if (prompt.separate && result == (prompt.reload ? 2 : 1))
-                PluginWindows::alwaysRunSeparately (safe->engine, crashedName);
-        });
-    }
-
-    // round 176a: a plugin in a separate process (Make bridged, or a 32-bit plugin in the 32-bit bridge) crashed or hung:
-    // only that process went; the plugin is muted. Round 174a's prompt, logged like the other plugin crashes.
-    if (const auto deaths = pluginSandboxDeathCount(); deaths != sandboxDeathsSeen)
-    {
-        const auto fresh = juce::jmax (1, deaths - sandboxDeathsSeen);
-        sandboxDeathsSeen = deaths;
-        const auto all = pluginSandboxDeaths();
-        if (! all.empty())
-        {
-            const auto& d = all.back();
-            // round 190jg: a group's process (per vendor / all plugins together) took the other plugins in it along
-            juce::StringArray withIt;
-            for (int i = juce::jmax (0, (int) all.size() - fresh); i + 1 < (int) all.size(); ++i)
-                if (! d.alone && all[(std::size_t) i].group == d.group && all[(std::size_t) i].plugin != d.plugin)
-                    withIt.addIfNotAlreadyThere (all[(std::size_t) i].plugin);
-            PluginHost::settingsFolder().getChildFile ("plugin-crashes.log").appendText (
-                juce::Time::getCurrentTime().toISO8601 (true) + "  " + d.plugin + "  " + (d.crashed ? "crashed" : "stopped responding")
-                + (d.bits32 ? " (32-bit bridge)" : d.group.isNotEmpty() ? " (process group " + d.group + ")" : " (separate process)")
-                + (withIt.isEmpty() ? juce::String() : ", with " + withIt.joinIntoString (", ")) + "\n");
-            announceSeparateProcessCrash (d.plugin, d.crashed, d.bits32, withIt);
-        }
-    }
-
-    // issue #32 (round 174a): a plugin's own editor window faulted; LYNX closed that editor and kept running
-    if (const auto crashes = PluginWindows::editorCrashCount(); crashes != editorCrashesSeen)
-    {
-        editorCrashesSeen = crashes;
-        const auto all = PluginWindows::editorCrashes();
-        if (! all.empty())
-            announceEditorCrash (all.back().plugin);
-    }
+    // Plugin crashes (inside a call, in a separate process, in an editor window) are gathered and told in one prompt, at
+    // most one at a time and a second after the last one came, not while a project opens. A project whose plugins
+    // crashed one after the other gave a modal prompt per crash, each naming only the newest plugin (and only the
+    // newest crash line was logged). A problem that comes alone keeps its own prompt.
+    collectPluginProblems();
+    if (! pluginProblems.empty() && ! pluginProblemPromptOpen && ! projectLoadRunning()
+        && juce::Time::getMillisecondCounterHiRes() - pluginProblemsSinceMs >= 1000.0)
+        announcePluginProblems();
 
     autoCloseDevice();
 
@@ -8580,6 +8521,196 @@ void MainComponent::startNewProject (Song song, const juce::File& file)
     updateTitle();
 }
 
+void MainComponent::collectPluginProblems()
+{
+    const auto log = [] (const juce::String& line) {
+        PluginHost::settingsFolder().getChildFile ("plugin-crashes.log").appendText (juce::Time::getCurrentTime().toISO8601 (true) + "  " + line + "\n");
+    };
+    const auto now = juce::Time::getMillisecondCounterHiRes();
+
+    // a hosted plugin crashed inside a call: it was switched off (bypassed / silent) and LYNX kept running
+    if (const auto crashes = pluginCrashCount(); crashes != pluginCrashesSeen)
+    {
+        const auto all = pluginCrashes();
+        const auto fresh = juce::jlimit (0, (int) all.size(), crashes - pluginCrashesSeen);
+        pluginCrashesSeen = crashes;
+        for (auto i = (int) all.size() - fresh; i < (int) all.size(); ++i)
+        {
+            const auto& c = all[(std::size_t) i];
+            const auto name = juce::String::fromUTF8 (c.plugin.c_str());
+            log (name + "  " + crashguard::describe (c.code) + " 0x" + juce::String::toHexString ((juce::int64) c.code));
+            PluginProblem p;
+            p.plugin = name;
+            p.onLoad = c.onLoad; // (round 190dt: it crashed on its saved settings: the same settings would crash it again)
+            pluginProblems.push_back (std::move (p));
+        }
+        pluginProblemsSinceMs = now;
+    }
+
+    // round 176a: a plugin in a separate process (Make bridged, or a 32-bit plugin in the 32-bit bridge) crashed or hung:
+    // only that process went; the plugin is muted. Logged like the other plugin crashes.
+    if (const auto deaths = pluginSandboxDeathCount(); deaths != sandboxDeathsSeen)
+    {
+        const auto fresh = juce::jmax (1, deaths - sandboxDeathsSeen);
+        sandboxDeathsSeen = deaths;
+        const auto all = pluginSandboxDeaths();
+        if (! all.empty())
+        {
+            const auto& d = all.back();
+            // round 190jg: a group's process (per vendor / all plugins together) took the other plugins in it along
+            juce::StringArray withIt;
+            for (int i = juce::jmax (0, (int) all.size() - fresh); i + 1 < (int) all.size(); ++i)
+                if (! d.alone && all[(std::size_t) i].group == d.group && all[(std::size_t) i].plugin != d.plugin)
+                    withIt.addIfNotAlreadyThere (all[(std::size_t) i].plugin);
+            log (d.plugin + "  " + (d.crashed ? "crashed" : "stopped responding")
+                 + (d.bits32 ? " (32-bit bridge)" : d.group.isNotEmpty() ? " (process group " + d.group + ")" : " (separate process)")
+                 + (withIt.isEmpty() ? juce::String() : ", with " + withIt.joinIntoString (", ")));
+            PluginProblem p;
+            p.kind = PluginProblem::Kind::separateProcess;
+            p.plugin = d.plugin;
+            p.crashed = d.crashed;
+            p.bits32 = d.bits32;
+            p.withIt = withIt;
+            pluginProblems.push_back (std::move (p));
+        }
+        pluginProblemsSinceMs = now;
+    }
+
+    // issue #32 (round 174a): a plugin's own editor window faulted; LYNX closed that editor and kept running
+    if (const auto crashes = PluginWindows::editorCrashCount(); crashes != editorCrashesSeen)
+    {
+        editorCrashesSeen = crashes;
+        const auto all = PluginWindows::editorCrashes();
+        if (! all.empty())
+        {
+            PluginProblem p;
+            p.kind = PluginProblem::Kind::editor;
+            p.plugin = all.back().plugin;
+            pluginProblems.push_back (std::move (p));
+        }
+        pluginProblemsSinceMs = now;
+    }
+}
+
+void MainComponent::announcePluginProblems()
+{
+    auto problems = std::exchange (pluginProblems, {});
+    // (several instances of one plugin: told once)
+    std::vector<PluginProblem> once;
+    for (auto& p : problems)
+        if (std::none_of (once.begin(), once.end(), [&p] (const PluginProblem& o) { return o.kind == p.kind && o.plugin == p.plugin; }))
+            once.push_back (std::move (p));
+        else if (p.kind == PluginProblem::Kind::crashed && ! p.onLoad) // (one instance that can be reloaded is enough)
+            for (auto& o : once)
+                if (o.kind == p.kind && o.plugin == p.plugin)
+                    o.onLoad = false;
+    if (once.empty())
+        return;
+    pluginProblemPromptOpen = true;
+    if (once.size() == 1)
+    {
+        const auto& p = once.front();
+        if (p.kind == PluginProblem::Kind::separateProcess)
+            announceSeparateProcessCrash (p.plugin, p.crashed, p.bits32, p.withIt);
+        else if (p.kind == PluginProblem::Kind::editor)
+            announceEditorCrash (p.plugin);
+        else
+            announcePluginCrash (p.plugin, p.onLoad);
+        return;
+    }
+
+    juce::StringArray crashed, separate, editors, separable;
+    bool reloadable = false;
+    for (const auto& p : once)
+    {
+        if (p.kind == PluginProblem::Kind::crashed)
+        {
+            crashed.addIfNotAlreadyThere (p.plugin);
+            reloadable = reloadable || ! p.onLoad;
+            if (PluginWindows::canAlwaysRunSeparately (p.plugin))
+                separable.addIfNotAlreadyThere (p.plugin);
+        }
+        else if (p.kind == PluginProblem::Kind::separateProcess)
+        {
+            separate.addIfNotAlreadyThere (p.withIt.isEmpty() ? p.plugin : p.plugin + " (" + tr ("with {0}", { p.withIt.joinIntoString (", ") }) + ")");
+            reloadable = true;
+        }
+        else
+        {
+            editors.addIfNotAlreadyThere (p.plugin);
+            if (! pluginSandboxEnabled() && ! pluginAlwaysSeparate (p.plugin) && p.plugin != "?")
+                separable.addIfNotAlreadyThere (p.plugin);
+        }
+    }
+    juce::String message;
+    if (! crashed.isEmpty())
+        message << tr ("These plugins crashed and were switched off (an effect is bypassed, an instrument stays silent): {0}.", { crashed.joinIntoString (", ") }) << "\n";
+    if (! separate.isEmpty())
+        message << tr ("These plugins crashed in their separate process and were muted: {0}.", { separate.joinIntoString (", ") }) << "\n";
+    if (! editors.isEmpty())
+        message << tr ("The windows of these plugins crashed and were closed: {0}.", { editors.joinIntoString (", ") }) << "\n";
+    message << "\n" << tr ("LYNX SHARE and your project kept running. Save your project (as a new file is safest).");
+    if (reloadable)
+        message << " " << tr ("Reload starts them again with the settings from the last save or backup (a plugin that crashed on its saved settings stays off).");
+    if (! separable.isEmpty())
+        message << "\n\n" << PluginWindows::alwaysSeparateHint();
+
+    auto options = juce::MessageBoxOptions().withIconType (juce::MessageBoxIconType::WarningIcon).withTitle (tr ("Plugins crashed")).withMessage (message);
+    juce::StringArray buttons; // (what each button does, in their order)
+    const auto addButton = [&options, &buttons] (const char* action, const juce::String& text) {
+        buttons.add (action);
+        options = options.withButton (text);
+    };
+    if (reloadable)
+        addButton ("reload", tr ("Reload"));
+    if (! separable.isEmpty())
+        addButton ("separate", tr ("Always run them in a separate process"));
+    addButton ("save", tr ("Save as..."));
+    addButton ("close", tr ("Close"));
+    juce::AlertWindow::showAsync (options, [safe = juce::Component::SafePointer<MainComponent> (this), buttons, separable] (int result) {
+        if (safe == nullptr)
+            return;
+        safe->pluginProblemPromptOpen = false;
+        // (JUCE: the first button is 1, the last one 0)
+        const auto chosen = result == 0 ? juce::String ("close") : buttons[result - 1];
+        if (chosen == "reload")
+        {
+            if (const auto which = safe->engine.downHostedPlugins(); ! which.empty())
+                PluginWindows::reload (safe->engine, which);
+        }
+        else if (chosen == "separate")
+        {
+            for (const auto& name : separable)
+                PluginWindows::alwaysRunSeparately (safe->engine, name);
+        }
+        else if (chosen == "save")
+            safe->save (true);
+    });
+}
+
+// round 190ao: "Reload" starts it again without reopening the project (only on request: a plugin that crashes again
+// shows this again); round 190dt: one that crashed on its saved settings gets no Reload (the same settings would crash it
+// again; the project keeps them for the save); round 190gg (B1): or from now on in a process of its own
+void MainComponent::announcePluginCrash (const juce::String& plugin, bool onLoad)
+{
+    const auto prompt = PluginWindows::crashPrompt (plugin, onLoad);
+    auto options = juce::MessageBoxOptions().withIconType (juce::MessageBoxIconType::WarningIcon).withTitle (prompt.title).withMessage (prompt.message);
+    for (const auto& button : prompt.buttons)
+        options = options.withButton (button);
+    juce::AlertWindow::showAsync (options, [safe = juce::Component::SafePointer<MainComponent> (this), plugin, prompt] (int result) {
+        if (safe == nullptr)
+            return;
+        safe->pluginProblemPromptOpen = false;
+        // (JUCE: the first button is 1, the last one 0)
+        if (result == 0)
+            return;
+        if (result == 1 && prompt.reload)
+            safe->reloadCrashedPlugins (plugin);
+        else if (prompt.separate && result == (prompt.reload ? 2 : 1))
+            PluginWindows::alwaysRunSeparately (safe->engine, plugin);
+    });
+}
+
 // The user's choice after a plugin's editor crashed (issue #32): save under a new name now, and/or run that plugin in a
 // separate process from now on (like Processing › "Always run … in a separate process": persisted, applied at once)
 void MainComponent::announceEditorCrash (const juce::String& plugin)
@@ -8598,6 +8729,7 @@ void MainComponent::announceEditorCrash (const juce::String& plugin)
     juce::AlertWindow::showAsync (options, [safe = juce::Component::SafePointer<MainComponent> (this), plugin, offerSeparate] (int result) {
         if (safe == nullptr)
             return;
+        safe->pluginProblemPromptOpen = false;
         if (result == 1)
             safe->save (true);
         else if (result == 2 && offerSeparate)
@@ -8638,6 +8770,7 @@ void MainComponent::announceSeparateProcessCrash (const juce::String& plugin, bo
     juce::AlertWindow::showAsync (options, [safe = juce::Component::SafePointer<MainComponent> (this), plugin, everyDown = ! withIt.isEmpty()] (int result) {
         if (safe == nullptr)
             return;
+        safe->pluginProblemPromptOpen = false;
         if (result == 1 && everyDown) // (round 190jg: the whole group came down; all of it comes back)
         {
             if (const auto which = safe->engine.downHostedPlugins(); ! which.empty())
@@ -8936,6 +9069,30 @@ void MainComponent::showPluginsOff()
 
 void MainComponent::openLynxProject (const juce::File& file, bool withoutPlugins)
 {
+    withoutPlugins = withoutPlugins || std::exchange (nextOpenWithoutPlugins, false);
+    if (persistent)
+    {
+        // behind the progress panel (as an FL project): the file is read and its samples and recordings decoded on a
+        // thread, the plugins are created one by one with their names shown. In one block on the message thread it
+        // froze the window for minutes on a project with long Edison recordings, and input reached the half-built rack.
+        if (projectLoadRunning())
+            return;
+        openLynxWithProgress (*this, engine, file, withoutPlugins,
+                              [safe = juce::Component::SafePointer<MainComponent> (this), file] (bool ok, const juce::String& error,
+                                                                                                 const juce::String& savedBy, const ProjectFile::WindowLayout& layout) {
+                                  if (safe == nullptr)
+                                      return;
+                                  if (! ok)
+                                  {
+                                      juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
+                                      return;
+                                  }
+                                  safe->lynxProjectOpened (file, savedBy, layout);
+                              });
+        return;
+    }
+
+    // (command-line modes open synchronously: they read the song right after)
     juce::String error, savedBy;
     ProjectFile::WindowLayout layout; // round 190mr (DF-141)
     auto song = ProjectFile::load (file, error, &savedBy, &layout);
@@ -8945,10 +9102,10 @@ void MainComponent::openLynxProject (const juce::File& file, bool withoutPlugins
         juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr ("Could not open"), error);
         return;
     }
-    withoutPlugins = withoutPlugins || std::exchange (nextOpenWithoutPlugins, false);
 
     engine.stop();
     engine.rewind();
+    engine.getPluginHost().clearLoadFailures(); // (another project's failures are not this one's)
     if (withoutPlugins)
     {
         // round 190ap: no hosted plugin is created and no slot is changed (no substitutes either): each keeps the
@@ -8961,6 +9118,12 @@ void MainComponent::openLynxProject (const juce::File& file, bool withoutPlugins
         engine.getPluginHost().applySubstitutes (*song);
         engine.setSong (std::move (*song));
     }
+    lynxProjectOpened (file, savedBy, layout);
+}
+
+// The open project is the .lynx `file` now (either way of opening it): what follows an open.
+void MainComponent::lynxProjectOpened (const juce::File& file, const juce::String& savedBy, const ProjectFile::WindowLayout& layout)
+{
     currentFile = file;
     importedFlpFile = juce::File();
     projectName = file.getFileNameWithoutExtension();

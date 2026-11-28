@@ -1838,7 +1838,7 @@ public:
 
         if (args.contains ("--crashguardtest"))
         {
-            // LYNX --crashguardtest "LYNX Test Crash.vst3|.clap" report.txt [process|memcpy] (round 190dt,
+            // LYNX --crashguardtest "LYNX Test Crash.vst3|.clap" report.txt [process|memcpy|init|activate|destroy] (round 190dt,
             // tools/testplugin/lynx_test_crash*.{c,cpp}): the plugin crashes in its 40th block on insert 1; LYNX must
             // catch it, mark the slot, keep playing the other inserts, save the project, reload the plugin; then the
             // saved project opens with the plugin crashing on its state; and LYNX's own faults are still crashes
@@ -2594,6 +2594,17 @@ public:
             // the round-165g layout (-paint.txt)
             const auto i = args.indexOf ("--newtoneshot");
             runNewtoneShot (args[i + 1].unquoted(), args[i + 2].unquoted());
+            quit();
+            return;
+        }
+
+        if (args.contains ("--dragundotest"))
+        {
+            // LYNX.exe --dragundotest report.txt: Undo while the mouse button still holds a dragged note (Piano Roll) or
+            // clip (Playlist); the next mouse move must end the drag (it wrote past the end of the list: heap corruption)
+            const auto i = args.indexOf ("--dragundotest");
+            const auto ok = runDragUndoTest (args[i + 1].unquoted());
+            setApplicationReturnValue (ok ? 0 : 1);
             quit();
             return;
         }
@@ -11534,6 +11545,11 @@ private:
             runCrashGuardThreadOrUiTest (pluginPath, reportPath, mode);
             return;
         }
+        if (mode == "init" || mode == "activate" || mode == "destroy")
+        {
+            runCrashGuardCreateTest (pluginPath, reportPath, mode);
+            return;
+        }
         juce::String report;
         bool ok = true;
         const auto expect = [&] (const char* name, bool value) {
@@ -11689,6 +11705,88 @@ private:
         for (const auto& c : lynx::pluginCrashes())
             report << "  crashed: " << c.plugin << " (" << lynx::crashguard::describe (c.code) << (c.onLoad ? ", loading its state" : "") << ")\n";
         tmp.deleteRecursively();
+        report << "result=" << (ok ? "OK" : "FAILED") << "\n";
+        juce::File (reportPath).replaceWithText (report);
+        setApplicationReturnValue (ok ? 0 : 1);
+        quit();
+    }
+
+    // --crashguardtest "LYNX Test Crash.clap" report.txt init | activate: the plugin crashes while LYNX creates it (CLAP
+    // init) or prepares it (activate) as the project opens. Only its saved settings were loaded under the guard, so such a
+    // plugin ended LYNX, and the project could not be opened again. It must be left out (a crash on load: no Reload),
+    // its slot keeps its settings, and the project plays.
+    void runCrashGuardCreateTest (const juce::String& pluginPath, const juce::String& reportPath, const juce::String& mode)
+    {
+        juce::String report;
+        bool ok = true;
+        const auto expect = [&] (const char* name, bool value) {
+            report << name << "=" << (value ? 1 : 0) << "\n";
+            ok = ok && value;
+        };
+        const auto setEnv = [] (const char* name, const char* value) {
+           #if JUCE_WINDOWS
+            _putenv_s (name, value);
+           #else
+            setenv (name, value, 1);
+           #endif
+        };
+        report << "guard=" << (lynx::crashguard::pluginFaultsCaught() ? "on" : "off") << "\nmode=" << mode << "\n";
+        {
+            lynx::AudioEngine offline (false);
+            auto& host = offline.getPluginHost();
+            host.addPluginFile (juce::File (pluginPath)); // (scanned before the crash is switched on)
+            juce::PluginDescription effect;
+            bool found = false;
+            for (const auto& type : host.getKnownPlugins().getTypes())
+                if (! found && ! type.isInstrument && juce::File (type.fileOrIdentifier).getFileName() == juce::File (pluginPath).getFileName())
+                {
+                    effect = type;
+                    found = true;
+                }
+            expect ("plugin_found", found);
+            setEnv ("LYNX_TEST_CRASH", mode.toRawUTF8());
+            auto song = lynx::Song::makeDefault();
+            lynx::EffectSlot slot;
+            slot.kind = lynx::EffectKind::plugin;
+            slot.plugin.id = effect.createIdentifierString().toStdString();
+            slot.plugin.name = effect.name.toStdString();
+            song.mixer[1].effects.push_back (slot);
+            const auto before = lynx::pluginCrashCount();
+            offline.setSong (song); // (the plugin is created and prepared here)
+            if (mode == "destroy")
+            {
+                // made and played, then deleted as another project opens: its crash there must not end LYNX
+                expect ("plugin_loaded", dynamic_cast<lynx::PluginEffect*> (offline.getEffect (1, 0).get()) != nullptr);
+                offline.setSong (lynx::Song::makeDefault());
+                offline.dispatchPendingMessages();
+                expect ("teardown_survived", offline.getEffect (1, 0) == nullptr);
+                expect ("no_crash_prompt", lynx::pluginCrashCount() == before); // (closed: nothing to tell about it)
+            }
+            const auto crashes = lynx::pluginCrashes();
+            if (mode != "destroy")
+            {
+                expect ("crash_caught", lynx::pluginCrashCount() == before + 1 && ! crashes.empty() && crashes.back().onLoad);
+                expect ("plugin_left_out", dynamic_cast<lynx::PluginEffect*> (offline.getEffect (1, 0).get()) == nullptr);
+            }
+            if (mode != "destroy")
+                expect ("slot_kept", offline.getSong().mixer[1].effects.size() == 1 && offline.getSong().mixer[1].effects[0].plugin.id == slot.plugin.id);
+            lynx::AudioEngine::RenderOptions o;
+            o.seconds = 1.0;
+            o.sampleRate = 48000.0;
+            o.pluginWarmUp = false;
+            float peak = 0.0f;
+            o.capture = [&peak] (const float* l, const float* r, int n) {
+                for (int k = 0; k < n; ++k)
+                    peak = std::max (peak, std::max (std::abs (l[k]), std::abs (r[k])));
+            };
+            offline.renderOffline (o);
+            expect ("project_plays", peak > 0.01f);
+            if (offline.getPluginHost().getLoadFailures().size() > 0)
+                report << "load_failures=" << offline.getPluginHost().getLoadFailures().joinIntoString (" | ") << "\n";
+        }
+        setEnv ("LYNX_TEST_CRASH", "");
+        for (const auto& c : lynx::pluginCrashes())
+            report << "  crashed: " << c.plugin << " (" << lynx::crashguard::describe (c.code) << (c.onLoad ? ", while loading" : "") << ")\n";
         report << "result=" << (ok ? "OK" : "FAILED") << "\n";
         juce::File (reportPath).replaceWithText (report);
         setApplicationReturnValue (ok ? 0 : 1);
@@ -22628,6 +22726,94 @@ private:
                 if (w->getName().startsWith ("Formula") && w->getContentComponent() != nullptr)
                     savePng (lynx::shot::snapshot (*w->getContentComponent()), prefix + "-formula-controller.png");
         lynx::FormulaControllerWindows::closeAll();
+    }
+
+    // --dragundotest: a note / clip drag whose note / clip Undo took away while the button was held. The drag kept the
+    // indices of what it moved, and the next mouse move wrote a Note / Clip past the end of the list (the heap was
+    // corrupted, LYNX crashed later somewhere else). The drag must end there, the song as Undo left it.
+    bool runDragUndoTest (const juce::String& reportPath)
+    {
+        juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
+        juce::String report;
+        bool all = true;
+        auto check = [&] (const juce::String& name, bool ok, const juce::String& note = {}) {
+            report << name << "=" << (ok ? "ok" : "FAIL") << (note.isNotEmpty() ? "  (" + note + ")" : juce::String()) << "\n";
+            all = all && ok;
+        };
+        {
+            lynx::AudioEngine offline (false);
+            lynx::MainComponent ui (offline, false);
+            ui.setSize (1600, 900);
+            offline.dispatchPendingMessages();
+            const juce::ModifierKeys left (juce::ModifierKeys::leftButtonModifier);
+            const auto held = juce::ModifierKeys::currentModifiers;
+
+            // Piano Roll: the Pencil on an empty cell adds a note and drags it at once
+            ui.selectTabForSnapshot (1);
+            offline.dispatchPendingMessages();
+            auto& roll = ui.getPianoRollForSnapshot();
+            roll.setToolForSnapshot (lynx::EditTool::pencil);
+            offline.editSong ([] (lynx::Song& s) { s.activePattern().notes.clear(); }); // (every cell is empty)
+            offline.dispatchPendingMessages();
+            const auto notes = [&offline] { return offline.getSong().activePattern().notes.size(); };
+            const auto before = notes();
+            const juce::Point<int> at { lynx::PianoRollComponent::keyboardWidth + 420, lynx::PianoRollComponent::headerHeight + 140 };
+            juce::ModifierKeys::currentModifiers = left; // (the button is down for the engine too: one undo step per press)
+            roll.pressForSnapshot (at, left);
+            const auto added = notes();
+            check ("roll_press_adds_a_note_and_drags_it", added == before + 1 && roll.dragActiveForTests(),
+                   juce::String ((int) before) + " -> " + juce::String ((int) added) + " notes");
+            offline.undo();
+            offline.dispatchPendingMessages();
+            check ("roll_undo_takes_the_note_away", notes() == before);
+            roll.dragForSnapshot (at.translated (60, -36), left);
+            roll.dragForSnapshot (at.translated (120, -60), left);
+            check ("roll_drag_ends_with_its_note_gone", ! roll.dragActiveForTests() && notes() == before);
+            juce::ModifierKeys::currentModifiers = held;
+            roll.releaseForSnapshot (at.translated (120, -60));
+            offline.dispatchPendingMessages();
+
+            // Playlist: a pattern clip grabbed with the Pencil, the edit that added it undone while it is held
+            ui.selectTabForSnapshot (2);
+            offline.dispatchPendingMessages();
+            auto& playlist = ui.getPlaylistForSnapshot();
+            playlist.setToolForSnapshot (lynx::EditTool::pencil);
+            offline.editSong ([] (lynx::Song& s) {
+                lynx::Clip c;
+                c.pattern = s.currentPattern;
+                c.track = 0;
+                c.start = 0;
+                c.length = 4 * 4 * lynx::ppq;
+                s.playlist.push_back (c);
+            });
+            offline.dispatchPendingMessages();
+            ui.resized();
+            const auto clips = offline.getSong().playlist.size();
+            const auto box = playlist.clipBoundsForSnapshot ((int) clips - 1);
+            check ("playlist_clip_on_screen", ! box.isEmpty(), box.toString());
+            auto source = juce::Desktop::getInstance().getMainMouseSource();
+            const auto now = juce::Time::getCurrentTime();
+            const auto grab = box.getCentre().toFloat();
+            const auto event = [&] (juce::Point<float> p, juce::ModifierKeys m, bool dragged) {
+                return juce::MouseEvent (source, p, m, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, &playlist, &playlist, now, grab, now, 1, dragged);
+            };
+            juce::ModifierKeys::currentModifiers = left;
+            playlist.mouseDown (event (grab, left, false));
+            check ("playlist_press_grabs_the_clip", playlist.dragActiveForTests());
+            offline.undo();
+            offline.dispatchPendingMessages();
+            check ("playlist_undo_takes_the_clip_away", offline.getSong().playlist.size() == clips - 1);
+            playlist.mouseDrag (event (grab.translated (80.0f, 0.0f), left, true));
+            playlist.mouseDrag (event (grab.translated (160.0f, 0.0f), left, true));
+            check ("playlist_drag_ends_with_its_clip_gone", ! playlist.dragActiveForTests() && offline.getSong().playlist.size() == clips - 1);
+            juce::ModifierKeys::currentModifiers = held;
+            playlist.mouseUp (event (grab.translated (160.0f, 0.0f), {}, true));
+            offline.dispatchPendingMessages();
+        }
+        report << "result=" << (all ? "OK" : "FAILED") << "\n";
+        juce::File (reportPath).replaceWithText (report);
+        juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
+        return all;
     }
 
     bool runEdisonSlotTest (const juce::String& folderPath, const juce::String& flp)

@@ -2185,6 +2185,7 @@ void PianoRollComponent::mouseDown (const juce::MouseEvent& e)
 
     downMods = e.mods;
     startedOnEmpty = erasedSomething = holdExpired = false;
+    dragPattern = engine.getSong().currentPattern; // (dragStillValid: the pattern the drag's note indices are of)
 
     // FL's middle + right click (round 190mp, DE-62; capture 190mp A3.2): the second button's press opens the main menu at
     // the mouse with the tools' "Mode" column on its left; whatever the first press began stops
@@ -2779,6 +2780,12 @@ void PianoRollComponent::mouseDrag (const juce::MouseEvent& e)
         const juce::MouseEvent& event;
         ~PostAfter() { roll.postDragHint (event); }
     } postAfter { *this, e };
+
+    if (! dragStillValid())
+    {
+        cancelStaleDrag();
+        return;
+    }
 
     switch (drag)
     {
@@ -5288,7 +5295,7 @@ void PianoRollComponent::nudge (std::int64_t ticks, int keys)
         editNotes ([this, &ticks, &keys] (Pattern& p) { noteedit::move (p, selection, ticks, keys); });
     }
 
-    if (keys != 0 && selection.size() == 1)
+    if (keys != 0 && selection.size() == 1 && (std::size_t) selection[0] < currentPattern (engine.getSong()).notes.size())
     {
         const auto& n = currentPattern (engine.getSong()).notes[(std::size_t) selection[0]];
         previewEdit (n.key, n.velocity);
@@ -5554,6 +5561,38 @@ void PianoRollComponent::scrollBarMoved (juce::ScrollBar* bar, double start)
     repaint();
 }
 
+// A drag of notes by their indices (move, resize, stretch) still about notes that exist? Undo, Delete or Ctrl+X pressed
+// while the mouse button was held (or a recording that replaced notes meanwhile) took notes away, and the next step of
+// the drag wrote a note past the end of the list: the heap was corrupted and LYNX crashed later, somewhere else.
+bool PianoRollComponent::dragStillValid() const
+{
+    if (drag != Drag::move && drag != Drag::resize && drag != Drag::resizeLeft && drag != Drag::stretch)
+        return true;
+    const auto& song = engine.getSong();
+    if (song.currentPattern != dragPattern)
+        return false;
+    const auto count = currentPattern (song).notes.size();
+    if (std::any_of (dragIndices.begin(), dragIndices.end(), [count] (int i) { return i < 0 || (std::size_t) i >= count; }))
+        return false;
+    if (drag == Drag::stretch)
+        return true;
+    return dragOriginals.size() == dragIndices.size() && dragNote >= 0 && (std::size_t) dragNote < count
+           && std::find (dragIndices.begin(), dragIndices.end(), dragNote) != dragIndices.end();
+}
+
+// such a drag ends where it is (what it did so far stays; the notes that are gone are not selected)
+void PianoRollComponent::cancelStaleDrag()
+{
+    previewOff();
+    drag = Drag::none;
+    dragNote = -1;
+    dragIndices.clear();
+    dragOriginals.clear();
+    const auto count = currentPattern (engine.getSong()).notes.size();
+    selection.erase (std::remove_if (selection.begin(), selection.end(), [count] (int i) { return i < 0 || (std::size_t) i >= count; }), selection.end());
+    repaint();
+}
+
 void PianoRollComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     // pattern/channel switched or the pattern changed externally (undo, another window): the selection no longer applies
@@ -5580,6 +5619,10 @@ void PianoRollComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 
         if (drag == Drag::none)
             selection.clear();
+        else if (! dragStillValid()) // (an undo, a cut or a recording took the dragged notes away while the button was held)
+            cancelStaleDrag();
+        else // (the drag goes on: only the notes that are still there stay selected)
+            selection.erase (std::remove_if (selection.begin(), selection.end(), [count] (int i) { return i < 0 || (std::size_t) i >= count; }), selection.end());
     }
 
     followButton.setToggleState (EditorGlobals::get().isFollowing (true), juce::dontSendNotification);
