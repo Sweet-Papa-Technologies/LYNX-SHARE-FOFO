@@ -191,6 +191,7 @@ public:
     std::int64_t timeSelectionFrom() const noexcept { return timeFrom; }
     std::int64_t timeSelectionTo() const noexcept { return timeTo; }
     std::vector<int> selectionForTests() const { return selection; }
+    bool dragActiveForTests() const noexcept { return drag != Drag::none; }
     // The MIDI Tools panel (round 190s): the notes a tool works on (the selection, or every note of the channel when
     // nothing is selected: `selected` false), and its result becomes the selection.
     std::vector<int> midiToolNotes (bool& selected) const { selected = ! selection.empty(); return selectionOrAll(); }
@@ -441,6 +442,8 @@ private:
     bool isSelected (int index) const;
     std::vector<int> channelNotes() const;           // indices of the channel's notes
     std::vector<int> selectionOrAll() const;         // selection, or all of the channel's notes if empty
+    bool dragStillValid() const;                     // the drag's note indices still name notes of its pattern
+    void cancelStaleDrag();
     void setSelection (std::vector<int> indices);
     void sortNotes();                                // sorts while keeping the selection (no undo step)
     void editNotes (const std::function<void (Pattern&)>& edit, bool undoable = true);
@@ -701,6 +704,7 @@ private:
 
     Drag drag = Drag::none;
     int dragNote = -1;              // grabbed note (reference for snap and preview)
+    int dragPattern = -1;           // the pattern the press was in (the drag's note indices are of it)
     std::vector<int> dragIndices;   // notes that follow the drag
     std::vector<Note> dragOriginals;
     std::int64_t grabOffset = 0;    // note tick - mouse tick at drag start

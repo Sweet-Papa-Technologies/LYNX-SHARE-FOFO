@@ -281,6 +281,7 @@ public:
     juce::Rectangle<int> trackLaneArrowForSnapshot (int track) const { return trackLaneArrow (track); }
     double xOfTickForSnapshot (double tick) const { return tickToX (tick); }
     juce::Rectangle<int> clipBoundsForSnapshot (int clip) const { return clipBounds (clip); } // (round 190gi)
+    bool dragActiveForTests() const noexcept { return drag != Drag::none; }
     juce::Rectangle<float> curveBodyForSnapshot (int clip) const; // (round 190gi: where an envelope / automation curve is drawn)
     double warpStripSecondsForSnapshot (int clip, juce::Point<int> p) const { return warpStripSeconds (clip, p); }
     std::size_t warpMarkerCountForSnapshot (int clip) const { return clipWarpMarkers (clip).size(); }
@@ -931,6 +932,9 @@ private:
     int dragClip = -1;
     std::vector<int> dragIndices;
     std::vector<Clip> dragOriginals;
+    bool clipDragStillValid() const; // the drag's clip indices still name clips of the playlist
+    void cancelStaleClipDrag();
+    void pruneSelection();           // selected indices past the end of the playlist dropped
     std::vector<int> selection, selectionBefore;
     juce::Rectangle<int> rubberBand;
     std::int64_t loopAnchor = 0;

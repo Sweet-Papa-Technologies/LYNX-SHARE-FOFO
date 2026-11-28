@@ -246,10 +246,15 @@ TEST (stability190gg_always_separate_offered_after_a_crash)
 {
     using namespace i18ntest;
     const auto main = readFile ("src/ui/MainComponent.cpp");
-    const auto prompt = main.find ("const auto prompt = PluginWindows::crashPrompt (crashedName, onLoad);");
+    // (one crash alone: its own prompt, MainComponent::announcePluginCrash; several gathered: one prompt for all of them)
+    const auto prompt = main.find ("const auto prompt = PluginWindows::crashPrompt (plugin, onLoad);");
     CHECK (prompt != std::string::npos);
     CHECK (main.find ("else if (prompt.separate && result == (prompt.reload ? 2 : 1))", prompt) != std::string::npos);
-    CHECK (main.find ("PluginWindows::alwaysRunSeparately (safe->engine, crashedName);", prompt) != std::string::npos);
+    CHECK (main.find ("PluginWindows::alwaysRunSeparately (safe->engine, plugin);", prompt) != std::string::npos);
+    const auto gathered = main.find ("void MainComponent::announcePluginProblems()");
+    CHECK (gathered != std::string::npos);
+    CHECK (main.find ("PluginWindows::canAlwaysRunSeparately (p.plugin)", gathered) != std::string::npos);
+    CHECK (main.find ("PluginWindows::alwaysRunSeparately (safe->engine, name);", gathered) != std::string::npos);
     // the editor-crash prompt (Windows) uses the same action
     CHECK (main.find ("PluginWindows::alwaysRunSeparately (safe->engine, plugin);") != std::string::npos);
     const auto window = readFile ("src/ui/PluginWindow.cpp");

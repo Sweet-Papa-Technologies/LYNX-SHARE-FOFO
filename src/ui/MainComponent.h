@@ -339,6 +339,26 @@ private:
     int editorCrashesSeen = 0; // faults in plugin editor windows (ui/PluginWindow.h, issue #32) already announced
     int sandboxDeathsSeen = 0; // separate-process plugins that died (engine/PluginSandbox.h, round 176a) already announced
     void announceEditorCrash (const juce::String& plugin);
+    void announcePluginCrash (const juce::String& plugin, bool onLoad);
+    // plugin crashes gathered for one prompt (the timer: collectPluginProblems, then announcePluginProblems)
+    struct PluginProblem
+    {
+        enum class Kind
+        {
+            crashed,         // inside a call (switched off)
+            separateProcess, // its separate process died (muted)
+            editor           // its editor window faulted (closed)
+        };
+        Kind kind = Kind::crashed;
+        juce::String plugin;
+        bool onLoad = false, crashed = true, bits32 = false;
+        juce::StringArray withIt;
+    };
+    std::vector<PluginProblem> pluginProblems;
+    double pluginProblemsSinceMs = 0.0;
+    bool pluginProblemPromptOpen = false;
+    void collectPluginProblems();
+    void announcePluginProblems();
     void announceSeparateProcessCrash (const juce::String& plugin, bool crashed, bool bits32, const juce::StringArray& withIt = {});
     void reloadCrashedPlugins (const juce::String& plugin); // round 190ao: a crash prompt's "Reload"
     void showHelp();
