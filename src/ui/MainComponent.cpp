@@ -8061,7 +8061,7 @@ void MainComponent::revertToLastBackup()
 
 void MainComponent::revertTo (const juce::File& backup)
 {
-    // behind the progress panel, as File › Open (the backup of a project with long recordings is as big as it)
+    // behind the progress panel, as File › Open (a backup decodes the same recordings and samples as its project)
     if (projectLoadRunning())
         return;
     openLynxWithProgress (*this, engine, backup, false,
