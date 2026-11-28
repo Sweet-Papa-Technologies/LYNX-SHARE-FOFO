@@ -180,3 +180,94 @@ TEST (wave_disk_cache_round_trip)
     CHECK (! deserialise (other.data(), other.size(), junk));
     CHECK (! deserialise (nullptr, 0, junk));
 }
+
+// Edison follows a recording with a Builder: the same columns as analysing the whole take, at the cost of each new
+// stretch (it used to analyse everything again five times a second, and a long take froze the window)
+TEST (wave_builder_matches_analyse_whatever_the_chunks)
+{
+    using namespace lynx::wave;
+    const auto frames = (std::size_t) 200003;
+    const auto l = waveNoise (0.7f, frames);
+    auto r = waveSine (3000.0, 0.4f, frames, 44100.0);
+    for (std::size_t i = 0; i < frames; i += 7)
+        r[i] += 0.1f * l[i];
+    const auto whole = analyse (l.data(), r.data(), frames, 44100.0);
+
+    Builder b (44100.0, 2);
+    std::size_t at = 0, step = 1;
+    while (at < frames)
+    {
+        const auto n = std::min (frames - at, step);
+        b.append (l.data() + at, r.data() + at, n);
+        at += n;
+        step = step * 3 + 17; // 1, 20, 77, 248, ... (chunks across column boundaries, and ones much longer)
+        if (step > 40000)
+            step = 5;
+    }
+    const auto& s = b.summary();
+    CHECK (s.frames == whole.frames && s.channels == 2 && s.bucket == whole.bucket && s.scale == whole.scale);
+    CHECK (std::abs (s.peak - whole.peak) < 1e-6f);
+    CHECK (s.levels.size() == whole.levels.size());
+    bool same = s.levels.size() == whole.levels.size();
+    for (std::size_t lv = 0; same && lv < s.levels.size(); ++lv)
+        same = s.levels[lv].size() == whole.levels[lv].size()
+               && std::memcmp (s.levels[lv].data(), whole.levels[lv].data(), s.levels[lv].size() * sizeof (Column)) == 0;
+    CHECK (same);
+
+    // between appends it is a summary of what is in so far (the open column included)
+    Builder partial (44100.0, 1);
+    partial.append (l.data(), nullptr, 1000);
+    const auto upTo = analyse (l.data(), nullptr, 1000, 44100.0);
+    CHECK (partial.frames() == 1000 && partial.summary().levels[0].size() == upTo.levels[0].size());
+    CHECK (std::memcmp (partial.summary().levels[0].data(), upTo.levels[0].data(), upTo.levels[0].size() * sizeof (Column)) == 0);
+    CHECK (partial.summary().levels.back().size() == 1);
+    CHECK (! Builder (44100.0, 1).summary().query (0.0, 10.0, -1).valid); // (nothing yet)
+}
+
+TEST (wave_builder_grows_its_bucket_and_scale)
+{
+    using namespace lynx::wave;
+    // level 0 full (a small limit here; maxBaseColumns in the app): two columns merge, the bucket doubles, the
+    // peaks stay exact
+    const auto frames = (std::size_t) 20603;
+    const auto v = waveNoise (0.9f, frames);
+    Builder b (48000.0, 1, 64);
+    for (std::size_t at = 0; at < frames; at += 333)
+        b.append (v.data() + at, nullptr, std::min<std::size_t> (333, frames - at));
+    const auto& s = b.summary();
+    CHECK (s.bucket == 512 && s.levels[0].size() == (frames + 511) / 512 && s.frames == frames);
+    bool peaks = true, rms = true;
+    for (std::size_t c = 0; c < s.levels[0].size(); ++c)
+    {
+        const auto from = c * s.bucket, to = std::min (frames, from + s.bucket);
+        float lo = v[from], hi = v[from];
+        double sq = 0.0;
+        for (auto i = from; i < to; ++i)
+        {
+            lo = std::min (lo, v[i]);
+            hi = std::max (hi, v[i]);
+            sq += (double) v[i] * v[i];
+        }
+        const auto& col = s.levels[0][c];
+        peaks = peaks && std::abs (col.lo[0] / 32767.0f - lo) < 1e-4f && std::abs (col.hi[0] / 32767.0f - hi) < 1e-4f;
+        rms = rms && std::abs (col.rms[0] / 65535.0 - std::sqrt (sq / (double) (to - from))) < 2e-3;
+    }
+    CHECK (peaks);
+    CHECK (rms);
+    CHECK (s.levels.back().size() == 1);
+    for (std::size_t lv = 1; lv < s.levels.size(); ++lv)
+        CHECK (s.levels[lv].size() == (s.levels[lv - 1].size() + levelFactor - 1) / levelFactor);
+
+    // a float input past full scale: the scale follows, what came before keeps its level
+    auto quiet = waveSine (200.0, 0.5f, 30000, 48000.0);
+    const auto loud = waveSine (200.0, 2.0f, 30000, 48000.0);
+    Builder f (48000.0, 1);
+    f.append (quiet.data(), nullptr, quiet.size());
+    CHECK (f.summary().scale == 1.0f);
+    f.append (loud.data(), nullptr, loud.size());
+    CHECK (std::abs (f.summary().scale - 2.0f) < 0.01f);
+    // (ranges well inside each part: a wide query reads coarser columns, which may reach into the other part)
+    const auto q = f.summary().query (5000.0, 6000.0, 0), w = f.summary().query (40000.0, 41000.0, 0);
+    CHECK (std::abs (q.hi - 0.5f) < 0.01f && std::abs (q.lo + 0.5f) < 0.01f);
+    CHECK (std::abs (w.hi - 2.0f) < 0.02f && std::abs (w.lo + 2.0f) < 0.02f);
+}

@@ -267,8 +267,11 @@ int Processor::drain (std::vector<float>& l, std::vector<float>& r, std::vector<
     const auto rd = readIndex.load (std::memory_order_relaxed);
     const auto n = (int) (w - rd);
     const auto mask = (std::uint64_t) ringCapacity - 1;
-    l.reserve (l.size() + (std::size_t) n);
-    r.reserve (r.size() + (std::size_t) n);
+    // (grown by half again, never to the exact size: reserve (size + n) on every pump moved the whole take to a new
+    // buffer 30 times a second, so a long recording got slower and slower to drain)
+    for (auto* v : { &l, &r })
+        if (v->capacity() < v->size() + (std::size_t) n)
+            v->reserve (std::max (v->size() + (std::size_t) n, v->capacity() + v->capacity() / 2 + 4096));
     for (int i = 0; i < n; ++i)
     {
         l.push_back (ringL[(std::size_t) ((rd + (std::uint64_t) i) & mask)]);
@@ -510,6 +513,18 @@ ae::Document withTake (const ae::Document& base, const ae::Audio& take, const st
     return d;
 }
 
+ae::Document withTake (const ae::Document& base, ae::Audio&& take, const std::vector<std::int64_t>& jumps, bool appendTake)
+{
+    if (appendTake && ! base.audio.empty())
+        return withTake (base, static_cast<const ae::Audio&> (take), jumps, appendTake); // (converted into a copy of the audio)
+    ae::Document d;
+    d.title = base.title;
+    d.audio = std::move (take);
+    for (const auto j : jumps)
+        ae::addMarker (d, std::clamp<std::int64_t> (j, 0, d.audio.frames()), "Song jump");
+    return d;
+}
+
 namespace
 {
 std::mutex& registryMutex()
@@ -668,7 +683,12 @@ void Session::stop()
     recorder.reset();
     if (! takeL.empty())
     {
-        doc = std::make_shared<const ae::Document> (withTake (*doc, take(), jumps, appending));
+        ae::Audio recorded; // (the take moves into the document: it is not kept here)
+        recorded.sampleRate = takeRate;
+        recorded.channels.reserve (2);
+        recorded.channels.push_back (std::move (takeL));
+        recorded.channels.push_back (std::move (takeR));
+        doc = std::make_shared<const ae::Document> (withTake (*doc, std::move (recorded), jumps, appending));
         changed = true;
         changedDocument();
     }
@@ -689,7 +709,9 @@ ae::Audio Session::take() const
 {
     ae::Audio a;
     a.sampleRate = takeRate;
-    a.channels = { takeL, takeR };
+    a.channels.reserve (2); // (not `= { takeL, takeR }`: an initializer list copies each channel twice)
+    a.channels.push_back (takeL);
+    a.channels.push_back (takeR);
     return a;
 }
 
@@ -701,6 +723,56 @@ ae::Document Session::preview() const
 std::int64_t Session::takeStart() const noexcept
 {
     return active && appending ? doc->audio.frames() : 0;
+}
+
+bool Session::follow (ae::Document& shown, Follow& f) const
+{
+    const auto now = takeFrames();
+    if (! active)
+    {
+        shown = *doc;
+        f = {};
+        return true;
+    }
+    if (now == 0) // nothing recorded yet (or a take that began again): as preview(), the document as it is
+    {
+        if (f.frames < 0)
+            return false;
+        shown = *doc;
+        f = {};
+        return true;
+    }
+    if (f.frames < 0 || now < f.frames) // (first frames, or the take began again)
+    {
+        shown = withTake (*doc, take(), jumps, appending);
+        f.frames = now;
+        f.jumps = jumps.size();
+        f.at = takeStart();
+        f.scale = appending && ! doc->audio.empty() ? doc->audio.sampleRate / std::max (1.0, takeRate) : 1.0;
+        return true;
+    }
+    if (now == f.frames && jumps.size() == f.jumps)
+        return false;
+    if (now > f.frames)
+    {
+        ae::Audio fresh;
+        fresh.sampleRate = takeRate;
+        fresh.channels = { std::vector<float> (takeL.begin() + (std::ptrdiff_t) f.frames, takeL.end()),
+                           std::vector<float> (takeR.begin() + (std::ptrdiff_t) f.frames, takeR.end()) };
+        if (shown.audio.channels.empty())
+            shown.audio = std::move (fresh);
+        else
+        {
+            const auto conformed = ae::conform (fresh, shown.audio.numChannels(), shown.audio.sampleRate);
+            for (std::size_t c = 0; c < shown.audio.channels.size() && c < conformed.channels.size(); ++c)
+                shown.audio.channels[c].insert (shown.audio.channels[c].end(), conformed.channels[c].begin(), conformed.channels[c].end());
+        }
+    }
+    for (auto j = f.jumps; j < jumps.size(); ++j)
+        ae::addMarker (shown, std::clamp<std::int64_t> (f.at + (std::int64_t) std::llround ((double) jumps[j] * f.scale), 0, shown.audio.frames()), "Song jump");
+    f.frames = now;
+    f.jumps = jumps.size();
+    return true;
 }
 
 std::shared_ptr<Session> findSession (std::uint64_t instanceId)

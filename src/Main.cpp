@@ -23053,6 +23053,64 @@ private:
             check ("no_editor_for_other_slots", lynx::makeEdisonSlotEditor (engine, 0, 0) == nullptr);
             editor.reset();
 
+            // A long take with the slot's window open (26.47.1: the window froze as a take grew, because every follow
+            // copied the whole document and take and analysed all of it). Five minutes through the slot, with the
+            // window's timer turned as often as it runs (every 1470 frames ~ 33 ms): its turns at the end cost what
+            // they cost at the start.
+            if (auto window = lynx::makeEdisonSlotEditor (engine, 1, at))
+            {
+                window->setSize (1120, 600);
+                auto liveParams = slotOf().params; // (the slot is set to On play / Slave above: this take records at once)
+                liveParams[ef::recordMode] = ef::modeValue (ef::Mode::now);
+                liveParams[ef::slave] = 0.0f;
+                check ("long_take_record_starts", session->start (p, false));
+                const auto frames = (std::int64_t) (rate * 300.0);
+                const auto perTick = (std::int64_t) (rate / 30.0);
+                std::vector<double> tickMs;
+                std::int64_t fed = 0, sinceTick = 0;
+                double longest = 0.0;
+                for (int block = 0; fed < frames; ++block)
+                {
+                    fill (block);
+                    p->process (l.data(), r.data(), 512, liveParams, 120.0);
+                    fed += 512;
+                    if ((sinceTick += 512) < perTick)
+                        continue;
+                    sinceTick = 0;
+                    const auto t0 = juce::Time::getMillisecondCounterHiRes();
+                    lynx::tickAudioEditorForTest (*window);
+                    if (tickMs.size() % 5 == 0)
+                        engine.pumpEdisonRecordings(); // (the engine's timer, 6 times a second: the take's safety file)
+                    tickMs.push_back (juce::Time::getMillisecondCounterHiRes() - t0);
+                    longest = juce::jmax (longest, tickMs.back());
+                    if (longest > 2000.0) // (as before the fix: no need to wait for the rest)
+                        break;
+                }
+                const auto recorded = folder.getChildFile ("Audio").getChildFile ("Recorded");
+                const auto safety = recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav");
+                // (stereo float: 8 bytes a frame; it lags by the last pump and the writer's one-second flush at most)
+                const auto safeFrames = safety.size() == 1 ? (safety[0].getSize() - 44) / 8 : (juce::int64) 0;
+                check ("long_take_written_to_a_safety_file_as_it_records", safety.size() == 1 && safeFrames <= fed && fed - safeFrames < (std::int64_t) (2.5 * rate),
+                       juce::String (safety.size()) + " file(s), about " + juce::String (safeFrames) + " frames of " + juce::String (fed));
+                session->stop();
+                lynx::tickAudioEditorForTest (*window); // (the take ends in the window: written to its own file)
+                engine.pumpEdisonRecordings();
+                check ("long_take_safety_file_goes_once_the_take_is_saved", recorded.findChildFiles (juce::File::findFiles, false, "* (recording).wav").isEmpty()
+                                                                             && ! session->dirty());
+                const auto average = [&tickMs] (std::size_t from, std::size_t to) {
+                    double sum = 0.0;
+                    for (auto i = from; i < to && i < tickMs.size(); ++i)
+                        sum += tickMs[i];
+                    return to > from ? sum / (double) (to - from) : 0.0;
+                };
+                const auto n = tickMs.size();
+                const auto early = average (0, std::min<std::size_t> (n, 600)), late = average (n > 600 ? n - 600 : 0, n);
+                const auto note = juce::String (n) + " ticks, first 600 " + juce::String (early, 3) + " ms, last 600 " + juce::String (late, 3)
+                                  + " ms, longest " + juce::String (longest, 1) + " ms";
+                check ("long_take_followed_at_the_same_cost", fed >= frames && late < 4.0 * juce::jmax (early, 0.25) && longest < 250.0, note);
+                check ("long_take_is_the_document", session->document().audio.frames() == fed, juce::String (session->document().audio.frames()) + " frames of " + juce::String (fed));
+            }
+
             // deleting the slot leaves the song without it (the file stays for the unused-recordings prompt)
             engine.editSong ([at] (lynx::Song& s) { s.mixer[1].effects.erase (s.mixer[1].effects.begin() + at); });
             engine.dispatchPendingMessages();

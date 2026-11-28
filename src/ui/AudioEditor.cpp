@@ -624,6 +624,7 @@ public:
             if (session->recording()) // (a recording started before this window was opened)
             {
                 beforeRecording = doc;
+                resetLiveView();
                 recState = session->phase() == edisonfx::Phase::recording ? RecState::recording : RecState::waiting;
                 recordButton.setToggleState (true, juce::dontSendNotification);
                 showSlotPhase();
@@ -694,6 +695,7 @@ public:
         if (! session->start (p, appendTake))
             return;
         beforeRecording = doc;
+        resetLiveView();
         if (! appendTake)
         {
             beforeRecording = {};
@@ -709,6 +711,10 @@ public:
     void finishSlotRecording()
     {
         recState = RecState::idle;
+        if (liveFollow.scale == 1.0) // (the take was not resampled into the document)
+            finishedSummary = liveSummary;
+        resetLiveView();
+        const juce::ScopeGuard handedOver { [this] { finishedSummary.reset(); } };
         recordButton.setToggleState (false, juce::dontSendNotification);
         if (session->revision() != seenRevision)
         {
@@ -3400,7 +3406,17 @@ private:
         }
         const auto* l = doc.audio.channels[0].data();
         const auto* r = doc.audio.numChannels() > 1 ? doc.audio.channels[1].data() : nullptr;
-        summary = std::make_shared<wave::Summary> (wave::analyse (l, r, (std::size_t) doc.audio.frames(), doc.audio.sampleRate));
+        const auto frames = (std::size_t) doc.audio.frames();
+        if (const auto handed = std::exchange (finishedSummary, nullptr);
+            handed != nullptr && handed->frames() <= frames && handed->summary().channels == (r != nullptr ? 2 : 1)
+            && handed->summary().sampleRate == doc.audio.sampleRate)
+        {
+            // a recording just ended: its followed summary covers the document up to its last frames
+            handed->append (l + handed->frames(), r != nullptr ? r + handed->frames() : nullptr, frames - handed->frames());
+            summary = std::shared_ptr<const wave::Summary> (handed, &handed->summary());
+            return;
+        }
+        summary = std::make_shared<wave::Summary> (wave::analyse (l, r, frames, doc.audio.sampleRate));
     }
 
     void undo()
@@ -4373,6 +4389,7 @@ private:
         recR.clear();
         recWraps.clear();
         beforeRecording = doc;
+        resetLiveView();
         recordAt = takePosition();
         engine.getMeters().capture.setSource (captureStream, recordSource);
         recState = recordMode == RecordMode::now ? RecState::recording : RecState::waiting;
@@ -4469,31 +4486,30 @@ private:
         return a;
     }
 
-    // the document = what it was, with the recording inserted at the cursor and any loop-take markers placed
-    void showRecording()
+    // the document = what it was, with the recording inserted at the cursor and any loop-take markers placed.
+    // ~5 times a second while recording: it costs what came in since the last call. (Building the whole document and
+    // analysing all of it again each time made a long take slower and slower to follow, until the window stopped
+    // answering while the recording went on.) `final`: the last call, when the recording stops.
+    void showRecording (bool final = false)
     {
+        const auto startedMs = juce::Time::getMillisecondCounterHiRes();
+        bool madeWhole = false;
         if (slotMode())
         {
-            doc = session->preview(); // (what the document will be when the recording stops now)
-            recordAt = session->takeStart();
+            const auto had = liveFollow.frames;
+            if (! session->follow (doc, liveFollow))
+                return;
+            madeWhole = had < 0 || liveFollow.frames < had;
+            recordAt = liveFollow.at;
         }
-        else
-        {
-            doc = beforeRecording;
-            const auto rec = recordedAudio();
-            if (doc.audio.empty())
-            {
-                doc.audio = rec;
-                doc.title = tr ("Recording").toStdString();
-            }
-            else
-                ae::insert (doc, recordAt, rec);
-        }
+        else if (! followOwnRecording (final, madeWhole))
+            return;
+        if (madeWhole)
+            liveSummary.reset();
         const auto length = doc.audio.frames() - beforeRecording.audio.frames();
-        ae::addLoopTakeMarkers (doc, recordAt, length, recWraps);
         selection = { recordAt, recordAt + length };
         cursor = recordAt + length;
-        rebuildSummary();
+        followSummary();
         ++docVersion;
         // follow the end
         const auto visible = (double) waveArea.getWidth() * fpp;
@@ -4505,6 +4521,75 @@ private:
         }
         clampView();
         repaint();
+        if (madeWhole && ! slotMode())
+            liveRebuildDueMs = juce::Time::getMillisecondCounterHiRes() + juce::jmax (200.0, 9.0 * (juce::Time::getMillisecondCounterHiRes() - startedMs));
+    }
+
+    // this editor's own recording (recL / recR at recordAt) into `doc`: appended when it goes at the end, else made
+    // whole again, not more often than that costs. False: nothing to show yet.
+    bool followOwnRecording (bool final, bool& madeWhole)
+    {
+        const auto have = (std::int64_t) recL.size();
+        if (have == liveOwnFrames && ! final)
+            return false;
+        const auto atEnd = beforeRecording.audio.empty() || recordAt >= beforeRecording.audio.frames();
+        if (atEnd && liveOwnFrames >= 0 && have >= liveOwnFrames && ! doc.audio.channels.empty())
+        {
+            ae::Audio fresh;
+            fresh.sampleRate = recordRate;
+            fresh.channels.emplace_back (recL.begin() + (std::ptrdiff_t) liveOwnFrames, recL.end());
+            if (recordStereo)
+                fresh.channels.emplace_back (recR.begin() + (std::ptrdiff_t) liveOwnFrames, recR.end());
+            const auto conformed = ae::conform (fresh, doc.audio.numChannels(), doc.audio.sampleRate);
+            for (std::size_t c = 0; c < doc.audio.channels.size() && c < conformed.channels.size(); ++c)
+                doc.audio.channels[c].insert (doc.audio.channels[c].end(), conformed.channels[c].begin(), conformed.channels[c].end());
+            doc.markers = beforeRecording.markers; // (the take markers again below: the wraps grow with the take)
+        }
+        else
+        {
+            if (! final && liveOwnFrames >= 0 && juce::Time::getMillisecondCounterHiRes() < liveRebuildDueMs)
+                return false;
+            doc = beforeRecording;
+            const auto rec = recordedAudio();
+            if (doc.audio.empty())
+            {
+                doc.audio = rec;
+                doc.title = tr ("Recording").toStdString();
+            }
+            else
+                ae::insert (doc, recordAt, rec);
+            madeWhole = true;
+        }
+        liveOwnFrames = have;
+        ae::addLoopTakeMarkers (doc, recordAt, doc.audio.frames() - beforeRecording.audio.frames(), recWraps);
+        return true;
+    }
+
+    // the summary of `doc` while a recording grows it: only the frames added since are analysed
+    void followSummary()
+    {
+        if (doc.audio.empty())
+        {
+            summary.reset();
+            liveSummary.reset();
+            return;
+        }
+        const auto frames = (std::size_t) doc.audio.frames();
+        const auto stereo = doc.audio.numChannels() > 1;
+        if (liveSummary == nullptr || liveSummary->frames() > frames || liveSummary->summary().channels != (stereo ? 2 : 1)
+            || liveSummary->summary().sampleRate != doc.audio.sampleRate)
+            liveSummary = std::make_shared<wave::Builder> (doc.audio.sampleRate, stereo ? 2 : 1);
+        if (const auto from = liveSummary->frames(); from < frames)
+            liveSummary->append (doc.audio.channels[0].data() + from, stereo ? doc.audio.channels[1].data() + from : nullptr, frames - from);
+        summary = std::shared_ptr<const wave::Summary> (liveSummary, &liveSummary->summary()); // (shares the builder)
+    }
+
+    void resetLiveView()
+    {
+        liveFollow = {};
+        liveOwnFrames = -1;
+        liveSummary.reset();
+        liveRebuildDueMs = 0.0;
     }
 
     // the input this editor opened for its recording: closed again (FL does not keep the microphone open; Windows
@@ -4536,8 +4621,11 @@ private:
         recordButton.setToggleState (false, juce::dontSendNotification);
         if (got)
         {
-            showRecording();
+            showRecording (true);
+            finishedSummary = liveSummary; // (it is the summary of the document now)
+            resetLiveView();
             commit (tr ("Record"));
+            finishedSummary.reset();
             placeNextTake (cursor);
             setStatus (tr ("Recorded {0}", { formatTime ((std::int64_t) recL.size()) }) + (dropped > 0 ? "  (" + tr ("{0} frames lost", { juce::String (dropped) }) + ")" : ""), dropped > 0);
         }
@@ -5224,6 +5312,7 @@ private:
             if (recState == RecState::idle && session->recording()) // (armed from outside: the mixer's "…and record")
             {
                 beforeRecording = doc;
+                resetLiveView();
                 recState = RecState::waiting;
                 recordButton.setToggleState (true, juce::dontSendNotification);
                 showSlotPhase();
@@ -6052,7 +6141,15 @@ private:
     ae::Document doc;
     std::shared_ptr<const ae::Document> lastSyncedDoc;
     ae::History history;
-    std::shared_ptr<wave::Summary> summary;
+    std::shared_ptr<const wave::Summary> summary;
+    // a recording being followed (showRecording): what `doc` holds of it, and its summary built as it grows
+    edisonfx::Session::Follow liveFollow;    // slot mode: the session's take
+    std::int64_t liveOwnFrames = -1;         // this editor's own recording: frames of recL / recR in `doc`
+    std::shared_ptr<wave::Builder> liveSummary;
+    double liveRebuildDueMs = 0.0;           // (an insert in the middle is made whole again: at most a tenth of the time)
+    // the followed summary handed to the document the recording ended with (the start of it is the same audio): only
+    // the last frames are analysed, not the whole take again as the recording stops
+    std::shared_ptr<wave::Builder> finishedSummary;
     int docVersion = 0;
     bool modified = false;
     juce::File lastFile;
@@ -6225,6 +6322,7 @@ public:
         recR.clear();
         recWraps.clear();
         beforeRecording = doc;
+        resetLiveView();
         recordAt = takePosition();
         engine.getMeters().capture.setSource (captureStream, recordSource);
         recState = RecState::recording;
@@ -7071,6 +7169,12 @@ void drainAudioEditorRecordForTest (juce::Component& editor)
 {
     if (auto* e = dynamic_cast<AudioEditor*> (&editor))
         e->drainRecordForTest();
+}
+
+void tickAudioEditorForTest (juce::Component& editor)
+{
+    if (auto* e = dynamic_cast<AudioEditor*> (&editor))
+        e->syncFromSongForTest();
 }
 
 void stopAudioEditorRecordForTest (juce::Component& editor)
